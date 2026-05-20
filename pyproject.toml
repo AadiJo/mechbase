@@ -1,0 +1,32 @@
+[project]
+name = "frc-mechanism-rag"
+version = "0.1.0"
+description = "Recall-focused multimodal RAG retrieval API for FRC technical binders."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.124.0",
+  "uvicorn[standard]>=0.38.0",
+  "pydantic>=2.12.0",
+  "pydantic-settings>=2.12.0",
+  "qdrant-client>=1.16.0,<1.17.0",
+  "pymupdf>=1.26.0",
+  "pillow>=11.0.0",
+  "pytesseract>=0.3.13",
+  "rank-bm25>=0.2.2",
+  "numpy>=1.26.0",
+  "python-multipart>=0.0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.9.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

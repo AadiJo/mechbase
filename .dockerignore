@@ -1,0 +1,8 @@
+.venv/
+data/
+artifacts/
+qdrant_storage/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env

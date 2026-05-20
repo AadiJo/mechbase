@@ -1,0 +1,60 @@
+[
+  {
+    "query": "multi ball shooter",
+    "expected": [
+      {"source_pdf": "694-2020.pdf", "page": 19},
+      {"source_pdf": "254-2024.pdf", "page": 14}
+    ]
+  },
+  {
+    "query": "drum shooter",
+    "expected": [
+      {"source_pdf": "254-2024.pdf", "page": 14},
+      {"source_pdf": "254-2020.pdf", "page": 22}
+    ]
+  },
+  {
+    "query": "multi lane shooter",
+    "expected": [
+      {"source_pdf": "254-2020.pdf", "page": 22},
+      {"source_pdf": "254-2024.pdf", "page": 14}
+    ]
+  },
+  {
+    "query": "floor intake",
+    "expected": [
+      {"source_pdf": "254-2023.pdf", "page": 16},
+      {"source_pdf": "254-2024.pdf", "page": 11}
+    ]
+  },
+  {
+    "query": "indexer",
+    "expected": [
+      {"source_pdf": "254-2020.pdf", "page": 20},
+      {"source_pdf": "254-2025.pdf", "page": 14}
+    ]
+  },
+  {
+    "query": "climber",
+    "expected": [
+      {"source_pdf": "254-2025.pdf", "page": 17},
+      {"source_pdf": "2910-2025.pdf", "page": 7},
+      {"source_pdf": "254-2024.pdf", "page": 16}
+    ]
+  },
+  {
+    "query": "coral end effector",
+    "expected": [
+      {"source_pdf": "254-2025.pdf", "page": 18},
+      {"source_pdf": "294-2025.pdf", "page": 10}
+    ]
+  },
+  {
+    "query": "algae intake",
+    "expected": [
+      {"source_pdf": "3255-2025.pdf", "page": 6},
+      {"source_pdf": "2910-2025.pdf", "page": 8},
+      {"source_pdf": "1323-2025.pdf", "page": 8}
+    ]
+  }
+]

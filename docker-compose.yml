@@ -1,0 +1,33 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.16.2
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - qdrant
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+
+  ingest:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - qdrant
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command: python -m app.rag.ingest --data-dir /app/data
