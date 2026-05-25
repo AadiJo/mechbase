@@ -31,9 +31,11 @@ jobs:
             BACKEND_PATH="/mnt/block-volume/mechbase-rag-8642/repo"
             SERVICE_NAME="mechbase-rag-8642.service"
             ARTIFACT_SOURCE="$BACKEND_PATH/artifacts"
+            REPO_URL="https://github.com/AadiJo/mechbase.git"
 
             cd "$BACKEND_PATH"
 
+            git remote set-url origin "$REPO_URL"
             git fetch origin main
             git reset --hard origin/main
 
