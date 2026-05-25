@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     chunk_overlap_chars: int = Field(default=220, alias="CHUNK_OVERLAP_CHARS")
     multimodal_batch_size: int = Field(default=4, alias="MULTIMODAL_BATCH_SIZE")
     max_embed_image_side: int = Field(default=1400, alias="MAX_EMBED_IMAGE_SIDE")
+    required_api_key_permission: str = Field(default="search:read", alias="REQUIRED_API_KEY_PERMISSION")
+    convex_http_url: str | None = Field(default=None, alias="CONVEX_HTTP_URL")
+    convex_recording_secret: str | None = Field(default=None, alias="CONVEX_RECORDING_SECRET")
 
 
 @lru_cache

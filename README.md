@@ -27,9 +27,14 @@ Search:
 
 ```bash
 curl -X POST http://localhost:8000/search \
+  -H 'Authorization: Bearer <mechbase-api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"query":"multi ball shooter","top_k":10}'
 ```
+
+All retrieval endpoints except `/health` require a Mechbase API key with the
+`search:read` permission. Set `CONVEX_HTTP_URL` and `CONVEX_RECORDING_SECRET`
+so the service can validate keys and record usage through Convex.
 
 Search results include `artifact_url`, `linked_artifact_urls`, `page_context_url`, and
 `page_text_url`. Use them when the agent needs to display images or fetch more page context.

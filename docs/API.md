@@ -4,6 +4,16 @@ Base URL for local development: `http://localhost:8000`
 
 In production, replace the host with the VPS domain. URLs returned by the API are relative paths; clients should resolve them against the base URL.
 
+Except for `/health`, endpoints require a Mechbase API key:
+
+```http
+Authorization: Bearer <mechbase-api-key>
+```
+
+Keys must include `search:read` by default. Set `REQUIRED_API_KEY_PERMISSION` to
+change the required permission. Set `CONVEX_HTTP_URL` and
+`CONVEX_RECORDING_SECRET` to record authenticated usage into Convex.
+
 ## Health
 
 ```http
@@ -16,6 +26,7 @@ Returns service status and the active Qdrant collection.
 
 ```http
 POST /search
+Authorization: Bearer <mechbase-api-key>
 Content-Type: application/json
 ```
 

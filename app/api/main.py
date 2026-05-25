@@ -1,7 +1,10 @@
-from fastapi import FastAPI, HTTPException
+import time
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
+from app.api.auth import ApiKeyContext, record_usage, require_api_key
 from app.rag.config import get_settings
 from app.rag.models import (
     ImageContextResponse,
@@ -34,6 +37,21 @@ if settings.artifact_url_base != "/artifacts":
     )
 
 
+@app.middleware("http")
+async def usage_recording_middleware(request: Request, call_next):
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    api_key_context = getattr(request.state, "api_key_context", None)
+    if isinstance(api_key_context, ApiKeyContext):
+        record_usage(
+            context=api_key_context,
+            request=request,
+            status_code=response.status_code,
+            started_at=started_at,
+        )
+    return response
+
+
 @app.get("/health")
 def health() -> dict:
     settings = get_settings()
@@ -41,7 +59,10 @@ def health() -> dict:
 
 
 @app.post("/search", response_model=SearchResponse)
-def search_endpoint(request: SearchRequest) -> SearchResponse:
+def search_endpoint(
+    request: SearchRequest,
+    _api_key: ApiKeyContext = Depends(require_api_key),
+) -> SearchResponse:
     try:
         return search(
             request.query,
@@ -62,12 +83,16 @@ def list_sources(
     team: str | None = None,
     year: int | None = None,
     source: str | None = None,
+    _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> SourceListResponse:
     return RagStore(get_settings()).list_sources(team=team, year=year, source=source)
 
 
 @app.post("/sources/search", response_model=SourceSearchResponse)
-def search_sources(request: SourceSearchRequest) -> SourceSearchResponse:
+def search_sources(
+    request: SourceSearchRequest,
+    _api_key: ApiKeyContext = Depends(require_api_key),
+) -> SourceSearchResponse:
     if request.query:
         search_response = search(
             request.query,
@@ -106,7 +131,10 @@ def search_sources(request: SourceSearchRequest) -> SourceSearchResponse:
 
 
 @app.get("/sources/{source_pdf}", response_model=SourceSummary)
-def source_summary(source_pdf: str) -> SourceSummary:
+def source_summary(
+    source_pdf: str,
+    _api_key: ApiKeyContext = Depends(require_api_key),
+) -> SourceSummary:
     summary = RagStore(get_settings()).source_summary(source_pdf)
     if summary is None:
         raise HTTPException(status_code=404, detail="Source not found.")
@@ -119,6 +147,7 @@ def similar_pages(
     source_pdf: str | None = None,
     page: int | None = None,
     top_k: int = 10,
+    _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> SimilarPagesResponse:
     store = RagStore(get_settings())
     if result_id:
@@ -136,6 +165,7 @@ def similar_pages(
 def image_context(
     result_id: str | None = None,
     image_url: str | None = None,
+    _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> ImageContextResponse:
     if not result_id and not image_url:
         raise HTTPException(status_code=400, detail="Provide result_id or image_url.")
@@ -146,7 +176,11 @@ def image_context(
 
 
 @app.get("/pages/{source_pdf}/{page}", response_model=PageContextResponse)
-def page_context(source_pdf: str, page: int) -> PageContextResponse:
+def page_context(
+    source_pdf: str,
+    page: int,
+    _api_key: ApiKeyContext = Depends(require_api_key),
+) -> PageContextResponse:
     context = RagStore(get_settings()).page_context(source_pdf, page)
     if context is None:
         raise HTTPException(status_code=404, detail="Page context not found.")
@@ -154,7 +188,11 @@ def page_context(source_pdf: str, page: int) -> PageContextResponse:
 
 
 @app.get("/pages/{source_pdf}/{page}/text", response_model=PageTextResponse)
-def page_text(source_pdf: str, page: int) -> PageTextResponse:
+def page_text(
+    source_pdf: str,
+    page: int,
+    _api_key: ApiKeyContext = Depends(require_api_key),
+) -> PageTextResponse:
     context = RagStore(get_settings()).page_context(source_pdf, page)
     if context is None or not context.text.strip():
         raise HTTPException(status_code=404, detail="Page text not found.")
@@ -162,6 +200,6 @@ def page_text(source_pdf: str, page: int) -> PageTextResponse:
 
 
 @app.post("/collections/init")
-def init_collection() -> dict:
+def init_collection(_api_key: ApiKeyContext = Depends(require_api_key)) -> dict:
     RagStore(get_settings()).ensure_collection()
     return {"ok": True}
