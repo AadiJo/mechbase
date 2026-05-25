@@ -91,11 +91,18 @@ class RagStore:
                         payload,
                         {"vector_source": source, "vector_score": float(hit.score), "lexical_bonus": lexical},
                     )
-        ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)[: request.top_k]
-        return [
-            self._search_result_from_payload(payload, score, debug if request.debug else {})
-            for point_id, (score, payload, debug) in ranked
-        ]
+        ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
+        results: list[SearchResult] = []
+        seen_pages: set[tuple[str, int]] = set()
+        for point_id, (score, payload, debug) in ranked:
+            page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
+            if page_key in seen_pages:
+                continue
+            seen_pages.add(page_key)
+            results.append(self._search_result_from_payload(payload, score, debug if request.debug else {}))
+            if len(results) >= request.top_k:
+                break
+        return results
 
 
     def page_context(self, source_pdf: str, page: int) -> PageContextResponse | None:
