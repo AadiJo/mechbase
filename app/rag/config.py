@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     required_api_key_permission: str = Field(default="search:read", alias="REQUIRED_API_KEY_PERMISSION")
     convex_http_url: str | None = Field(default=None, alias="CONVEX_HTTP_URL")
     convex_recording_secret: str | None = Field(default=None, alias="CONVEX_RECORDING_SECRET")
+    rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
+    rate_limit_max_requests: int = Field(default=20, alias="RATE_LIMIT_MAX_REQUESTS")
+    rate_limit_window_seconds: int = Field(default=60, alias="RATE_LIMIT_WINDOW_SECONDS")
 
 
 @lru_cache

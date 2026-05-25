@@ -50,6 +50,12 @@ def validate_mechbase_api_key(value: str, settings: Settings | None = None) -> A
     key_hash_value = _base64_urlsafe_no_padding(key_hash)
     url = settings.convex_http_url.rstrip("/") + "/validateApiKey"
 
+    rate_limit = {
+        "enabled": settings.rate_limit_enabled,
+        "maxRequests": settings.rate_limit_max_requests,
+        "windowSeconds": settings.rate_limit_window_seconds,
+    }
+
     try:
         response = httpx.post(
             url,
@@ -57,7 +63,7 @@ def validate_mechbase_api_key(value: str, settings: Settings | None = None) -> A
                 "Content-Type": "application/json",
                 "x-convex-recording-secret": settings.convex_recording_secret,
             },
-            json={"keyHash": key_hash_value},
+            json={"keyHash": key_hash_value, "rateLimit": rate_limit},
             timeout=10,
         )
     except httpx.HTTPError as exc:
@@ -68,6 +74,28 @@ def validate_mechbase_api_key(value: str, settings: Settings | None = None) -> A
 
     if response.status_code == status.HTTP_401_UNAUTHORIZED:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+    if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        headers = {
+            key: value
+            for key, value in {
+                "Retry-After": response.headers.get("retry-after"),
+                "X-RateLimit-Limit": response.headers.get("x-ratelimit-limit"),
+                "X-RateLimit-Remaining": response.headers.get("x-ratelimit-remaining"),
+                "X-RateLimit-Reset": response.headers.get("x-ratelimit-reset"),
+            }.items()
+            if value is not None
+        }
+        detail = "API key rate limit exceeded."
+        try:
+            payload = response.json()
+            detail = str(payload.get("error") or payload.get("detail") or detail)
+        except ValueError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=detail,
+            headers=headers,
+        )
     if response.status_code >= 400:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
