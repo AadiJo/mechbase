@@ -58,6 +58,16 @@ def health() -> dict:
     return {"ok": True, "collection": settings.collection_name}
 
 
+@app.get("/auth/validate")
+def validate_api_key(api_key: ApiKeyContext = Depends(require_api_key)) -> dict:
+    return {
+        "valid": True,
+        "apiKeyId": api_key.api_key_id,
+        "workspaceId": api_key.organization_id,
+        "permissions": list(api_key.permissions),
+    }
+
+
 @app.post("/search", response_model=SearchResponse)
 def search_endpoint(
     request: SearchRequest,

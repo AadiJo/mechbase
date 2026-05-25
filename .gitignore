@@ -9,6 +9,7 @@ __pycache__/
 .codex/
 artifacts/
 data/
+docs/
 qdrant_storage/
 frc_mechanism_rag.egg-info/
 *.pyc

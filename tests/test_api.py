@@ -20,6 +20,27 @@ def test_search_requires_api_key() -> None:
     assert response.status_code == 401
 
 
+def test_validate_api_key_accepts_valid_key(monkeypatch) -> None:
+    def fake_validate_mechbase_api_key(value, settings=None):
+        return ApiKeyContext(
+            api_key_id="api_key_test",
+            organization_id="workspace_test",
+            permissions=("search:read",),
+        )
+
+    monkeypatch.setattr(auth, "validate_mechbase_api_key", fake_validate_mechbase_api_key)
+    client = TestClient(app)
+    response = client.get("/auth/validate", headers={"Authorization": "Bearer sk_test"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "valid": True,
+        "apiKeyId": "api_key_test",
+        "workspaceId": "workspace_test",
+        "permissions": ["search:read"],
+    }
+
+
 def test_search_rejects_key_without_required_permission(monkeypatch) -> None:
     def fake_validate_mechbase_api_key(value, settings=None):
         return ApiKeyContext(
