@@ -1,9 +1,7 @@
 name: Deploy backend to VPS
 
 on:
-  push:
-    branches:
-      - main
+  # Keep deployment manual while the hosted MCP endpoint is being tested.
   workflow_dispatch:
 
 concurrency:
