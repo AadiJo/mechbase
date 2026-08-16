@@ -96,6 +96,11 @@ def search_endpoint(
             team=request.team,
             year=request.year,
             source=request.source,
+            team_numbers=request.team_numbers,
+            years=request.years,
+            source_ids=request.source_ids,
+            mechanism_types=request.mechanism_types,
+            sort=request.sort,
             modality=request.modality,
         )
     except MissingVoyageApiKey as exc:

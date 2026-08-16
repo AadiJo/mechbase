@@ -3,8 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 Modality = Literal["text", "page_image", "extracted_image"]
+SearchSort = Literal["relevance", "newest", "oldest"]
 
 
 class SourceDoc(BaseModel):
@@ -34,6 +34,11 @@ class SearchRequest(BaseModel):
     team: str | None = None
     year: int | None = None
     source: str | None = None
+    team_numbers: list[str] = Field(default_factory=list)
+    years: list[int] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    mechanism_types: list[str] = Field(default_factory=list)
+    sort: SearchSort = "relevance"
     modality: Modality | None = None
     debug: bool = False
 

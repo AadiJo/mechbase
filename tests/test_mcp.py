@@ -20,6 +20,7 @@ from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
     ImageContextResponse,
+    SearchRequest,
     SearchResponse,
     SearchResult,
     SimilarPagesResponse,
@@ -44,11 +45,12 @@ class FakeTokenVerifier:
 
 class FakeRetrievalBackend:
     def __init__(self) -> None:
-        self.search_calls: list[tuple[str, int]] = []
+        self.search_calls: list[SearchRequest] = []
+        self.list_source_calls: list[dict[str, object]] = []
 
-    def search(self, query: str, top_k: int) -> SearchResponse:
-        self.search_calls.append((query, top_k))
-        return SearchResponse(query=query, results=[_search_result("result_1", 12)])
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.search_calls.append(request)
+        return SearchResponse(query=request.query, results=[_search_result("result_1", 12)])
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         if result_id == "missing":
@@ -81,15 +83,34 @@ class FakeRetrievalBackend:
         team: str | None,
         year: int | None,
         source: str | None,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
     ) -> SourceListResponse:
+        self.list_source_calls.append(
+            {
+                "team": team,
+                "year": year,
+                "source": source,
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+            }
+        )
+        resolved_team = team or next(iter(team_numbers), None) or "254"
+        resolved_year = year or next(iter(years), None) or 2020
+        resolved_source = source or (f"{source_ids[0]}.pdf" if source_ids else "254-2020.pdf")
         return SourceListResponse(
             sources=[
                 SourceSummary(
-                    source_pdf=source or "254-2020.pdf",
-                    team=team or "254",
-                    year=year or 2020,
+                    source_pdf=resolved_source,
+                    team=resolved_team,
+                    year=resolved_year,
                     pages=[1, 12],
                     page_count=2,
+                    text_count=3,
+                    page_image_count=2,
+                    extracted_image_count=1,
                     sample_image_urls=["/images/254-2020/page-012/page.png"],
                 )
             ]
@@ -283,12 +304,23 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "render_search_results",
                             "list_sources",
                         }
-                        assert set(tools["search"].input_schema["properties"]) == {"query"}
+                        assert set(tools["search"].input_schema["properties"]) == {
+                            "query",
+                            "team_numbers",
+                            "years",
+                            "source_ids",
+                            "mechanism_types",
+                            "sort",
+                            "top_k",
+                        }
                         assert "Always follow a non-empty search with inspect_candidates" in (
                             tools["search"].description or ""
                         )
                         assert tools["search"].output_schema is not None
-                        assert set(tools["search"].output_schema["properties"]) == {"results"}
+                        assert set(tools["search"].output_schema["properties"]) == {
+                            "results",
+                            "applied_filters",
+                        }
                         assert tools["inspect_candidates"].output_schema is None
                         assert "Always follow visual review with render_search_results" in (
                             tools["inspect_candidates"].description or ""
@@ -317,11 +349,52 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "url": (
                                         "https://api.example.com/images/254-2020/page-012/page.png"
                                     ),
+                                    "source_pdf": "254-2020.pdf",
+                                    "team": "254",
+                                    "year": 2020,
+                                    "page": 12,
+                                    "snippet": "elevator",
                                 }
-                            ]
+                            ],
+                            "applied_filters": {
+                                "team_numbers": [],
+                                "years": [],
+                                "source_ids": [],
+                                "mechanism_types": [],
+                                "sort": "relevance",
+                            },
                         }
                         assert json.loads(searched.content[0].text) == searched.structured_content
-                        assert backend.search_calls == [("elevator", 10)]
+                        assert len(backend.search_calls) == 1
+                        assert backend.search_calls[0].query == "elevator"
+                        assert backend.search_calls[0].top_k == 10
+
+                        filtered = await session.call_tool(
+                            "search",
+                            {
+                                "query": "cone intake",
+                                "team_numbers": [254, 4414, 254],
+                                "years": [2023],
+                                "source_ids": ["254-2023"],
+                                "mechanism_types": ["intake"],
+                                "sort": "newest",
+                                "top_k": 4,
+                            },
+                        )
+                        assert filtered.is_error is False
+                        assert filtered.structured_content["applied_filters"] == {
+                            "team_numbers": ["254", "4414"],
+                            "years": [2023],
+                            "source_ids": ["254-2023"],
+                            "mechanism_types": ["intake"],
+                            "sort": "newest",
+                        }
+                        assert backend.search_calls[1].team_numbers == ["254", "4414"]
+                        assert backend.search_calls[1].years == [2023]
+                        assert backend.search_calls[1].source_ids == ["254-2023"]
+                        assert backend.search_calls[1].mechanism_types == ["intake"]
+                        assert backend.search_calls[1].sort == "newest"
+                        assert backend.search_calls[1].top_k == 4
 
                         inspected = await session.call_tool(
                             "inspect_candidates", {"ids": ["result_1"]}
@@ -395,6 +468,31 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         ]
+                        assert sources.structured_content["sources"][0]["text_count"] == 3
+                        assert sources.structured_content["sources"][0]["page_image_count"] == 2
+                        assert (
+                            sources.structured_content["sources"][0]["extracted_image_count"] == 1
+                        )
+
+                        filtered_sources = await session.call_tool(
+                            "list_sources",
+                            {
+                                "team_numbers": [4414],
+                                "years": [2024],
+                                "source_ids": ["4414-2024"],
+                            },
+                        )
+                        assert filtered_sources.is_error is False
+                        assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
+                        assert filtered_sources.structured_content["sources"][0]["year"] == 2024
+                        assert backend.list_source_calls[-1] == {
+                            "team": None,
+                            "year": None,
+                            "source": None,
+                            "team_numbers": ["4414"],
+                            "years": [2024],
+                            "source_ids": ["4414-2024"],
+                        }
 
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}

@@ -1,6 +1,6 @@
 from app.rag.chunking import expand_query
 from app.rag.config import Settings
-from app.rag.models import SearchRequest, SearchResponse
+from app.rag.models import SearchRequest, SearchResponse, SearchSort
 from app.rag.store import RagStore
 from app.rag.voyage_client import VoyageEmbedder
 
@@ -13,6 +13,11 @@ def search(
     team: str | None = None,
     year: int | None = None,
     source: str | None = None,
+    team_numbers: list[str] | None = None,
+    years: list[int] | None = None,
+    source_ids: list[str] | None = None,
+    mechanism_types: list[str] | None = None,
+    sort: SearchSort = "relevance",
     modality: str | None = None,
 ) -> SearchResponse:
     request = SearchRequest(
@@ -22,9 +27,14 @@ def search(
         team=team,
         year=year,
         source=source,
+        team_numbers=team_numbers or [],
+        years=years or [],
+        source_ids=source_ids or [],
+        mechanism_types=mechanism_types or [],
+        sort=sort,
         modality=modality,  # type: ignore[arg-type]
     )
-    expanded = expand_query(query)
+    expanded = expand_query(" ".join([query, *request.mechanism_types]))
     embedder = VoyageEmbedder(settings)
     text_vector = embedder.embed_texts([expanded], "query")[0]
     image_vector = embedder.embed_multimodal([expanded], [None], "query")[0]

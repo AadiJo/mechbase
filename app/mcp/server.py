@@ -16,6 +16,7 @@ from starlette.types import ASGIApp
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
+    AppliedSearchFilters,
     FetchOutput,
     InspectOutput,
     RenderOutput,
@@ -31,7 +32,9 @@ from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET
 from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
+    SearchRequest,
     SearchResponse,
+    SearchSort,
     SimilarPagesResponse,
     SourceListResponse,
 )
@@ -45,10 +48,14 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,
 )
 MODEL_ONLY = Annotations(audience=["assistant"], priority=1.0)
+TeamNumber = Annotated[int, Field(ge=1, le=99999)]
+SeasonYear = Annotated[int, Field(ge=1992, le=2100)]
+SourceId = Annotated[str, Field(min_length=1, max_length=160)]
+MechanismType = Annotated[str, Field(min_length=1, max_length=80)]
 
 
 class RetrievalBackend(Protocol):
-    def search(self, query: str, top_k: int) -> SearchResponse: ...
+    def search(self, request: SearchRequest) -> SearchResponse: ...
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
 
@@ -60,6 +67,9 @@ class RetrievalBackend(Protocol):
         team: str | None,
         year: int | None,
         source: str | None,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
     ) -> SourceListResponse: ...
 
 
@@ -67,8 +77,18 @@ class RagRetrievalBackend:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def search(self, query: str, top_k: int) -> SearchResponse:
-        return rag_search(query, top_k=top_k, debug=False, settings=self._settings)
+    def search(self, request: SearchRequest) -> SearchResponse:
+        return rag_search(
+            request.query,
+            top_k=request.top_k,
+            debug=False,
+            settings=self._settings,
+            team_numbers=request.team_numbers,
+            years=request.years,
+            source_ids=request.source_ids,
+            mechanism_types=request.mechanism_types,
+            sort=request.sort,
+        )
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         return RagStore(self._settings).image_context(result_id=result_id)
@@ -82,8 +102,18 @@ class RagRetrievalBackend:
         team: str | None,
         year: int | None,
         source: str | None,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
     ) -> SourceListResponse:
-        return RagStore(self._settings).list_sources(team=team, year=year, source=source)
+        return RagStore(self._settings).list_sources(
+            team=team,
+            year=year,
+            source=source,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+        )
 
 
 def create_mcp_server(
@@ -156,20 +186,50 @@ def create_mcp_server(
     @server.tool(
         title="Search FRC mechanisms",
         description=(
-            "Search FRC technical binders for mechanism designs and return stable result ids "
-            "with citation URLs. Always follow a non-empty search with inspect_candidates on the "
-            "most promising ids before answering, even when the user only asks to find or search "
-            "Mechbase and does not mention images. After visual review, display relevant pages "
-            "only through render_search_results."
+            "Search FRC technical binders for mechanism designs. Use team_numbers, years, and "
+            "source_ids whenever the user names exact teams, seasons, or binders. "
+            "mechanism_types add semantic search terms; they are not exact metadata filters. "
+            "The sort option orders relevant candidates and does not measure design quality or "
+            "competition performance. Always follow a non-empty search with inspect_candidates "
+            "on the most promising ids before answering. After visual review, display relevant "
+            "pages only through render_search_results."
         ),
         annotations=READ_ONLY,
         structured_output=True,
     )
-    def search(query: str) -> SearchOutput:
+    def search(
+        query: str,
+        team_numbers: Annotated[list[TeamNumber], Field(max_length=20)] | None = None,
+        years: Annotated[list[SeasonYear], Field(max_length=20)] | None = None,
+        source_ids: Annotated[list[SourceId], Field(max_length=20)] | None = None,
+        mechanism_types: Annotated[list[MechanismType], Field(max_length=8)] | None = None,
+        sort: SearchSort = "relevance",
+        top_k: Annotated[int | None, Field(ge=1, le=20)] = None,
+    ) -> SearchOutput:
+        filters = AppliedSearchFilters(
+            team_numbers=[str(team) for team in dict.fromkeys(team_numbers or [])],
+            years=list(dict.fromkeys(years or [])),
+            source_ids=list(dict.fromkeys(source_ids or [])),
+            mechanism_types=list(dict.fromkeys(mechanism_types or [])),
+            sort=sort,
+        )
         if not query.strip():
-            return SearchOutput(results=[])
-        response = retrieval.search(query.strip(), settings.mcp_search_top_k)
-        return search_output(response.results, public_base_url)
+            return SearchOutput(results=[], applied_filters=filters)
+        request = SearchRequest(
+            query=query.strip(),
+            top_k=top_k or settings.mcp_search_top_k,
+            team_numbers=filters.team_numbers,
+            years=filters.years,
+            source_ids=filters.source_ids,
+            mechanism_types=filters.mechanism_types,
+            sort=filters.sort,
+        )
+        response = retrieval.search(request)
+        return search_output(
+            response.results,
+            public_base_url,
+            applied_filters=filters,
+        )
 
     @server.tool(
         title="Inspect FRC mechanism candidate images",
@@ -324,7 +384,11 @@ def create_mcp_server(
 
     @server.tool(
         title="List indexed FRC binders",
-        description="List indexed technical binders, optionally filtered by team, year, or filename.",
+        description=(
+            "List indexed technical binders and their text and image coverage. Use exact team, "
+            "year, filename, or source-id filters to check whether Mechbase covers a request "
+            "before substituting results from another team or season."
+        ),
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -332,9 +396,19 @@ def create_mcp_server(
         team: str | None = None,
         year: int | None = None,
         source: str | None = None,
+        team_numbers: Annotated[list[TeamNumber], Field(max_length=50)] | None = None,
+        years: Annotated[list[SeasonYear], Field(max_length=35)] | None = None,
+        source_ids: Annotated[list[SourceId], Field(max_length=50)] | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
     ) -> SourceOutput:
-        response = retrieval.list_sources(team=team, year=year, source=source)
+        response = retrieval.list_sources(
+            team=team,
+            year=year,
+            source=source,
+            team_numbers=[str(value) for value in dict.fromkeys(team_numbers or [])],
+            years=list(dict.fromkeys(years or [])),
+            source_ids=list(dict.fromkeys(source_ids or [])),
+        )
         return source_output(response.sources[:limit], public_base_url)
 
     return server

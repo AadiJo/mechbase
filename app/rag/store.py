@@ -18,7 +18,6 @@ from app.rag.models import (
     SourceSummary,
 )
 
-
 TEXT_VECTOR = "text"
 IMAGE_VECTOR = "image"
 
@@ -92,17 +91,39 @@ class RagStore:
                         {"vector_source": source, "vector_score": float(hit.score), "lexical_bonus": lexical},
                     )
         ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
-        results: list[SearchResult] = []
+        candidates: list[SearchResult] = []
         seen_pages: set[tuple[str, int]] = set()
         for point_id, (score, payload, debug) in ranked:
             page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
             if page_key in seen_pages:
                 continue
             seen_pages.add(page_key)
-            results.append(self._search_result_from_payload(payload, score, debug if request.debug else {}))
-            if len(results) >= request.top_k:
-                break
-        return results
+            candidates.append(
+                self._search_result_from_payload(
+                    payload,
+                    score,
+                    debug if request.debug else {},
+                )
+            )
+
+        if request.sort == "newest":
+            candidates.sort(
+                key=lambda result: (
+                    result.year is not None,
+                    result.year or 0,
+                    result.score,
+                ),
+                reverse=True,
+            )
+        elif request.sort == "oldest":
+            candidates.sort(
+                key=lambda result: (
+                    result.year is None,
+                    result.year or 0,
+                    -result.score,
+                )
+            )
+        return candidates[: request.top_k]
 
 
     def page_context(self, source_pdf: str, page: int) -> PageContextResponse | None:
@@ -162,8 +183,21 @@ class RagStore:
         team: str | None = None,
         year: int | None = None,
         source: str | None = None,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
     ) -> SourceListResponse:
-        payloads = self._scroll_payloads(_metadata_filter(team=team, year=year, source=source), limit=10000)
+        payloads = self._scroll_payloads(
+            _metadata_filter(
+                team=team,
+                year=year,
+                source=source,
+                team_numbers=team_numbers,
+                years=years,
+                source_ids=source_ids,
+            ),
+            limit=10000,
+        )
         return SourceListResponse(sources=self._summarize_sources(payloads))
 
     def source_summary(self, source_pdf: str) -> SourceSummary | None:
@@ -424,27 +458,42 @@ def _metadata_filter(
     team: str | None = None,
     year: int | None = None,
     source: str | None = None,
+    team_numbers: list[str] | None = None,
+    years: list[int] | None = None,
+    source_ids: list[str] | None = None,
 ) -> models.Filter | None:
     conditions = []
-    if team:
-        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=team)))
-    if year:
-        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=year)))
+    all_teams = list(dict.fromkeys([*([team] if team else []), *(team_numbers or [])]))
+    all_years = list(dict.fromkeys([*([year] if year else []), *(years or [])]))
+    if all_teams:
+        conditions.append(_match_values("team", all_teams))
+    if all_years:
+        conditions.append(_match_values("year", all_years))
     if source:
         conditions.append(models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source)))
+    if source_ids:
+        conditions.append(_match_values("source_id", list(dict.fromkeys(source_ids))))
     return models.Filter(must=conditions) if conditions else None
 
 def _build_filter(request: SearchRequest) -> models.Filter | None:
-    conditions = []
-    if request.team:
-        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=request.team)))
-    if request.year:
-        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=request.year)))
-    if request.source:
-        conditions.append(models.FieldCondition(key="source_pdf", match=models.MatchValue(value=request.source)))
+    metadata_filter = _metadata_filter(
+        team=request.team,
+        year=request.year,
+        source=request.source,
+        team_numbers=request.team_numbers,
+        years=request.years,
+        source_ids=request.source_ids,
+    )
+    conditions = list(metadata_filter.must or []) if metadata_filter else []
     if request.modality:
         conditions.append(models.FieldCondition(key="modality", match=models.MatchValue(value=request.modality)))
     return models.Filter(must=conditions) if conditions else None
+
+
+def _match_values(key: str, values: list[str] | list[int]) -> models.FieldCondition:
+    if len(values) == 1:
+        return models.FieldCondition(key=key, match=models.MatchValue(value=values[0]))
+    return models.FieldCondition(key=key, match=models.MatchAny(any=values))
 
 
 def _lexical_bonus(query: str, text: str) -> float:

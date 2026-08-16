@@ -47,14 +47,16 @@ The MCP endpoint accepts Clerk OAuth access tokens only.
 
 The server provides six read-only tools:
 
-- `search(query)` returns the standard ChatGPT company-knowledge result shape.
+- `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
+  result-count controls. Results include source metadata and a short evidence snippet.
 - `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
   model can check visual relevance before anything is displayed.
 - `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
 - `find_similar(id, top_k)` finds related mechanism pages.
 - `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
   hosts that support MCP Apps. Other clients still receive its structured result.
-- `list_sources(...)` lists indexed technical binders.
+- `list_sources(...)` lists indexed technical binders with exact metadata filters and coverage
+  counts for text, page images, and extracted figures.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.

@@ -3,17 +3,31 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, JsonValue
 
 from app.mcp.images import preview_image_url
-from app.rag.models import ImageContextResponse, SearchResult, SourceSummary
+from app.rag.models import ImageContextResponse, SearchResult, SearchSort, SourceSummary
 
 
 class SearchItem(BaseModel):
     id: str
     title: str
     url: str
+    source_pdf: str
+    team: str | None = None
+    year: int | None = None
+    page: int
+    snippet: str = ""
+
+
+class AppliedSearchFilters(BaseModel):
+    team_numbers: list[str] = Field(default_factory=list)
+    years: list[int] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    mechanism_types: list[str] = Field(default_factory=list)
+    sort: SearchSort = "relevance"
 
 
 class SearchOutput(BaseModel):
     results: list[SearchItem]
+    applied_filters: AppliedSearchFilters = Field(default_factory=AppliedSearchFilters)
 
 
 class FetchOutput(BaseModel):
@@ -30,6 +44,9 @@ class SourceItem(BaseModel):
     year: int | None = None
     pages: list[int] = Field(default_factory=list)
     page_count: int
+    text_count: int
+    page_image_count: int
+    extracted_image_count: int
     sample_image_urls: list[str] = Field(default_factory=list)
 
 
@@ -70,17 +87,28 @@ class RenderOutput(BaseModel):
     results: list[RenderItem]
 
 
-def search_output(results: list[SearchResult], public_base_url: str) -> SearchOutput:
+def search_output(
+    results: list[SearchResult],
+    public_base_url: str,
+    *,
+    applied_filters: AppliedSearchFilters | None = None,
+) -> SearchOutput:
     return SearchOutput(
         results=[
             SearchItem(
                 id=result.id,
                 title=_result_title(result.source_pdf, result.page, result.team),
                 url=_result_url(result, public_base_url),
+                source_pdf=result.source_pdf,
+                team=result.team,
+                year=result.year,
+                page=result.page,
+                snippet=_truncate(result.text.strip(), 500),
             )
             for result in results
             if result.id
-        ]
+        ],
+        applied_filters=applied_filters or AppliedSearchFilters(),
     )
 
 
@@ -119,6 +147,9 @@ def source_output(
                 year=source.year,
                 pages=source.pages,
                 page_count=source.page_count,
+                text_count=source.text_count,
+                page_image_count=source.page_image_count,
+                extracted_image_count=source.extracted_image_count,
                 sample_image_urls=[
                     _absolute_url(public_base_url, url) for url in source.sample_image_urls
                 ],
