@@ -16,6 +16,7 @@ from PIL import Image
 
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
+from app.mcp.images import load_preview_image
 from app.mcp.results import search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
@@ -186,6 +187,28 @@ def test_search_output_preserves_weak_result_abstention() -> None:
     assert output.results == []
     assert output.coverage.weak_pages_dropped == 3
     assert output.abstention_reason == ("No indexed pages met the calibrated relevance threshold.")
+
+
+def test_candidate_preview_uses_shared_external_image_cache(tmp_path: Path) -> None:
+    source = tmp_path / "page.png"
+    Image.new("RGB", (64, 64), "white").save(source)
+    context = ImageContextResponse(
+        image_url="/images/page.png",
+        source_pdf="254-2020.pdf",
+        page=1,
+        page_context_url="/pages/254-2020.pdf/1",
+        page_text_url="/pages/254-2020.pdf/1/text",
+        text="intake",
+        image_urls=["/images/page.png"],
+    )
+
+    first = load_preview_image(context, _settings(tmp_path), max_side=32)
+    second = load_preview_image(context, _settings(tmp_path), max_side=32)
+
+    assert first is not None
+    assert second == first
+    assert len(list((tmp_path / ".embedding-cache").glob("*.jpg"))) == 1
+    assert not (tmp_path / ".embed").exists()
 
 
 def test_clerk_token_verifier_accepts_active_tokens() -> None:

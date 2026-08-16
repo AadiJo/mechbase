@@ -1,13 +1,12 @@
 import base64
 import mimetypes
 import time
-from hashlib import sha256
 from pathlib import Path
 
 import httpx
-from PIL import Image
 
 from app.rag.config import Settings
+from app.rag.image_cache import cached_resized_image
 
 
 class MissingVoyageApiKey(RuntimeError):
@@ -56,7 +55,7 @@ class VoyageEmbedder:
                     {
                         "type": "image_base64",
                         "image_base64": _data_url(
-                            _embedding_image(
+                            cached_resized_image(
                                 Path(image_path),
                                 self.settings.max_embed_image_side,
                                 self.settings.artifact_dir / ".embedding-cache",
@@ -102,19 +101,3 @@ def _data_url(path: Path) -> str:
     if media_type == "image/jpg":
         media_type = "image/jpeg"
     return f"data:{media_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
-
-
-def _embedding_image(path: Path, max_side: int, cache_dir: Path) -> Path:
-    digest = sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / f"{digest.hexdigest()}-{max_side}.jpg"
-    if out.exists():
-        return out
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        image.thumbnail((max_side, max_side))
-        image.save(out, "JPEG", quality=82, optimize=True)
-    return out

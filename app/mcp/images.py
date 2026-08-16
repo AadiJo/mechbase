@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from PIL import Image, ImageOps, UnidentifiedImageError
-
 from app.rag.config import Settings
+from app.rag.image_cache import cached_resized_image
 from app.rag.models import ImageContextResponse
 
 
@@ -35,28 +33,16 @@ def load_preview_image(
     if source is None or not source.is_file():
         return None
 
-    cached_preview = source.parent / ".embed" / f"{source.stem}-{max_side}.jpg"
-    if cached_preview.is_file():
-        return PreviewImage(data=cached_preview.read_bytes(), mime_type="image/jpeg")
-
     try:
-        with Image.open(source) as original:
-            image = ImageOps.exif_transpose(original)
-            image.thumbnail((max_side, max_side))
-            if image.mode == "RGB":
-                rgb = image
-            elif "A" in image.getbands():
-                rgb = Image.new("RGB", image.size, "white")
-                rgb.paste(image, mask=image.getchannel("A"))
-            else:
-                rgb = image.convert("RGB")
-
-            output = BytesIO()
-            rgb.save(output, "JPEG", quality=82, optimize=True)
-    except (OSError, UnidentifiedImageError):
+        cached = cached_resized_image(
+            source,
+            max_side,
+            settings.artifact_dir / ".embedding-cache",
+        )
+        data = cached.read_bytes()
+    except OSError:
         return None
-
-    return PreviewImage(data=output.getvalue(), mime_type="image/jpeg")
+    return PreviewImage(data=data, mime_type="image/jpeg")
 
 
 def _artifact_path_from_url(image_url: str, settings: Settings) -> Path | None:
