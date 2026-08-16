@@ -785,9 +785,7 @@ def test_image_contexts_batches_result_and_page_lookups(tmp_path: Path) -> None:
     assert client.calls == 2
     assert len(client.filters[1].should) == 2
     assert list(contexts) == ["result-1", "result-2"]
-    assert contexts["result-1"].page_image_url == (
-        "/images/generation-new/page-001/page.png"
-    )
+    assert contexts["result-1"].page_image_url == ("/images/generation-new/page-001/page.png")
     assert contexts["result-2"].text == "page 2"
 
 

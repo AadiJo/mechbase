@@ -1007,10 +1007,24 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         inspected_old_generation = await session.call_tool(
                             "inspect_candidates", {"ids": ["result_1"]}
                         )
-                        old_generation_figure_id = inspected_old_generation.structured_content[
+                        old_generation_assets = inspected_old_generation.structured_content[
                             "candidates"
-                        ][0]["assets"][1]["asset_id"]
+                        ][0]["assets"]
+                        old_generation_page_id = old_generation_assets[0]["asset_id"]
+                        old_generation_figure_id = old_generation_assets[1]["asset_id"]
                         backend.asset_generation = "generation-new"
+                        stale_generation_page = await session.call_tool(
+                            "render_search_results",
+                            {
+                                "selections": [
+                                    {
+                                        "id": "result_1",
+                                        "asset_id": old_generation_page_id,
+                                    }
+                                ]
+                            },
+                        )
+                        assert stale_generation_page.is_error is True
                         stale_generation_asset = await session.call_tool(
                             "render_search_results",
                             {
@@ -1023,6 +1037,21 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             },
                         )
                         assert stale_generation_asset.is_error is True
+                        missing_page_asset = await session.call_tool(
+                            "render_search_results",
+                            {"selections": [{"id": "result_1"}]},
+                        )
+                        assert missing_page_asset.is_error is True
+
+                        # The legacy ids alias deliberately resolves the current full-page asset.
+                        legacy_after_refresh = await session.call_tool(
+                            "render_search_results", {"ids": ["result_1"]}
+                        )
+                        assert legacy_after_refresh.is_error is False
+                        assert (
+                            legacy_after_refresh.structured_content["results"][0]["asset_id"]
+                            != old_generation_page_id
+                        )
                         backend.asset_generation = None
 
                         invalid_figure = await session.call_tool(
@@ -1034,7 +1063,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "render_search_results",
                             {
                                 "ids": ["result_1"],
-                                "selections": [{"id": "result_1"}],
+                                "selections": [{"id": "result_1", "asset_id": page_asset_id}],
                             },
                         )
                         assert ambiguous_render.is_error is True

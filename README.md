@@ -62,7 +62,8 @@ The server provides seven read-only tools:
   year, and source filters, and explains which form of similarity matched each result.
 - `render_search_results(ids, selections)` displays only model-selected pages or extracted figures
   in an inline image rail on MCP hosts that support MCP Apps. `ids` remains the legacy full-page
-  alias; new clients can use `selections` with asset IDs. Other clients receive structured output.
+  alias and cannot detect a source refresh; current clients use `selections` with the inspected
+  asset ID for every page or figure. Other clients receive structured output.
 - `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
   search, stable logical IDs plus content versions, provenance when known, and complete text and
   image coverage counts.

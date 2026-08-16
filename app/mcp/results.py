@@ -191,7 +191,7 @@ class InspectOutput(BaseModel):
 
 class RenderSelection(BaseModel):
     id: str = Field(min_length=1, max_length=200)
-    asset_id: str | None = Field(default=None, min_length=1, max_length=100)
+    asset_id: str = Field(min_length=1, max_length=100)
 
 
 class RenderItem(BaseModel):
