@@ -11,6 +11,8 @@ from PIL import Image
 from app.rag.artifacts import generation_namespace, source_artifact_root
 from app.rag.chunking import (
     MECHANISM_HEADINGS,
+    contains_token_phrase,
+    normalize_token_phrase,
     resolve_page_section,
     section_candidates,
     split_text,
@@ -245,7 +247,8 @@ def _repeated_headers(pdf: fitz.Document) -> set[str]:
     candidate_counts: Counter[str] = Counter()
     for page in pdf:
         candidates = [
-            candidate.casefold() for candidate in section_candidates(page.get_text("text"))[:2]
+            normalize_token_phrase(candidate)
+            for candidate in section_candidates(page.get_text("text"))[:2]
         ]
         candidate_counts.update(set(candidates))
     minimum_repeats = max(2, math.ceil(len(pdf) * 0.6))
@@ -255,7 +258,7 @@ def _repeated_headers(pdf: fitz.Document) -> set[str]:
     repeated = {
         candidate
         for candidate in repeated
-        if not any(f" {mechanism} " in f" {candidate} " for mechanism in MECHANISM_HEADINGS)
+        if not any(contains_token_phrase(candidate, mechanism) for mechanism in MECHANISM_HEADINGS)
     }
     if not repeated:
         return set()

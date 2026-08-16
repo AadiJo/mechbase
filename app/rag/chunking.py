@@ -64,13 +64,28 @@ def section_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def normalize_token_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def contains_token_phrase(text: str, phrase: str) -> bool:
+    haystack = normalize_token_phrase(text).split()
+    needle = normalize_token_phrase(phrase).split()
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[index : index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
 def section_from_text(text: str, ignored: set[str] | None = None) -> str | None:
-    ignored_keys = {value.casefold() for value in ignored or set()}
+    ignored_keys = {normalize_token_phrase(value) for value in ignored or set()}
     return next(
         (
             candidate
             for candidate in section_candidates(text)
-            if candidate.casefold() not in ignored_keys
+            if normalize_token_phrase(candidate) not in ignored_keys
         ),
         None,
     )

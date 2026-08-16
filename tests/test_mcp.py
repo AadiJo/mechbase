@@ -183,7 +183,7 @@ class FakeRetrievalBackend:
                 page=page,
                 section="Elevator" if page in {11, 12, 13} else "Overview",
                 text=(
-                    "Swerve Drive\nMechanical Design\nPage 1 source text"
+                    "Swerve Drive\nMechanical Design\nFloor-Pickup\nHarmonic drive"
                     if page == 1
                     else f"Page {page} source text"
                 ),
@@ -959,6 +959,31 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             page["page"]
                             for page in browsed_text_heading.structured_content["pages"]
                         ] == [1]
+
+                        browsed_hyphenated_heading = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "floor pickup",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_hyphenated_heading.is_error is False
+                        assert [
+                            page["page"]
+                            for page in browsed_hyphenated_heading.structured_content["pages"]
+                        ] == [1]
+
+                        browsed_substring = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "arm",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_substring.is_error is False
+                        assert browsed_substring.structured_content["pages"] == []
 
                         bounded_section_browse = await session.call_tool(
                             "browse_source",

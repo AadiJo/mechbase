@@ -37,6 +37,7 @@ from app.mcp.results import (
     visual_candidate,
 )
 from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET_URI
+from app.rag.chunking import contains_token_phrase, normalize_token_phrase
 from app.rag.config import Settings
 from app.rag.models import (
     FetchContextResponse,
@@ -613,7 +614,9 @@ def create_mcp_server(
                 raise ValueError("browse_source can return at most 10 pages per call.")
         if cursor is not None and start_page is not None:
             raise ValueError("cursor cannot be combined with an explicit page range.")
-        section_needle = section.strip().casefold() if section else None
+        section_needle = normalize_token_phrase(section) if section else None
+        if section is not None and not section_needle:
+            raise ValueError("section must contain at least one letter or number.")
         if cursor is not None and cursor.source_id != source_id:
             raise ValueError("The browse cursor belongs to a different source.")
         if cursor is not None and cursor.section != section_needle:
@@ -653,7 +656,10 @@ def create_mcp_server(
             context
             for context in contexts
             if section_needle is None
-            or section_needle in "\n".join((context.section or "", context.text)).casefold()
+            or contains_token_phrase(
+                "\n".join((context.section or "", context.text)),
+                section_needle,
+            )
         ]
         total_matches = len(matching_contexts)
         matching_contexts = matching_contexts[:10]
