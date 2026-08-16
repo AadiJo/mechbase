@@ -12,6 +12,7 @@ import app.api.main as main
 from app.api.auth import ApiKeyContext
 from app.api.main import app
 from app.rag.config import Settings
+from app.rag.ingest import ingestion_lock
 from app.rag.models import SearchResponse
 from app.rag.store import RagStore
 
@@ -35,6 +36,9 @@ def test_api_startup_migrates_and_denies_legacy_control_state(tmp_path: Path) ->
     )
     (artifact_dir / ".embedding-cache").mkdir()
     (artifact_dir / ".embedding-cache" / "preview.jpg").write_bytes(b"private")
+    nested_metadata = artifact_dir / "sources" / "254" / "generation" / ".complete.json"
+    nested_metadata.parent.mkdir(parents=True)
+    nested_metadata.write_text("{}", encoding="utf-8")
     settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
 
     main.prepare_control_state(settings)
@@ -50,6 +54,43 @@ def test_api_startup_migrates_and_denies_legacy_control_state(tmp_path: Path) ->
     assert client.get("/images/ingestion-manifest.jsonl").status_code == 404
     assert client.get("/images/ingestion.lock").status_code == 404
     assert client.get("/images/.embedding-cache/preview.jpg").status_code == 404
+    assert client.get("/images/sources/254/generation/.complete.json").status_code == 404
+
+
+def test_api_startup_waits_for_an_active_legacy_ingestion(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    state_dir = tmp_path / "state"
+    settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    startup_finished = threading.Event()
+    startup_errors: list[BaseException] = []
+
+    def legacy_writer() -> None:
+        with ingestion_lock(artifact_dir):
+            writer_started.set()
+            release_writer.wait(timeout=2)
+
+    def prepare_api() -> None:
+        try:
+            main.prepare_control_state(settings)
+        except BaseException as exc:
+            startup_errors.append(exc)
+        finally:
+            startup_finished.set()
+
+    writer = threading.Thread(target=legacy_writer)
+    writer.start()
+    assert writer_started.wait(timeout=1)
+    startup = threading.Thread(target=prepare_api)
+    startup.start()
+    assert not startup_finished.wait(timeout=0.05)
+    release_writer.set()
+    writer.join(timeout=1)
+    startup.join(timeout=1)
+
+    assert startup_finished.is_set()
+    assert startup_errors == []
 
 
 def test_compose_services_share_the_configured_private_state_volume() -> None:
@@ -59,7 +100,7 @@ def test_compose_services_share_the_configured_private_state_volume() -> None:
     assert compose.count("RAG_STATE_DIR: /app/rag-state") == 2
 
 
-def test_cancelled_startup_awaits_its_bounded_index_worker() -> None:
+def test_repeatedly_cancelled_startup_awaits_its_bounded_index_worker() -> None:
     async def verify() -> tuple[bool, bool]:
         started = threading.Event()
         release = threading.Event()
@@ -71,6 +112,8 @@ def test_cancelled_startup_awaits_its_bounded_index_worker() -> None:
         task = asyncio.create_task(main._run_blocking_safely(worker))
         while not started.is_set():
             await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
         task.cancel()
         await asyncio.sleep(0)
         still_waiting = not task.done()

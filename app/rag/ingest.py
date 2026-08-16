@@ -303,12 +303,13 @@ def remove_abandoned_artifact_staging(artifact_dir: Path) -> None:
 
 
 @contextmanager
-def ingestion_lock(state_dir: Path) -> Iterator[None]:
+def ingestion_lock(state_dir: Path, *, blocking: bool = False) -> Iterator[None]:
     lock_path = state_dir / "ingestion.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(lock_file.fileno(), operation)
         except BlockingIOError as exc:
             raise RuntimeError("Another ingestion process is already running.") from exc
         try:
@@ -318,9 +319,12 @@ def ingestion_lock(state_dir: Path) -> Iterator[None]:
 
 
 @contextmanager
-def control_state_lock(settings: Settings) -> Iterator[None]:
+def control_state_lock(settings: Settings, *, blocking: bool = False) -> Iterator[None]:
     """Coordinate new readers and writers with ingestion processes from the prior release."""
-    with ingestion_lock(settings.artifact_dir), ingestion_lock(settings.rag_state_dir):
+    with (
+        ingestion_lock(settings.artifact_dir, blocking=blocking),
+        ingestion_lock(settings.rag_state_dir, blocking=blocking),
+    ):
         yield
 
 

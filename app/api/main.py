@@ -44,7 +44,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def prepare_control_state(current_settings: Settings) -> None:
-    with control_state_lock(current_settings):
+    with control_state_lock(current_settings, blocking=True):
         migrate_legacy_control_state(current_settings)
 
 
@@ -64,13 +64,20 @@ async def _ensure_payload_indexes() -> None:
 
 async def _run_blocking_safely(operation: Callable[[], object]) -> None:
     worker = asyncio.create_task(asyncio.to_thread(operation))
-    try:
-        await asyncio.shield(worker)
-    except asyncio.CancelledError as cancellation:
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
         try:
-            await worker
-        finally:
-            raise cancellation
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+    if cancellation is not None:
+        if not worker.cancelled():
+            worker.exception()
+        raise cancellation
+    worker.result()
 
 
 PRIVATE_ARTIFACT_ROOTS = frozenset(
@@ -80,8 +87,8 @@ PRIVATE_ARTIFACT_ROOTS = frozenset(
 
 class ArtifactStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
-        root_name = path.split("/", 1)[0]
-        if root_name.startswith(".") or root_name in PRIVATE_ARTIFACT_ROOTS:
+        path_parts = path.split("/")
+        if any(part.startswith(".") or part in PRIVATE_ARTIFACT_ROOTS for part in path_parts):
             return PlainTextResponse("Not Found", status_code=404)
         return await super().get_response(path, scope)
 
