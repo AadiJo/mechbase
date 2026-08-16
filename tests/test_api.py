@@ -93,6 +93,41 @@ def test_api_startup_waits_for_an_active_legacy_ingestion(tmp_path: Path) -> Non
     assert startup_errors == []
 
 
+def test_async_startup_lock_wait_remains_responsive_and_cancel_safe(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    state_dir = tmp_path / "state"
+    settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+
+    def legacy_writer() -> None:
+        with ingestion_lock(artifact_dir):
+            writer_started.set()
+            release_writer.wait(timeout=2)
+
+    writer = threading.Thread(target=legacy_writer)
+    writer.start()
+    assert writer_started.wait(timeout=1)
+
+    async def verify() -> tuple[bool, bool]:
+        task = asyncio.create_task(main.prepare_control_state_async(settings))
+        await asyncio.sleep(0.01)
+        event_loop_remained_responsive = not task.done()
+        task.cancel()
+        await asyncio.sleep(0)
+        cancellation_is_draining = not task.done()
+        release_writer.set()
+        with suppress(asyncio.CancelledError):
+            await task
+        return event_loop_remained_responsive, cancellation_is_draining
+
+    try:
+        assert asyncio.run(verify()) == (True, True)
+    finally:
+        release_writer.set()
+        writer.join(timeout=1)
+
+
 def test_compose_services_share_the_configured_private_state_volume() -> None:
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
 
@@ -123,6 +158,29 @@ def test_repeatedly_cancelled_startup_awaits_its_bounded_index_worker() -> None:
         return still_waiting, task.cancelled()
 
     assert asyncio.run(verify()) == (True, True)
+
+
+def test_recorded_cancellation_takes_priority_over_a_late_worker_error() -> None:
+    async def verify() -> bool:
+        started = threading.Event()
+        release = threading.Event()
+
+        def worker() -> None:
+            started.set()
+            release.wait(timeout=2)
+            raise RuntimeError("late worker failure")
+
+        task = asyncio.create_task(main._run_blocking_safely(worker))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with suppress(asyncio.CancelledError):
+            await task
+        return task.cancelled()
+
+    assert asyncio.run(verify()) is True
 
 
 def test_search_requires_api_key() -> None:

@@ -3,6 +3,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -37,7 +38,7 @@ mcp_http_app = create_mcp_http_app(mcp_server, settings)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    prepare_control_state(settings)
+    await prepare_control_state_async(settings)
     await _ensure_payload_indexes()
     async with mcp_server.session_manager.run():
         yield
@@ -46,6 +47,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 def prepare_control_state(current_settings: Settings) -> None:
     with control_state_lock(current_settings, blocking=True):
         migrate_legacy_control_state(current_settings)
+
+
+async def prepare_control_state_async(current_settings: Settings) -> None:
+    await _run_blocking_safely(partial(prepare_control_state, current_settings))
 
 
 async def _ensure_payload_indexes() -> None:
@@ -65,6 +70,7 @@ async def _ensure_payload_indexes() -> None:
 async def _run_blocking_safely(operation: Callable[[], object]) -> None:
     worker = asyncio.create_task(asyncio.to_thread(operation))
     cancellation: asyncio.CancelledError | None = None
+    worker_error: BaseException | None = None
     while not worker.done():
         try:
             await asyncio.shield(worker)
@@ -73,10 +79,15 @@ async def _run_blocking_safely(operation: Callable[[], object]) -> None:
             current_task = asyncio.current_task()
             if current_task is not None:
                 current_task.uncancel()
+        except BaseException as exc:
+            worker_error = exc
+            break
     if cancellation is not None:
         if not worker.cancelled():
             worker.exception()
         raise cancellation
+    if worker_error is not None:
+        raise worker_error
     worker.result()
 
 
