@@ -22,6 +22,7 @@ from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
     ImageContextResponse,
+    PageContextResponse,
     SearchCoverage,
     SearchRequest,
     SearchResponse,
@@ -49,6 +50,8 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
+        self.similar_calls: list[dict[str, object]] = []
+        self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
@@ -87,18 +90,76 @@ class FakeRetrievalBackend:
             image_urls=["/images/254-2020/page-012/page.png"],
         )
 
-    def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
+    def find_similar(
+        self,
+        result_id: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SimilarPagesResponse | None:
         if result_id == "missing":
             return None
+        self.similar_calls.append(
+            {
+                "result_id": result_id,
+                "top_k": top_k,
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+            }
+        )
+        result = _search_result("result_2", 8)
+        result.debug["similarity_reason"] = "both"
         return SimilarPagesResponse(
-            seed={"id": result_id},
-            results=[_search_result("result_2", 8)][:top_k],
+            seed={"id": result_id, "modality": "text"},
+            results=[result][:top_k],
             coverage=SearchCoverage(
                 candidate_pages=1,
                 candidate_sources=1,
                 returned_pages=1,
             ),
         )
+
+    def page_contexts(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+    ) -> list[PageContextResponse]:
+        self.page_context_calls.append(
+            {
+                "source_pdf": source_pdf,
+                "pages": pages,
+                "source_version_id": source_version_id,
+                "ingestion_id": ingestion_id,
+            }
+        )
+        if source_pdf != "254-2020.pdf":
+            return []
+        available_pages = {1, 11, 12, 13}
+        selected_pages = sorted({1, 12} if pages is None else available_pages & set(pages))
+        return [
+            PageContextResponse(
+                source_id="254-2020",
+                source_version="version-a",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2020,
+                page=page,
+                section="Elevator" if page in {11, 12, 13} else "Overview",
+                text=f"Page {page} source text",
+                page_image_url=f"/images/254-2020/page-{page:03d}/page.png",
+                image_urls=[f"/images/254-2020/page-{page:03d}/page.png"],
+                result_ids=[f"result_page_{page}"],
+                primary_result_id=f"result_page_{page}",
+            )
+            for page in selected_pages
+        ]
 
     def list_sources(
         self,
@@ -418,6 +479,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "find_similar",
                             "render_search_results",
                             "list_sources",
+                            "browse_source",
                         }
                         assert set(tools["search"].input_schema["properties"]) == {
                             "query",
@@ -574,14 +636,59 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         )
                         assert "continuous belt" in fetched.structured_content["text"]
+                        assert [page["page"] for page in fetched.structured_content["pages"]] == [
+                            12
+                        ]
+
+                        fetched_with_neighbors = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 1}
+                        )
+                        assert [
+                            page["page"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        ] == [11, 12, 13]
+                        assert all(
+                            page["evidence"]["direct_source_text"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        )
+                        assert backend.page_context_calls[-1]["pages"] == [11, 13]
 
                         similar = await session.call_tool(
-                            "find_similar", {"id": "result_1", "top_k": 1}
+                            "find_similar",
+                            {
+                                "id": "result_1",
+                                "team_numbers": [254],
+                                "years": [2020],
+                                "source_ids": ["254-2020"],
+                                "top_k": 1,
+                            },
                         )
                         assert similar.is_error is False
                         assert similar.structured_content["results"][0]["id"] == "result_2"
                         assert similar.structured_content["coverage"]["candidate_pages"] == 1
                         assert similar.structured_content["coverage"]["returned_pages"] == 1
+                        assert (
+                            similar.structured_content["results"][0]["similarity_reason"] == "both"
+                        )
+                        assert backend.similar_calls[-1] == {
+                            "result_id": "result_1",
+                            "top_k": 1,
+                            "team_numbers": ["254"],
+                            "years": [2020],
+                            "source_ids": ["254-2020"],
+                        }
+                        cached_similar = await session.call_tool(
+                            "find_similar",
+                            {
+                                "id": "result_1",
+                                "team_numbers": [254],
+                                "years": [2020],
+                                "source_ids": ["254-2020"],
+                                "top_k": 1,
+                            },
+                        )
+                        assert cached_similar.is_error is False
+                        assert len(backend.similar_calls) == 1
 
                         rendered = await session.call_tool(
                             "render_search_results", {"ids": ["result_1"]}
@@ -642,13 +749,67 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert cached_sources.is_error is False
                         assert len(backend.list_source_calls) == 1
+
+                        browsed = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 2,
+                                "include_previews": True,
+                            },
+                        )
+                        assert browsed.is_error is False
+                        assert browsed.structured_content["source_id"] == "254-2020"
+                        assert browsed.structured_content["pages"][0]["result_id"] == (
+                            "result_page_1"
+                        )
+                        assert browsed.structured_content["missing_pages"] == [2]
+                        assert browsed.structured_content["pages"][0]["image_url"].startswith(
+                            "https://api.example.com/images/"
+                        )
+                        assert backend.page_context_calls[-1]["pages"] == [1]
+
+                        browsed_section = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "elevator",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_section.is_error is False
+                        assert [
+                            page["page"] for page in browsed_section.structured_content["pages"]
+                        ] == [12]
+                        assert browsed_section.structured_content["pages"][0]["image_url"] is None
+                        assert backend.page_context_calls[-1]["pages"] is None
+
+                        oversized_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 11,
+                            },
+                        )
+                        assert oversized_browse.is_error is True
+                        invalid_adjacent_fetch = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 2}
+                        )
+                        assert invalid_adjacent_fetch.is_error is True
+                        incomplete_browse = await session.call_tool(
+                            "browse_source",
+                            {"source_id": "254-2020", "start_page": 1},
+                        )
+                        assert incomplete_browse.is_error is True
                         queried_sources = await session.call_tool(
                             "list_sources",
                             {"team_numbers": [254], "source_query": "2020"},
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 1
+                        assert len(backend.list_source_calls) == 2
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -662,7 +823,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 2
+                        assert len(backend.list_source_calls) == 3
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],

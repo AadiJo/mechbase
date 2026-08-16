@@ -451,6 +451,51 @@ def test_page_context_is_scoped_to_the_result_generation() -> None:
     assert context.source_version_id == "254-2023@new"
 
 
+class BatchPageClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.scroll_filter = None
+
+    def scroll(self, **kwargs):
+        self.calls += 1
+        self.scroll_filter = kwargs["scroll_filter"]
+        return (
+            [
+                SimpleNamespace(
+                    payload={
+                        **_versioned_doc(
+                            "new",
+                            page,
+                            ingestion_id="generation-new",
+                            text=f"page {page}",
+                        ).model_dump(),
+                        "id": f"result-{page}",
+                    }
+                )
+                for page in (2, 1)
+            ],
+            None,
+        )
+
+
+def test_page_contexts_loads_multiple_pages_in_one_snapshot_read() -> None:
+    client = BatchPageClient()
+    store = RagStore(Settings(), client=client)
+
+    contexts = store.page_contexts(
+        "254-2023.pdf",
+        [2, 1],
+        "254-2023@new",
+        "generation-new",
+    )
+
+    assert client.calls == 1
+    assert [context.page for context in contexts] == [1, 2]
+    assert [context.text for context in contexts] == ["page 1", "page 2"]
+    conditions = {condition.key: condition for condition in client.scroll_filter.must}
+    assert conditions["page"].match.any == [2, 1]
+
+
 class MixedGenerationPageClient:
     def scroll(self, **_kwargs):
         old = _versioned_doc(
@@ -674,6 +719,109 @@ def test_find_similar_drops_hits_below_relevance_floor() -> None:
     assert response.coverage.candidate_pages == 1
     assert response.coverage.weak_pages_dropped == 1
     assert response.coverage.returned_pages == 0
+
+
+class DualVectorSimilarityClient:
+    def __init__(self) -> None:
+        self.queried_vectors: list[str] = []
+
+    def query_points(self, **kwargs):
+        self.queried_vectors.append(kwargs["using"])
+        scores = {
+            TEXT_VECTOR: {
+                "both": 0.70,
+                "text-only": 0.60,
+                "shape-only": 0.10,
+            },
+            IMAGE_VECTOR: {
+                "both": 0.80,
+                "text-only": 0.10,
+                "shape-only": 0.75,
+            },
+        }
+        return SimpleNamespace(
+            points=[
+                _hit(point_id, f"{point_id}.pdf", "254", 2023, score)
+                for point_id, score in scores[kwargs["using"]].items()
+            ]
+        )
+
+
+class ResultSimilarityClient(DualVectorSimilarityClient):
+    def scroll(self, **_kwargs):
+        seed = _hit("seed", "seed.pdf", "254", 2023, 1.0)
+        return (
+            [
+                SimpleNamespace(
+                    payload=seed.payload,
+                    vector={TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.2]},
+                )
+            ],
+            None,
+        )
+
+
+def test_result_similarity_queries_both_seed_vectors() -> None:
+    client = ResultSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert client.queried_vectors == [TEXT_VECTOR, IMAGE_VECTOR]
+    assert [result.debug["similarity_reason"] for result in response.results] == [
+        "both",
+        "shape",
+        "text",
+    ]
+
+
+def test_find_similar_reports_text_shape_and_combined_matches() -> None:
+    client = DualVectorSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store._similar_from_vectors(
+        {TEXT_VECTOR: [0.0], IMAGE_VECTOR: [0.0]},
+        10,
+        {"id": "seed", "source_pdf": "seed.pdf", "page": 1, "modality": "text"},
+    )
+
+    assert [result.id for result in response.results] == ["both", "shape-only", "text-only"]
+    assert [result.debug["similarity_reason"] for result in response.results] == [
+        "both",
+        "shape",
+        "text",
+    ]
+    assert response.coverage.candidate_pages == 3
+    assert response.coverage.weak_pages_dropped == 0
+    assert client.queried_vectors == [TEXT_VECTOR, IMAGE_VECTOR]
+
+
+def test_find_similar_applies_exact_metadata_filters_before_retrieval() -> None:
+    client = FakeQdrantClient()
+    client.query_filter = None
+
+    def query_points(**kwargs):
+        client.query_filter = kwargs["query_filter"]
+        return SimpleNamespace(points=[])
+
+    client.query_points = query_points
+    store = RagStore(Settings(), client=client)
+
+    store._similar_from_vector(
+        TEXT_VECTOR,
+        [0.0],
+        10,
+        {"id": "seed", "source_pdf": "seed.pdf", "page": 1, "modality": "text"},
+        team_numbers=["254"],
+        years=[2023],
+        source_ids=["254-2023"],
+    )
+
+    conditions = {condition.key: condition for condition in client.query_filter.must}
+    assert conditions["team"].match.value == "254"
+    assert conditions["year"].match.value == 2023
+    assert conditions["source_id"].match.value == "254-2023"
 
 
 def test_search_request_bounds_filter_cost() -> None:

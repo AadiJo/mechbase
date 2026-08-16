@@ -114,11 +114,13 @@ class PageContextResponse(BaseModel):
     team: str | None = None
     year: int | None = None
     page: int
+    section: str | None = None
     text: str
     text_chunks: list[str] = Field(default_factory=list)
     page_image_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
     result_ids: list[str] = Field(default_factory=list)
+    primary_result_id: str | None = None
 
 
 class PageTextResponse(BaseModel):

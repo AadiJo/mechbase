@@ -20,14 +20,18 @@ from app.mcp.cache import TTLCache
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
     AppliedSearchFilters,
+    BrowseSourceOutput,
     FetchOutput,
     InspectOutput,
     RenderOutput,
     SearchOutput,
+    SimilarOutput,
     SourceOutput,
+    browse_source_output,
     fetch_output,
     render_output,
     search_output,
+    similar_output,
     source_output,
     visual_candidate,
 )
@@ -36,6 +40,7 @@ from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
     MechanismTypeFilter,
+    PageContextResponse,
     SearchRequest,
     SearchResponse,
     SearchSort,
@@ -66,7 +71,23 @@ class RetrievalBackend(Protocol):
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
 
-    def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None: ...
+    def find_similar(
+        self,
+        result_id: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SimilarPagesResponse | None: ...
+
+    def page_contexts(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+    ) -> list[PageContextResponse]: ...
 
     def list_sources(
         self,
@@ -112,8 +133,36 @@ class RagRetrievalBackend:
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         return self._store.image_context(result_id=result_id)
 
-    def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
-        return self._store.similar_from_result_id(result_id, top_k)
+    def find_similar(
+        self,
+        result_id: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SimilarPagesResponse | None:
+        return self._store.similar_from_result_id(
+            result_id,
+            top_k,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+        )
+
+    def page_contexts(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+    ) -> list[PageContextResponse]:
+        return self._store.page_contexts(
+            source_pdf,
+            pages,
+            source_version_id,
+            ingestion_id,
+        )
 
     def list_sources(
         self,
@@ -154,9 +203,10 @@ def create_mcp_server(
             "as final answer images. If at least one image is relevant, call "
             "render_search_results with only those ids. If none are relevant, do not call the "
             "render tool and say that no useful image was found. Use fetch only when complete page "
-            "text is needed. All tools are read-only."
+            "text is needed. Use browse_source for multi-page evidence from the same binder; "
+            "find_similar can return pages from other binders. All tools are read-only."
         ),
-        version="0.2.0",
+        version="0.3.0",
         auth=AuthSettings(
             issuer_url=settings.clerk_oauth_issuer_url,
             required_scopes=settings.mcp_required_scopes,
@@ -166,6 +216,7 @@ def create_mcp_server(
     )
     public_base_url = str(settings.mcp_public_base_url)
     search_cache: TTLCache[str, SearchResponse] = TTLCache(ttl_seconds=15 * 60)
+    similar_cache: TTLCache[str, SimilarPagesResponse | None] = TTLCache(ttl_seconds=60 * 60)
     source_cache: TTLCache[str, SourceListResponse] = TTLCache(ttl_seconds=5 * 60)
     parsed_public_url = urlparse(public_base_url)
     public_origin = f"{parsed_public_url.scheme}://{parsed_public_url.netloc}"
@@ -342,41 +393,76 @@ def create_mcp_server(
         annotations=READ_ONLY,
         structured_output=True,
     )
-    def fetch(id: str) -> FetchOutput:
+    def fetch(
+        id: str,
+        adjacent_pages: Annotated[int, Field(ge=0, le=1)] = 0,
+    ) -> FetchOutput:
         context = retrieval.fetch(id)
         if context is None:
             raise ValueError(f"No result found for id {id!r}.")
-        return fetch_output(context, id, public_base_url)
+        adjacent_contexts = []
+        if adjacent_pages:
+            pages = [
+                page
+                for page in range(
+                    context.page - adjacent_pages,
+                    context.page + adjacent_pages + 1,
+                )
+                if page >= 1 and page != context.page
+            ]
+            adjacent_contexts = retrieval.page_contexts(
+                context.source_pdf,
+                pages,
+                context.source_version_id,
+                context.ingestion_id,
+            )
+        return fetch_output(
+            context,
+            id,
+            public_base_url,
+            adjacent_contexts=adjacent_contexts,
+        )
 
     @server.tool(
         title="Find similar mechanism pages",
         description=(
-            "Find mechanism pages similar to a result returned by search. Always inspect "
-            "promising returned ids with inspect_candidates before answering, then display only "
-            "visually relevant pages through render_search_results."
+            "Find mechanism pages similar to a result returned by search. Use team_numbers, "
+            "years, and source_ids when the user constrains the comparison. Similarity means "
+            "related design evidence, not newer, better, or more successful. Always inspect "
+            "promising returned ids before answering, then display only visually relevant pages."
         ),
         annotations=READ_ONLY,
         structured_output=True,
     )
     def find_similar(
         id: str,
+        team_numbers: Annotated[list[TeamNumber], Field(max_length=20)] | None = None,
+        years: Annotated[list[SeasonYear], Field(max_length=20)] | None = None,
+        source_ids: Annotated[list[SourceId], Field(max_length=20)] | None = None,
         top_k: Annotated[int, Field(ge=1, le=20)] = 10,
-    ) -> SearchOutput:
-        response = retrieval.find_similar(id, top_k)
+    ) -> SimilarOutput:
+        filters = AppliedSearchFilters(
+            team_numbers=[str(team) for team in dict.fromkeys(team_numbers or [])],
+            years=list(dict.fromkeys(years or [])),
+            source_ids=list(dict.fromkeys(source_ids or [])),
+        )
+        cache_key = f"{retrieval.corpus_revision()}:{id}:{top_k}:{filters.model_dump_json()}"
+        response = similar_cache.get_or_compute(
+            cache_key,
+            lambda: retrieval.find_similar(
+                id,
+                top_k,
+                team_numbers=filters.team_numbers,
+                years=filters.years,
+                source_ids=filters.source_ids,
+            ),
+        )
         if response is None:
             raise ValueError(f"No result found for id {id!r}.")
-        return search_output(
-            SearchResponse(
-                query="",
-                results=response.results,
-                coverage=response.coverage,
-                abstention_reason=(
-                    None
-                    if response.results
-                    else "No similar pages met the calibrated relevance threshold."
-                ),
-            ),
+        return similar_output(
+            response,
             public_base_url,
+            applied_filters=filters,
         )
 
     @server.tool(
@@ -460,6 +546,76 @@ def create_mcp_server(
             sources[:limit],
             public_base_url,
             total_matching_sources=len(sources),
+        )
+
+    @server.tool(
+        title="Browse an indexed FRC binder",
+        description=(
+            "Navigate one exact binder by page range or section without leaving that source. "
+            "Use this for subsystem connections and designs that span several pages. Returned "
+            "result ids can be passed to fetch, inspect_candidates, or render_search_results."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def browse_source(
+        source_id: SourceId,
+        start_page: Annotated[int | None, Field(ge=1)] = None,
+        end_page: Annotated[int | None, Field(ge=1)] = None,
+        section: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
+        include_previews: bool = True,
+    ) -> BrowseSourceOutput:
+        if (start_page is None) != (end_page is None):
+            raise ValueError("Provide both start_page and end_page, or neither.")
+        if start_page is not None and end_page is not None:
+            if end_page < start_page:
+                raise ValueError("end_page must be greater than or equal to start_page.")
+            if end_page - start_page + 1 > 10:
+                raise ValueError("browse_source can return at most 10 pages per call.")
+
+        catalog = source_cache.get_or_compute(
+            retrieval.corpus_revision(),
+            retrieval.list_sources,
+        )
+        source = next((item for item in catalog.sources if item.source_id == source_id), None)
+        if source is None:
+            raise ValueError(f"No indexed source found for source_id {source_id!r}.")
+
+        has_range = start_page is not None and end_page is not None
+        requested_pages = list(range(start_page, end_page + 1)) if has_range else source.pages
+        missing_pages = [page for page in requested_pages if page not in source.pages]
+        section_needle = section.strip().casefold() if section else None
+        pages_to_load = [page for page in requested_pages if page in source.pages]
+        if not has_range and section_needle is None:
+            pages_to_load = pages_to_load[:10]
+        contexts = retrieval.page_contexts(
+            source.source_pdf,
+            None if not has_range and section_needle else pages_to_load,
+            source.source_version_id,
+            source.ingestion_id,
+        )
+        contexts = [context for context in contexts if context.page in pages_to_load]
+        loaded_pages = {context.page for context in contexts}
+        missing_pages.extend(page for page in pages_to_load if page not in loaded_pages)
+        matching_contexts = [
+            context
+            for context in contexts
+            if section_needle is None
+            or section_needle in (context.section or "").casefold()
+        ]
+        total_matches = len(matching_contexts)
+        matching_contexts = matching_contexts[:10]
+
+        return browse_source_output(
+            source,
+            matching_contexts,
+            public_base_url,
+            include_previews=include_previews,
+            missing_pages=sorted(set(missing_pages)),
+            truncated=(
+                total_matches > len(matching_contexts)
+                or (not has_range and section_needle is None and len(source.pages) > 10)
+            ),
         )
 
     return server

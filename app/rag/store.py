@@ -425,10 +425,28 @@ class RagStore:
         source_version_id: str | None = None,
         ingestion_id: str | None = None,
     ) -> PageContextResponse | None:
+        contexts = self.page_contexts(
+            source_pdf,
+            [page],
+            source_version_id,
+            ingestion_id,
+        )
+        return contexts[0] if contexts else None
+
+    def page_contexts(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None = None,
+        ingestion_id: str | None = None,
+    ) -> list[PageContextResponse]:
+        if pages == []:
+            return []
         conditions = [
             models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
-            models.FieldCondition(key="page", match=models.MatchValue(value=page)),
         ]
+        if pages is not None:
+            conditions.append(_match_values("page", list(dict.fromkeys(pages))))
         if source_version_id:
             conditions.append(
                 models.FieldCondition(
@@ -453,13 +471,29 @@ class RagStore:
             payload for payload in payloads if _is_current_generation(payload, active_generations)
         ]
         if not payloads:
-            return None
+            return []
         if ingestion_id is None:
             selected_generation = _latest_generation(payloads)
             payloads = [
                 payload for payload in payloads if _generation_key(payload) == selected_generation
             ]
 
+        grouped: dict[int, list[dict]] = {}
+        for payload in payloads:
+            payload_page = int(payload.get("page", 0))
+            if payload_page:
+                grouped.setdefault(payload_page, []).append(payload)
+        return [
+            self._page_context_from_payloads(source_pdf, page, grouped[page])
+            for page in sorted(grouped)
+        ]
+
+    def _page_context_from_payloads(
+        self,
+        source_pdf: str,
+        page: int,
+        payloads: list[dict],
+    ) -> PageContextResponse:
         text_payloads = [p for p in payloads if p.get("modality") == "text" and p.get("text")]
         if text_payloads:
             text_chunks = [p["text"] for p in sorted(text_payloads, key=_chunk_sort_key)]
@@ -492,11 +526,22 @@ class RagStore:
             team=first.get("team"),
             year=first.get("year"),
             page=page,
+            section=next(
+                (payload.get("section") for payload in payloads if payload.get("section")), None
+            ),
             text=text,
             text_chunks=text_chunks,
             page_image_url=page_image_url,
             image_urls=image_urls,
             result_ids=[payload.get("id", "") for payload in payloads if payload.get("id")],
+            primary_result_id=next(
+                (
+                    payload.get("id")
+                    for payload in payloads
+                    if payload.get("modality") == "page_image" and payload.get("id")
+                ),
+                next((payload.get("id") for payload in payloads if payload.get("id")), None),
+            ),
         )
 
     def list_sources(
@@ -594,19 +639,33 @@ class RagStore:
             existing.image_urls = list(dict.fromkeys([*existing.image_urls, *image_urls]))
         return sorted(grouped.values(), key=lambda match: match.score, reverse=True)
 
-    def similar_from_result_id(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
+    def similar_from_result_id(
+        self,
+        result_id: str,
+        top_k: int,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+    ) -> SimilarPagesResponse | None:
         payload, vectors = self._payload_and_vectors_for_result_id(result_id)
         if payload is None or vectors is None:
             return None
-        vector_name = (
-            IMAGE_VECTOR
-            if payload.get("modality") in {"page_image", "extracted_image"}
-            else TEXT_VECTOR
-        )
-        vector = vectors.get(vector_name)
-        if vector is None:
+        available_vectors = {
+            name: vector
+            for name in (TEXT_VECTOR, IMAGE_VECTOR)
+            if (vector := vectors.get(name)) is not None
+        }
+        if not available_vectors:
             return None
-        return self._similar_from_vector(vector_name, vector, top_k, payload)
+        return self._similar_from_vectors(
+            available_vectors,
+            top_k,
+            payload,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+        )
 
     def similar_from_page(
         self, source_pdf: str, page: int, top_k: int
@@ -707,48 +766,116 @@ class RagStore:
         vector: list[float],
         top_k: int,
         seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+    ) -> SimilarPagesResponse:
+        return self._similar_from_vectors(
+            {vector_name: vector},
+            top_k,
+            seed_payload,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+        )
+
+    def _similar_from_vectors(
+        self,
+        vectors: dict[str, list[float]],
+        top_k: int,
+        seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
     ) -> SimilarPagesResponse:
         top_k = min(max(top_k, 1), MAX_RETRIEVAL_PAGES)
         limit = max(top_k * 12, 60)
-        hits, active_generations = self._read_with_active_snapshot(
-            lambda active: (
-                self.client.query_points(
+        hits_by_vector, active_generations = self._read_with_active_snapshot(
+            lambda active: {
+                vector_name: self.client.query_points(
                     collection_name=self.settings.collection_name,
                     query=vector,
                     using=vector_name,
-                    query_filter=_active_filter(active_generations=active),
+                    query_filter=_metadata_filter(
+                        team_numbers=team_numbers,
+                        years=years,
+                        source_ids=source_ids,
+                        active_generations=active,
+                    ),
                     limit=limit,
                     with_payload=True,
                 ).points
-            )
+                for vector_name, vector in vectors.items()
+            }
         )
-        results: list[SearchResult] = []
+        page_hits: dict[tuple[str, int], dict[str, tuple[float, dict]]] = {}
         candidate_pages: set[tuple[str, int]] = set()
         candidate_sources: set[str] = set()
-        relevant_pages: set[tuple[str, int]] = set()
-        seen_pages: set[tuple[str, int]] = set()
         seed_page = _page_key(seed_payload)
-        for hit in hits:
-            payload = dict(hit.payload or {})
-            if not _is_current_generation(payload, active_generations):
-                continue
-            page_key = _page_key(payload)
-            if page_key == seed_page:
-                continue
-            candidate_pages.add(page_key)
-            candidate_sources.add(
-                str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
-            )
-            if float(hit.score) < self.settings.search_min_score or page_key in seen_pages:
-                continue
-            relevant_pages.add(page_key)
-            seen_pages.add(page_key)
-            if len(results) < top_k:
-                results.append(
-                    self._search_result_from_payload(
-                        payload, float(hit.score), {"vector_source": vector_name}
-                    )
+        for vector_name, hits in hits_by_vector.items():
+            for hit in hits:
+                payload = dict(hit.payload or {})
+                if not _is_current_generation(payload, active_generations):
+                    continue
+                page_key = _page_key(payload)
+                if page_key == seed_page:
+                    continue
+                candidate_pages.add(page_key)
+                candidate_sources.add(
+                    str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
                 )
+                vector_hits = page_hits.setdefault(page_key, {})
+                score = float(hit.score)
+                existing = vector_hits.get(vector_name)
+                if existing is None or score > existing[0]:
+                    vector_hits[vector_name] = (score, payload)
+
+        ranked_pages: list[tuple[float, dict, str, dict[str, float]]] = []
+        for vector_hits in page_hits.values():
+            relevant_hits = {
+                name: hit
+                for name, hit in vector_hits.items()
+                if hit[0] >= self.settings.search_min_score
+            }
+            if not relevant_hits:
+                continue
+            best_name, (best_score, best_payload) = max(
+                relevant_hits.items(),
+                key=lambda item: item[1][0],
+            )
+            if TEXT_VECTOR in relevant_hits and IMAGE_VECTOR in relevant_hits:
+                reason = "both"
+            elif best_name == IMAGE_VECTOR:
+                reason = "shape"
+            else:
+                reason = "text"
+            ranked_pages.append(
+                (
+                    best_score,
+                    best_payload,
+                    reason,
+                    {name: hit[0] for name, hit in vector_hits.items()},
+                )
+            )
+
+        ranked_pages.sort(key=lambda item: item[0], reverse=True)
+        results = [
+            self._search_result_from_payload(
+                payload,
+                score,
+                {
+                    "vector_source": reason,
+                    "similarity_reason": reason,
+                    "vector_scores": vector_scores,
+                },
+            )
+            for score, payload, reason, vector_scores in ranked_pages[:top_k]
+        ]
+        relevant_pages = {
+            _page_key(payload) for _score, payload, _reason, _scores in ranked_pages
+        }
         return SimilarPagesResponse(
             seed={
                 "id": seed_payload.get("id"),
@@ -762,7 +889,9 @@ class RagStore:
                 candidate_sources=len(candidate_sources),
                 weak_pages_dropped=len(candidate_pages - relevant_pages),
                 returned_pages=len(results),
-                candidate_window_truncated=len(hits) == limit,
+                candidate_window_truncated=any(
+                    len(hits) == limit for hits in hits_by_vector.values()
+                ),
             ),
         )
 
