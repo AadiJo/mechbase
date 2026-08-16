@@ -115,6 +115,7 @@ def test_ensure_collection_adds_missing_metadata_indexes() -> None:
         "ingestion_id",
         "is_staged",
         "source_pdf",
+        "page",
         "modality",
         "artifact_path",
         "linked_artifacts",
@@ -569,6 +570,33 @@ def test_browse_contexts_retries_summary_and_pages_under_one_source_snapshot() -
     assert [context.ingestion_id for context in response.contexts] == ["new", "new"]
     assert store.summary_snapshots == [old, new]
     assert store.context_snapshots == [old, new]
+
+
+def test_browse_contexts_reuses_the_generation_pinned_source_summary() -> None:
+    active = {"254-2023": "steady"}
+    store = SnapshotBoundBrowseStore([active, active, active, active])
+
+    first = store.browse_contexts(
+        "254-2023",
+        start_page=None,
+        end_page=None,
+        resume_page=None,
+        scan_limit=1,
+    )
+    second = store.browse_contexts(
+        "254-2023",
+        start_page=None,
+        end_page=None,
+        resume_page=2,
+        scan_limit=1,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.requested_pages == [1]
+    assert second.requested_pages == [2]
+    assert store.summary_snapshots == [active]
+    assert store.context_snapshots == [active, active]
 
 
 def test_source_summaries_do_not_mix_versions() -> None:

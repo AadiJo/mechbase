@@ -58,6 +58,7 @@ PAYLOAD_INDEXES = {
     "ingestion_id": models.PayloadSchemaType.KEYWORD,
     "is_staged": models.PayloadSchemaType.BOOL,
     "source_pdf": models.PayloadSchemaType.KEYWORD,
+    "page": models.PayloadSchemaType.INTEGER,
     "modality": models.PayloadSchemaType.KEYWORD,
     "artifact_path": models.PayloadSchemaType.KEYWORD,
     "linked_artifacts": models.PayloadSchemaType.KEYWORD,
@@ -89,6 +90,7 @@ class RagStore:
             url=settings.qdrant_url,
             timeout=settings.qdrant_timeout_seconds,
         )
+        self._source_summary_cache: dict[str, tuple[str, SourceSummary | None]] = {}
 
     def ensure_collection(self) -> None:
         existing = {collection.name for collection in self.client.get_collections().collections}
@@ -876,18 +878,7 @@ class RagStore:
         scan_limit: int,
     ) -> SourceBrowseResponse | None:
         def read(active: dict[str, str]) -> SourceBrowseResponse | None:
-            payloads = list(
-                self._iter_source_payloads(
-                    _metadata_filter(source_ids=[source_id], active_generations=active)
-                )
-            )
-            current_payloads = (
-                payload for payload in payloads if _is_current_generation(payload, active)
-            )
-            summaries = _latest_source_summaries(self._summarize_sources(current_payloads))
-            source = next(
-                (summary for summary in summaries if summary.source_id == source_id), None
-            )
+            source = self._source_summary_for_active(source_id, active)
             if source is None:
                 return None
             available_pages = sorted(source.pages)
@@ -912,6 +903,28 @@ class RagStore:
             )
 
         return self._read_with_source_snapshot(source_id, read)
+
+    def _source_summary_for_active(
+        self,
+        source_id: str,
+        active_generations: dict[str, str],
+    ) -> SourceSummary | None:
+        active_generation = active_generations.get(source_id)
+        cached = self._source_summary_cache.get(source_id)
+        if active_generation is not None and cached is not None and cached[0] == active_generation:
+            return cached[1]
+
+        payloads = self._iter_source_payloads(
+            _metadata_filter(source_ids=[source_id], active_generations=active_generations)
+        )
+        current_payloads = (
+            payload for payload in payloads if _is_current_generation(payload, active_generations)
+        )
+        summaries = _latest_source_summaries(self._summarize_sources(current_payloads))
+        source = next((summary for summary in summaries if summary.source_id == source_id), None)
+        if active_generation is not None:
+            self._source_summary_cache[source_id] = (active_generation, source)
+        return source
 
     def image_context(
         self,

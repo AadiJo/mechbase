@@ -4,7 +4,7 @@ from app.rag.chunking import (
     resolve_page_section,
     split_text,
 )
-from app.rag.pdf import _outline_section_starts
+from app.rag.pdf import _outline_section_starts, _repeated_headers
 
 
 def test_expand_multi_ball_query() -> None:
@@ -128,3 +128,35 @@ def test_sparse_outline_does_not_suppress_later_text_sections() -> None:
     assert document == "Robot Technical Binder"
     assert subsystem == "Elevator"
     assert continuation == "Elevator"
+
+
+class FakeTextPage:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def get_text(self, kind: str) -> str:
+        assert kind == "text"
+        return self.text
+
+
+class FakeTextPdf:
+    def __init__(self, pages: list[str]) -> None:
+        self.pages = [FakeTextPage(page) for page in pages]
+
+    def __iter__(self):
+        return iter(self.pages)
+
+    def __len__(self) -> int:
+        return len(self.pages)
+
+
+def test_repeated_single_subsystem_heading_is_retained() -> None:
+    pdf = FakeTextPdf(["Intake\nroller notes"] * 3)
+
+    assert _repeated_headers(pdf) == set()
+
+
+def test_repeated_document_title_is_suppressed_before_single_subsystem() -> None:
+    pdf = FakeTextPdf(["Team 254 Technical Binder\nIntake\nroller notes"] * 3)
+
+    assert _repeated_headers(pdf) == {"team 254 technical binder"}
