@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from app.rag.artifacts import generation_namespace, source_artifact_root
 from app.rag.config import Settings, get_settings
-from app.rag.models import SourceDoc
+from app.rag.models import RagDocument, SourceDoc
 from app.rag.pdf import extract_documents
 from app.rag.sources import iter_pdfs
 from app.rag.store import RagStore
@@ -87,35 +87,71 @@ def ingestion_fingerprint(source: SourceDoc, settings: Settings) -> str:
     return sha256(encoded).hexdigest()[:16]
 
 
-def remove_superseded_artifacts(
+def artifact_fingerprint(source: SourceDoc, settings: Settings) -> str:
+    parameters = {
+        "schema": EXTRACTION_SCHEMA_VERSION,
+        "source_version": source.source_version,
+        "render_dpi": settings.render_dpi,
+    }
+    encoded = json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode()
+    return sha256(encoded).hexdigest()[:16]
+
+
+def publish_artifact_generation(
     artifact_dir: Path,
     source_id: str,
-    current_namespace: str,
-    current_source_version: str,
+    staging_namespace: str,
+    published_namespace: str,
 ) -> None:
     artifact_root = artifact_dir.resolve()
     root_path = source_artifact_root(artifact_root, source_id)
     if root_path.is_symlink():
-        return
+        raise RuntimeError(f"Artifact root for {source_id} cannot be a symlink.")
     root = root_path.resolve()
     try:
         root.relative_to(artifact_root)
-    except ValueError:
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Artifact root for {source_id} escapes the artifact directory."
+        ) from exc
+    staging_path = root / staging_namespace
+    published_path = root / published_namespace
+    if staging_path.is_symlink() or published_path.is_symlink():
+        raise RuntimeError("Artifact generations cannot be symlinks.")
+    staging = staging_path.resolve()
+    published = published_path.resolve()
+    if staging.parent != root or published.parent != root:
+        raise RuntimeError("Artifact namespace escapes its source directory.")
+    if not staging.is_dir():
         return
-    if not root.exists():
+    if published.exists():
+        if not published.is_dir():
+            raise RuntimeError("Published artifact generation must be a directory.")
+        shutil.rmtree(staging)
         return
-    for candidate in root.iterdir():
-        is_current_content = candidate.name == current_source_version or candidate.name.startswith(
-            f"{current_source_version}~"
-        )
-        if (
-            candidate.is_symlink()
-            or not candidate.is_dir()
-            or candidate.name == current_namespace
-            or is_current_content
-        ):
-            continue
-        shutil.rmtree(candidate)
+    staging.replace(published)
+
+
+def with_published_artifacts(
+    document: RagDocument,
+    staging_root: Path,
+    published_root: Path,
+) -> RagDocument:
+    def published_path(path: str) -> str:
+        try:
+            relative = Path(path).relative_to(staging_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Artifact path {path} is outside its staging generation.") from exc
+        return str(published_root / relative)
+
+    return document.model_copy(
+        update={
+            "artifact_path": (
+                published_path(document.artifact_path) if document.artifact_path else None
+            ),
+            "linked_artifacts": [published_path(path) for path in document.linked_artifacts],
+        }
+    )
 
 
 def remove_artifact_generation(artifact_dir: Path, source_id: str, namespace: str) -> None:
@@ -176,10 +212,22 @@ def ingest_sources(
                     continue
             print(f"Ingesting {source.path.name}...", flush=True)
             ingestion_id = uuid4().hex
-            artifact_namespace = generation_namespace(source.source_version, ingestion_id)
+            staging_namespace = generation_namespace(source.source_version, ingestion_id)
+            published_namespace = generation_namespace(
+                source.source_version,
+                artifact_fingerprint(source, settings),
+            )
+            source_root = source_artifact_root(settings.artifact_dir, source.source_id)
+            staging_root = source_root / staging_namespace
+            published_root = source_root / published_namespace
             committed = False
             try:
-                docs = extract_documents(source, settings, ingestion_id=ingestion_id)
+                docs = extract_documents(
+                    source,
+                    settings,
+                    ingestion_id=ingestion_id,
+                    artifact_namespace=staging_namespace,
+                )
                 if not docs:
                     raise RuntimeError(
                         f"Refusing to replace {source.path.name}: extraction produced no documents."
@@ -196,8 +244,18 @@ def ingest_sources(
                         [doc.text or doc.source_pdf for doc in batch], "document"
                     )
                     image_vectors = multimodal_vectors(batch, embedder, settings)
-                    store.upsert(batch, text_vectors, image_vectors)
+                    published_batch = [
+                        with_published_artifacts(document, staging_root, published_root)
+                        for document in batch
+                    ]
+                    store.upsert(published_batch, text_vectors, image_vectors)
                     print(f"  upserted batch {batch_idx}", flush=True)
+                publish_artifact_generation(
+                    settings.artifact_dir,
+                    source.source_id,
+                    staging_namespace,
+                    published_namespace,
+                )
                 store.publish_source_generation(source.source_id, ingestion_id)
                 store.set_active_generation(source.source_id, ingestion_id)
                 committed = True
@@ -223,7 +281,7 @@ def ingest_sources(
                         remove_artifact_generation(
                             settings.artifact_dir,
                             source.source_id,
-                            artifact_namespace,
+                            staging_namespace,
                         )
                 raise
 
@@ -234,12 +292,6 @@ def ingest_sources(
             store.delete_superseded_source_generations(
                 source.source_id,
                 ingestion_id,
-            )
-            remove_superseded_artifacts(
-                settings.artifact_dir,
-                source.source_id,
-                artifact_namespace,
-                source.source_version,
             )
             manifest.write(
                 json.dumps(

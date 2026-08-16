@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -272,17 +272,7 @@ def _source_page_urls(source: SourceSummary, page: int) -> tuple[str, str]:
     if not page:
         return "", ""
     path = f"/pages/{quote(source.source_pdf, safe='')}/{page}"
-    query = urlencode(
-        {
-            key: value
-            for key, value in {
-                "source_version_id": source.source_version_id,
-            }.items()
-            if value
-        }
-    )
-    suffix = f"?{query}" if query else ""
-    return f"{path}{suffix}", f"{path}/text{suffix}"
+    return path, f"{path}/text"
 
 
 @app.get("/.well-known/oauth-authorization-server", include_in_schema=False)

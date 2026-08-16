@@ -1001,8 +1001,7 @@ class RagStore:
         source_version_id: str | None = None,
         ingestion_id: str | None = None,
     ) -> str:
-        path = f"/pages/{quote(source_pdf, safe='')}/{page}"
-        return _with_source_revision(path, source_version_id, ingestion_id)
+        return f"/pages/{quote(source_pdf, safe='')}/{page}"
 
     def _page_text_url(
         self,
@@ -1011,8 +1010,7 @@ class RagStore:
         source_version_id: str | None = None,
         ingestion_id: str | None = None,
     ) -> str:
-        path = f"/pages/{quote(source_pdf, safe='')}/{page}/text"
-        return _with_source_revision(path, source_version_id, ingestion_id)
+        return f"/pages/{quote(source_pdf, safe='')}/{page}/text"
 
 
 def _metadata_filter(
@@ -1200,16 +1198,3 @@ def _latest_source_summaries(summaries: Iterable[SourceSummary]) -> list[SourceS
         ):
             latest[summary.source_id] = summary
     return list(latest.values())
-
-
-def _with_source_revision(
-    path: str,
-    source_version_id: str | None,
-    _ingestion_id: str | None,
-) -> str:
-    parameters = []
-    if source_version_id:
-        parameters.append(f"source_version_id={quote(source_version_id, safe='')}")
-    if not parameters:
-        return path
-    return f"{path}?{'&'.join(parameters)}"

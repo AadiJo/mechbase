@@ -47,8 +47,11 @@ def extract_documents(
     settings: Settings,
     *,
     ingestion_id: str | None = None,
+    artifact_namespace: str | None = None,
 ) -> list[RagDocument]:
-    document_namespace = generation_namespace(source.source_version, ingestion_id)
+    document_namespace = artifact_namespace or generation_namespace(
+        source.source_version, ingestion_id
+    )
     artifact_root = (
         source_artifact_root(settings.artifact_dir, source.source_id) / document_namespace
     )

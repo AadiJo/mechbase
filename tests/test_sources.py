@@ -6,12 +6,14 @@ import pytest
 from app.rag.artifacts import source_artifact_root
 from app.rag.config import Settings
 from app.rag.ingest import (
+    artifact_fingerprint,
     completed_sources,
     ingest_sources,
     ingestion_fingerprint,
     ingestion_lock,
+    publish_artifact_generation,
     remove_artifact_generation,
-    remove_superseded_artifacts,
+    with_published_artifacts,
 )
 from app.rag.models import RagDocument, SourceDoc
 from app.rag.sources import iter_pdfs, parse_source
@@ -88,23 +90,79 @@ def test_ingestion_fingerprint_tracks_provenance_and_embedding_config(tmp_path: 
     assert ingestion_fingerprint(source, changed_settings) != baseline
 
 
-def test_remove_superseded_artifacts_only_removes_matching_source_generations(
+def test_artifact_publication_is_content_addressed_and_preserves_history(
     tmp_path: Path,
 ) -> None:
-    current_version = "version-current"
-    current = f"{current_version}~current"
-    previous_same_content = f"{current_version}~previous"
     root = source_artifact_root(tmp_path, "254-2023")
     root.mkdir(parents=True)
-    for name in ["version-old~old", previous_same_content, current, "other-version~other"]:
-        (root / name).mkdir()
+    historical = root / "version-old~fingerprint-old"
+    historical.mkdir()
+    (historical / "page.png").write_bytes(b"historical")
+    first_staging = root / "version-current~ingestion-one"
+    first_staging.mkdir()
+    (first_staging / "page.png").write_bytes(b"canonical")
+    published_namespace = "version-current~fingerprint-current"
 
-    remove_superseded_artifacts(tmp_path, "254-2023", current, current_version)
+    publish_artifact_generation(
+        tmp_path,
+        "254-2023",
+        first_staging.name,
+        published_namespace,
+    )
 
-    assert not (root / "version-old~old").exists()
-    assert (root / previous_same_content).is_dir()
-    assert (root / current).is_dir()
-    assert not (root / "other-version~other").exists()
+    published = root / published_namespace
+    assert not first_staging.exists()
+    assert (published / "page.png").read_bytes() == b"canonical"
+    assert (historical / "page.png").read_bytes() == b"historical"
+
+    duplicate_staging = root / "version-current~ingestion-two"
+    duplicate_staging.mkdir()
+    (duplicate_staging / "page.png").write_bytes(b"duplicate")
+
+    publish_artifact_generation(
+        tmp_path,
+        "254-2023",
+        duplicate_staging.name,
+        published_namespace,
+    )
+
+    assert not duplicate_staging.exists()
+    assert (published / "page.png").read_bytes() == b"canonical"
+    assert (historical / "page.png").read_bytes() == b"historical"
+
+
+def test_artifact_fingerprint_is_stable_across_ingestions(tmp_path: Path) -> None:
+    path = tmp_path / "254-2025.pdf"
+    path.write_bytes(b"binder")
+    source = parse_source(path)
+
+    first = artifact_fingerprint(source, Settings(RENDER_DPI=150))
+    second = artifact_fingerprint(source, Settings(RENDER_DPI=150))
+    changed = artifact_fingerprint(source, Settings(RENDER_DPI=200))
+
+    assert first == second
+    assert first != changed
+
+
+def test_document_artifacts_are_rewritten_to_published_namespace(tmp_path: Path) -> None:
+    staging = tmp_path / "version~ingestion"
+    published = tmp_path / "version~fingerprint"
+    document = RagDocument(
+        id="result",
+        source_id="254-2025",
+        source_version="version",
+        source_version_id="254-2025@version",
+        source_pdf="254-2025.pdf",
+        page=1,
+        modality="page_image",
+        artifact_path=str(staging / "page-001" / "page.png"),
+        linked_artifacts=[str(staging / "page-001" / "image.png")],
+    )
+
+    rewritten = with_published_artifacts(document, staging, published)
+
+    assert rewritten.artifact_path == str(published / "page-001" / "page.png")
+    assert rewritten.linked_artifacts == [str(published / "page-001" / "image.png")]
 
 
 def test_remove_artifact_generation_removes_only_the_exact_namespace(tmp_path: Path) -> None:
@@ -126,13 +184,11 @@ def test_artifact_cleanup_cannot_cross_source_id_prefixes(tmp_path: Path) -> Non
     prefixed_root = source_artifact_root(tmp_path, "254@prototype")
     first_root.mkdir(parents=True)
     prefixed_root.mkdir(parents=True)
-    (first_root / "current").mkdir()
     (first_root / "old").mkdir()
     (prefixed_root / "other-source").mkdir()
 
-    remove_superseded_artifacts(tmp_path, "254", "current", "current")
+    remove_artifact_generation(tmp_path, "254", "old")
 
-    assert (first_root / "current").is_dir()
     assert not (first_root / "old").exists()
     assert (prefixed_root / "other-source").is_dir()
 

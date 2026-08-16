@@ -330,17 +330,18 @@ def test_search_filter_excludes_superseded_published_generations(tmp_path: Path)
     client.close()
 
 
-def test_same_content_reingestion_keeps_stable_page_citations(tmp_path: Path) -> None:
+def test_page_citations_are_explicitly_current_source_links(tmp_path: Path) -> None:
     store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=SimpleNamespace())
-    old_payload = _versioned_doc("same", 1, ingestion_id="old").model_dump()
-    new_payload = _versioned_doc("same", 1, ingestion_id="new").model_dump()
+    old_payload = _versioned_doc("old", 1, ingestion_id="old").model_dump()
+    new_payload = _versioned_doc("new", 1, ingestion_id="new").model_dump()
 
     old_result = store._search_result_from_payload(old_payload, 0.9)
     new_result = store._search_result_from_payload(new_payload, 0.9)
 
     assert old_result.page_context_url == new_result.page_context_url
     assert old_result.page_text_url == new_result.page_text_url
-    assert "source_version_id=254-2023%40same" in old_result.page_context_url
+    assert old_result.page_context_url == "/pages/254-2023.pdf/1"
+    assert "source_version_id" not in old_result.page_context_url
     assert "ingestion_id" not in old_result.page_context_url
 
 
