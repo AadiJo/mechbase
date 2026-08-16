@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from app.rag.artifacts import source_artifact_root
 from app.rag.config import Settings
@@ -18,6 +19,7 @@ from app.rag.ingest import (
 )
 from app.rag.models import RagDocument, SourceDoc
 from app.rag.sources import iter_pdfs, parse_source
+from app.rag.voyage_client import _embedding_image
 
 
 def test_parse_team_year_filename(tmp_path: Path) -> None:
@@ -101,7 +103,9 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     (historical / "page.png").write_bytes(b"historical")
     first_staging = root / "version-current~ingestion-one"
     first_staging.mkdir()
-    (first_staging / "page.png").write_bytes(b"canonical")
+    first_image = first_staging / "page.png"
+    Image.new("RGB", (32, 32), "white").save(first_image)
+    canonical_bytes = first_image.read_bytes()
     published_namespace = "version-current~fingerprint-current"
 
     first_published = publish_artifact_generation(
@@ -114,13 +118,17 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     published = root / published_namespace
     assert first_published == published_namespace
     assert not first_staging.exists()
-    assert (published / "page.png").read_bytes() == b"canonical"
+    assert (published / "page.png").read_bytes() == canonical_bytes
     assert (published / ".complete.json").is_file()
     assert (historical / "page.png").read_bytes() == b"historical"
 
+    embedded = _embedding_image(published / "page.png", 16, tmp_path / ".embedding-cache")
+    assert embedded.is_file()
+    assert not (published / ".embed").exists()
+
     duplicate_staging = root / "version-current~ingestion-two"
     duplicate_staging.mkdir()
-    (duplicate_staging / "page.png").write_bytes(b"canonical")
+    (duplicate_staging / "page.png").write_bytes(canonical_bytes)
 
     duplicate_published = publish_artifact_generation(
         tmp_path,
@@ -131,7 +139,7 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
 
     assert duplicate_published == published_namespace
     assert not duplicate_staging.exists()
-    assert (published / "page.png").read_bytes() == b"canonical"
+    assert (published / "page.png").read_bytes() == canonical_bytes
     assert (historical / "page.png").read_bytes() == b"historical"
 
     (published / ".complete.json").write_text("{}", encoding="utf-8")

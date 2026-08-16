@@ -1,6 +1,7 @@
 import base64
 import mimetypes
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import httpx
@@ -55,11 +56,17 @@ class VoyageEmbedder:
                     {
                         "type": "image_base64",
                         "image_base64": _data_url(
-                            _embedding_image(Path(image_path), self.settings.max_embed_image_side)
+                            _embedding_image(
+                                Path(image_path),
+                                self.settings.max_embed_image_side,
+                                self.settings.artifact_dir / ".embedding-cache",
+                            )
                         ),
                     }
                 )
-            inputs.append({"content": content or [{"type": "text", "text": "FRC robot mechanism image"}]})
+            inputs.append(
+                {"content": content or [{"type": "text", "text": "FRC robot mechanism image"}]}
+            )
         response = self._post(
             "/multimodalembeddings",
             {
@@ -97,10 +104,13 @@ def _data_url(path: Path) -> str:
     return f"data:{media_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
-def _embedding_image(path: Path, max_side: int) -> Path:
-    cache_dir = path.parent / ".embed"
-    cache_dir.mkdir(exist_ok=True)
-    out = cache_dir / f"{path.stem}-{max_side}.jpg"
+def _embedding_image(path: Path, max_side: int, cache_dir: Path) -> Path:
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"{digest.hexdigest()}-{max_side}.jpg"
     if out.exists():
         return out
     with Image.open(path) as image:
