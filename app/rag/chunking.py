@@ -13,6 +13,12 @@ SEASON_MECHANISM_TERMS = {
     2024: {"climber": ["trap", "stage chain"]},
     2025: {"climber": ["cage", "deep cage", "shallow cage"]},
 }
+MULTI_PIECE_TERMS = {
+    2019: ["cargo", "two cargo", "three cargo"],
+    2020: ["power cell", "two ball", "three ball"],
+    2022: ["cargo", "two ball", "three ball"],
+    2024: ["multi note", "two note", "three note"],
+}
 
 
 def expand_query(query: str, years: list[int] | None = None) -> str:
@@ -29,7 +35,11 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
             for year in years or []:
                 extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))
     if "multi ball" in lowered:
-        extra.extend(["multi note", "two ball", "three ball", "cargo", "power cell", "shooter"])
+        extra.append("shooter")
+        selected_terms = [
+            term for year in years or MULTI_PIECE_TERMS for term in MULTI_PIECE_TERMS.get(year, [])
+        ]
+        extra.extend(selected_terms)
     return " ".join([query, *dict.fromkeys(extra)])
 
 

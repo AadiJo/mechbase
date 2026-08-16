@@ -23,12 +23,16 @@ class SourceDoc(BaseModel):
     team: str | None
     year: int | None
     source_id: str
+    source_version: str
+    source_version_id: str
     source_url: str | None = None
 
 
 class RagDocument(BaseModel):
     id: str
     source_id: str
+    source_version: str
+    source_version_id: str
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -64,6 +68,8 @@ class SearchResult(BaseModel):
     score: float
     score_band: ScoreBand
     source_id: str
+    source_version_id: str
+    source_version: str | None = None
     source_pdf: str
     team: str | None
     year: int | None
@@ -94,6 +100,9 @@ class SearchResponse(BaseModel):
 
 
 class PageContextResponse(BaseModel):
+    source_id: str | None = None
+    source_version: str | None = None
+    source_version_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -113,6 +122,8 @@ class PageTextResponse(BaseModel):
 
 class SourceSummary(BaseModel):
     source_id: str
+    source_version_id: str
+    source_version: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -163,6 +174,9 @@ class SimilarPagesResponse(BaseModel):
 class ImageContextResponse(BaseModel):
     result_id: str | None = None
     image_url: str | None = None
+    source_id: str | None = None
+    source_version: str | None = None
+    source_version_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None

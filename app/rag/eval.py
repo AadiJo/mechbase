@@ -26,6 +26,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cases = json.loads(Path(args.eval_file).read_text()) if args.eval_file else DEFAULT_QUERIES
+    failures = 0
     for case in cases:
         response = search(case["query"], top_k=args.top_k, debug=True, settings=get_settings())
         got = {(result.source_pdf, result.page) for result in response.results}
@@ -34,13 +35,17 @@ def main() -> None:
         total = len(expected)
         if case.get("expect_empty"):
             status = "pass" if not response.results else "fail"
+            failures += int(bool(response.results))
             print(f"{case['query']}: abstention={status}")
         else:
+            failures += int(bool(total and found < total))
             print(f"{case['query']}: recall@{args.top_k}={found}/{total}")
         for idx, result in enumerate(response.results[:5], start=1):
             print(
                 f"  {idx}. {result.source_pdf} p{result.page} {result.modality} score={result.score:.3f}"
             )
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from PIL import Image
 
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
+from app.mcp.results import search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
@@ -70,6 +71,9 @@ class FakeRetrievalBackend:
         return ImageContextResponse(
             result_id=result_id,
             image_url="/images/254-2020/page-012/image-000.png",
+            source_id="254-2020",
+            source_version="version-a",
+            source_version_id="254-2020@version-a",
             source_pdf="254-2020.pdf",
             team="254",
             year=2020,
@@ -118,6 +122,9 @@ class FakeRetrievalBackend:
                     source_id=(
                         source_ids[0] if source_ids else resolved_source.removesuffix(".pdf")
                     ),
+                    source_version_id=(
+                        source_ids[0] if source_ids else resolved_source.removesuffix(".pdf")
+                    ),
                     source_pdf=resolved_source,
                     team=resolved_team,
                     year=resolved_year,
@@ -138,6 +145,8 @@ def _search_result(result_id: str, page: int) -> SearchResult:
         score=0.9,
         score_band="strong",
         source_id="254-2020",
+        source_version="version-a",
+        source_version_id="254-2020@version-a",
         source_pdf="254-2020.pdf",
         team="254",
         year=2020,
@@ -164,6 +173,21 @@ def _settings(artifact_dir: Path | None = None) -> Settings:
     return Settings(
         **values,
     )
+
+
+def test_search_output_preserves_weak_result_abstention() -> None:
+    response = SearchResponse(
+        query="cake recipe",
+        results=[],
+        coverage=SearchCoverage(candidate_pages=3, weak_pages_dropped=3),
+        abstention_reason="No indexed pages met the calibrated relevance threshold.",
+    )
+
+    output = search_output(response, "https://api.example.com")
+
+    assert output.results == []
+    assert output.coverage.weak_pages_dropped == 3
+    assert output.abstention_reason == ("No indexed pages met the calibrated relevance threshold.")
 
 
 def test_clerk_token_verifier_accepts_active_tokens() -> None:
@@ -371,6 +395,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                         "https://api.example.com/images/254-2020/page-012/page.png"
                                     ),
                                     "source_id": "254-2020",
+                                    "source_version": "version-a",
+                                    "source_version_id": "254-2020@version-a",
                                     "source_pdf": "254-2020.pdf",
                                     "team": "254",
                                     "year": 2020,
@@ -379,9 +405,9 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "score_band": "strong",
                                     "evidence": {
                                         "direct_source_text": True,
-                                        "visible_image": False,
+                                        "visible_image": True,
                                         "model_inference": False,
-                                        "missing": ["visible image evidence"],
+                                        "missing": [],
                                     },
                                 }
                             ],
@@ -514,6 +540,10 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert sources.is_error is False
                         assert sources.structured_content["sources"][0]["team"] == "254"
                         assert sources.structured_content["sources"][0]["source_id"] == "254-2020"
+                        assert (
+                            sources.structured_content["sources"][0]["source_version_id"]
+                            == "254-2020"
+                        )
                         assert sources.structured_content["coverage_found"] is True
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
                             "https://api.example.com/images/254-2020/page-012/page.png"

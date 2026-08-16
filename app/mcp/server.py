@@ -389,6 +389,11 @@ def create_mcp_server(
                     candidate_sources=len({result.source_id for result in response.results}),
                     returned_pages=len(response.results),
                 ),
+                abstention_reason=(
+                    None
+                    if response.results
+                    else "No similar pages met the calibrated relevance threshold."
+                ),
             ),
             public_base_url,
         )
@@ -483,7 +488,9 @@ def create_mcp_server(
             sources = [
                 item
                 for item in sources
-                if needle in item.source_id.casefold() or needle in item.source_pdf.casefold()
+                if needle in item.source_id.casefold()
+                or needle in item.source_pdf.casefold()
+                or needle in item.source_version_id.casefold()
             ]
         return source_output(sources[:limit], public_base_url)
 

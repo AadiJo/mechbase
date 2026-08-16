@@ -26,7 +26,7 @@ def _ocr_image(path: Path) -> str:
 
 
 def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument]:
-    artifact_root = settings.artifact_dir / source.source_id
+    artifact_root = settings.artifact_dir / source.source_version_id
     docs: list[RagDocument] = []
     pdf = fitz.open(source.path)
     try:
@@ -56,8 +56,10 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
             section = section_from_text(page_text)
             docs.append(
                 RagDocument(
-                    id=_safe_id(source.source_id, page_num, "page"),
+                    id=_safe_id(source.source_version_id, page_num, "page"),
                     source_id=source.source_id,
+                    source_version=source.source_version,
+                    source_version_id=source.source_version_id,
                     source_pdf=source.path.name,
                     team=source.team,
                     year=source.year,
@@ -75,8 +77,10 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
             ):
                 docs.append(
                     RagDocument(
-                        id=_safe_id(source.source_id, page_num, "text", chunk_idx),
+                        id=_safe_id(source.source_version_id, page_num, "text", chunk_idx),
                         source_id=source.source_id,
+                        source_version=source.source_version,
+                        source_version_id=source.source_version_id,
                         source_pdf=source.path.name,
                         team=source.team,
                         year=source.year,
@@ -123,8 +127,10 @@ def _extract_page_images(
             out_path.write_bytes(image["image"])
         docs.append(
             RagDocument(
-                id=_safe_id(source.source_id, page_num, "image", image_idx),
+                id=_safe_id(source.source_version_id, page_num, "image", image_idx),
                 source_id=source.source_id,
+                source_version=source.source_version,
+                source_version_id=source.source_version_id,
                 source_pdf=source.path.name,
                 team=source.team,
                 year=source.year,

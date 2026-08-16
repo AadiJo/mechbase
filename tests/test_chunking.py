@@ -8,6 +8,21 @@ def test_expand_multi_ball_query() -> None:
     assert "flywheel" in expanded
 
 
+def test_expand_multi_ball_query_uses_only_matching_season_terms() -> None:
+    charged_up = expand_query("multi ball shooter", years=[2023])
+    crescendo = expand_query("multi ball shooter", years=[2024])
+    infinite_recharge = expand_query("multi ball shooter", years=[2020])
+
+    assert "multi note" not in charged_up
+    assert "cargo" not in charged_up
+    assert "power cell" not in charged_up
+    assert "multi note" in crescendo
+    assert "cargo" not in crescendo
+    assert "power cell" not in crescendo
+    assert "power cell" in infinite_recharge
+    assert "multi note" not in infinite_recharge
+
+
 def test_expansion_only_adds_game_specific_terms_for_matching_season() -> None:
     historical = expand_query("climber", years=[2018])
     crescendo = expand_query("climber", years=[2024])

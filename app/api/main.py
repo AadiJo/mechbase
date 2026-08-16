@@ -214,9 +214,10 @@ def image_context(
 def page_context(
     source_pdf: str,
     page: int,
+    source_version_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageContextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page)
+    context = RagStore(get_settings()).page_context(source_pdf, page, source_version_id)
     if context is None:
         raise HTTPException(status_code=404, detail="Page context not found.")
     return context
@@ -226,9 +227,10 @@ def page_context(
 def page_text(
     source_pdf: str,
     page: int,
+    source_version_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageTextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page)
+    context = RagStore(get_settings()).page_context(source_pdf, page, source_version_id)
     if context is None or not context.text.strip():
         raise HTTPException(status_code=404, detail="Page text not found.")
     return PageTextResponse(source_pdf=source_pdf, page=page, text=context.text)

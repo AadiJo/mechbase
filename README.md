@@ -23,6 +23,9 @@ docker compose run --rm ingest python -m app.rag.ingest --data-dir /app/data --l
 docker compose up api
 ```
 
+Optionally add `data/sources.json` as a filename-to-URL map so ingestion can preserve original
+HTTP or HTTPS source URLs.
+
 Search:
 
 ```bash
@@ -57,7 +60,8 @@ The server provides six read-only tools:
 - `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
   hosts that support MCP Apps. Other clients still receive its structured result.
 - `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
-  search, stable source IDs, provenance when known, and complete text and image coverage counts.
+  search, stable logical IDs plus content versions, provenance when known, and complete text and
+  image coverage counts.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.

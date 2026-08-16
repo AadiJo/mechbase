@@ -32,15 +32,16 @@ def multimodal_vectors(batch, embedder: VoyageEmbedder, settings):
     return [vector if vector is not None else zero for vector in vectors]
 
 
-def completed_sources(manifest_path: Path) -> set[str]:
+def completed_sources(manifest_path: Path) -> dict[str, str | None]:
     if not manifest_path.exists():
-        return set()
-    done = set()
+        return {}
+    done: dict[str, str | None] = {}
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
-            done.add(json.loads(line)["source"])
+            record = json.loads(line)
+            done[record["source"]] = record.get("source_version")
         except (json.JSONDecodeError, KeyError):
             continue
     return done
@@ -70,14 +71,18 @@ def main() -> None:
 
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = settings.artifact_dir / "ingestion-manifest.jsonl"
-    completed = set() if args.force else completed_sources(manifest_path)
+    completed = {} if args.force else completed_sources(manifest_path)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         for source in sources:
-            if source.path.name in completed:
+            if completed.get(source.path.name) == source.source_version:
                 print(f"Skipping {source.path.name}; already in manifest.", flush=True)
                 continue
             print(f"Ingesting {source.path.name}...", flush=True)
             docs = extract_documents(source, settings)
+            if not docs:
+                raise RuntimeError(
+                    f"Refusing to replace {source.path.name}: extraction produced no documents."
+                )
             ingested_at = datetime.now(UTC).isoformat()
             docs = [doc.model_copy(update={"ingested_at": ingested_at}) for doc in docs]
             print(f"Extracted {len(docs)} retrieval objects from {source.path.name}.", flush=True)
@@ -89,7 +94,21 @@ def main() -> None:
                 image_vectors = multimodal_vectors(batch, embedder, settings)
                 store.upsert(batch, text_vectors, image_vectors)
                 print(f"  upserted batch {batch_idx}", flush=True)
-            manifest.write(json.dumps({"source": source.path.name, "documents": len(docs)}) + "\n")
+            store.delete_superseded_source_versions(
+                source.source_id,
+                source.source_version,
+            )
+            manifest.write(
+                json.dumps(
+                    {
+                        "source": source.path.name,
+                        "source_id": source.source_id,
+                        "source_version": source.source_version,
+                        "documents": len(docs),
+                    }
+                )
+                + "\n"
+            )
             manifest.flush()
             print(f"Indexed {len(docs)} documents from {source.path.name}.", flush=True)
 

@@ -26,6 +26,8 @@ TEXT_VECTOR = "text"
 IMAGE_VECTOR = "image"
 SOURCE_SUMMARY_FIELDS = [
     "source_id",
+    "source_version",
+    "source_version_id",
     "source_pdf",
     "team",
     "year",
@@ -35,11 +37,22 @@ SOURCE_SUMMARY_FIELDS = [
     "ingested_at",
     "source_url",
 ]
+PAYLOAD_INDEXES = {
+    "team": models.PayloadSchemaType.KEYWORD,
+    "year": models.PayloadSchemaType.INTEGER,
+    "source_id": models.PayloadSchemaType.KEYWORD,
+    "source_version": models.PayloadSchemaType.KEYWORD,
+    "source_version_id": models.PayloadSchemaType.KEYWORD,
+    "source_pdf": models.PayloadSchemaType.KEYWORD,
+    "modality": models.PayloadSchemaType.KEYWORD,
+}
 
 
 @dataclass
 class _SourceAccumulator:
     source_id: str
+    source_version: str | None
+    source_version_id: str
     source_pdf: str
     team: str | None
     year: int | None
@@ -53,22 +66,33 @@ class _SourceAccumulator:
 
 
 class RagStore:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, client: QdrantClient | None = None):
         self.settings = settings
-        self.client = QdrantClient(url=settings.qdrant_url)
+        self.client = client or QdrantClient(url=settings.qdrant_url)
 
     def ensure_collection(self) -> None:
         existing = {collection.name for collection in self.client.get_collections().collections}
-        if self.settings.collection_name in existing:
-            return
-        vector_params = models.VectorParams(
-            size=self.settings.embedding_dim,
-            distance=models.Distance.COSINE,
-        )
-        self.client.create_collection(
-            collection_name=self.settings.collection_name,
-            vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
-        )
+        if self.settings.collection_name not in existing:
+            vector_params = models.VectorParams(
+                size=self.settings.embedding_dim,
+                distance=models.Distance.COSINE,
+            )
+            self.client.create_collection(
+                collection_name=self.settings.collection_name,
+                vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
+            )
+
+        collection = self.client.get_collection(self.settings.collection_name)
+        indexed_fields = set((getattr(collection, "payload_schema", None) or {}).keys())
+        for field_name, field_schema in PAYLOAD_INDEXES.items():
+            if field_name in indexed_fields:
+                continue
+            self.client.create_payload_index(
+                collection_name=self.settings.collection_name,
+                field_name=field_name,
+                field_schema=field_schema,
+                wait=True,
+            )
 
     def corpus_revision(self) -> str:
         collection = self.client.get_collection(self.settings.collection_name)
@@ -105,6 +129,32 @@ class RagStore:
             self.client.upsert(
                 collection_name=self.settings.collection_name, points=points, wait=True
             )
+
+    def delete_superseded_source_versions(
+        self,
+        source_id: str,
+        source_version: str,
+    ) -> None:
+        self.client.delete(
+            collection_name=self.settings.collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source_id",
+                            match=models.MatchValue(value=source_id),
+                        )
+                    ],
+                    must_not=[
+                        models.FieldCondition(
+                            key="source_version",
+                            match=models.MatchValue(value=source_version),
+                        )
+                    ],
+                )
+            ),
+            wait=True,
+        )
 
     def search(
         self,
@@ -148,33 +198,29 @@ class RagStore:
                         },
                     )
         ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
-        candidates: list[tuple[SearchResult, float]] = []
-        seen_pages: set[tuple[str, int]] = set()
+        candidate_pages: set[tuple[str, int]] = set()
+        candidate_sources: set[str] = set()
+        relevant_pages: set[tuple[str, int]] = set()
+        ranked_results: list[SearchResult] = []
         for _point_id, (score, payload, debug) in ranked:
-            page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
-            if page_key in seen_pages:
-                continue
-            seen_pages.add(page_key)
+            page_key = _page_key(payload)
+            source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+            candidate_pages.add(page_key)
+            candidate_sources.add(source_id)
             vector_score = float(debug["vector_score"])
-            candidates.append(
-                (
-                    self._search_result_from_payload(
-                        payload,
-                        score,
-                        debug if request.debug else {},
-                        band_score=vector_score,
-                    ),
-                    vector_score,
+            if vector_score < self.settings.search_min_score or page_key in relevant_pages:
+                continue
+            relevant_pages.add(page_key)
+            ranked_results.append(
+                self._search_result_from_payload(
+                    payload,
+                    score,
+                    debug if request.debug else {},
+                    band_score=vector_score,
                 )
             )
 
-        candidate_pages = len(candidates)
-        candidate_sources = len({result.source_id for result, _score in candidates})
-        candidates = [
-            candidate for candidate in candidates if candidate[1] >= self.settings.search_min_score
-        ]
-        weak_pages_dropped = candidate_pages - len(candidates)
-        ranked_results = [result for result, _score in candidates]
+        weak_pages_dropped = len(candidate_pages - relevant_pages)
 
         if request.sort == "newest":
             ranked_results.sort(
@@ -195,23 +241,32 @@ class RagStore:
             )
         results = ranked_results[: request.top_k]
         return results, SearchCoverage(
-            candidate_pages=candidate_pages,
-            candidate_sources=candidate_sources,
+            candidate_pages=len(candidate_pages),
+            candidate_sources=len(candidate_sources),
             weak_pages_dropped=weak_pages_dropped,
             returned_pages=len(results),
         )
 
-    def page_context(self, source_pdf: str, page: int) -> PageContextResponse | None:
+    def page_context(
+        self,
+        source_pdf: str,
+        page: int,
+        source_version_id: str | None = None,
+    ) -> PageContextResponse | None:
+        conditions = [
+            models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
+            models.FieldCondition(key="page", match=models.MatchValue(value=page)),
+        ]
+        if source_version_id:
+            conditions.append(
+                models.FieldCondition(
+                    key="source_version_id",
+                    match=models.MatchValue(value=source_version_id),
+                )
+            )
         hits, _ = self.client.scroll(
             collection_name=self.settings.collection_name,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="source_pdf", match=models.MatchValue(value=source_pdf)
-                    ),
-                    models.FieldCondition(key="page", match=models.MatchValue(value=page)),
-                ]
-            ),
+            scroll_filter=models.Filter(must=conditions),
             limit=256,
             with_payload=True,
         )
@@ -243,6 +298,9 @@ class RagStore:
 
         first = payloads[0]
         return PageContextResponse(
+            source_id=first.get("source_id"),
+            source_version=first.get("source_version"),
+            source_version_id=first.get("source_version_id"),
             source_pdf=source_pdf,
             team=first.get("team"),
             year=first.get("year"),
@@ -280,7 +338,9 @@ class RagStore:
             summaries = [
                 summary
                 for summary in summaries
-                if needle in summary.source_id.casefold() or needle in summary.source_pdf.casefold()
+                if needle in summary.source_id.casefold()
+                or needle in summary.source_pdf.casefold()
+                or needle in summary.source_version_id.casefold()
             ]
         return SourceListResponse(sources=summaries)
 
@@ -388,18 +448,22 @@ class RagStore:
             return None
         source_pdf = payload.get("source_pdf", "")
         page = int(payload.get("page", 0))
-        context = self.page_context(source_pdf, page)
+        source_version_id = payload.get("source_version_id")
+        context = self.page_context(source_pdf, page, source_version_id)
         if context is None:
             return None
         return ImageContextResponse(
             result_id=payload.get("id"),
             image_url=self._artifact_url(payload.get("artifact_path")) or image_url,
+            source_id=payload.get("source_id"),
+            source_version=payload.get("source_version"),
+            source_version_id=source_version_id,
             source_pdf=source_pdf,
             team=payload.get("team"),
             year=payload.get("year"),
             page=page,
-            page_context_url=self._page_context_url(source_pdf, page),
-            page_text_url=self._page_text_url(source_pdf, page),
+            page_context_url=self._page_context_url(source_pdf, page, source_version_id),
+            page_text_url=self._page_text_url(source_pdf, page, source_version_id),
             text=context.text,
             page_image_url=context.page_image_url,
             image_urls=context.image_urls,
@@ -421,10 +485,12 @@ class RagStore:
         ).points
         results: list[SearchResult] = []
         seen_pages: set[tuple[str, int]] = set()
-        seed_page = (seed_payload.get("source_pdf", ""), int(seed_payload.get("page", 0)))
+        seed_page = _page_key(seed_payload)
         for hit in hits:
+            if float(hit.score) < self.settings.search_min_score:
+                continue
             payload = dict(hit.payload or {})
-            page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
+            page_key = _page_key(payload)
             if page_key == seed_page or page_key in seen_pages:
                 continue
             seen_pages.add(page_key)
@@ -461,6 +527,12 @@ class RagStore:
                 self.settings.search_min_score,
             ),
             source_id=str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem),
+            source_version=payload.get("source_version"),
+            source_version_id=str(
+                payload.get("source_version_id")
+                or payload.get("source_id")
+                or Path(payload.get("source_pdf", "")).stem
+            ),
             source_pdf=payload.get("source_pdf", ""),
             team=payload.get("team"),
             year=payload.get("year"),
@@ -476,10 +548,14 @@ class RagStore:
                 if (url := self._artifact_url(path))
             ],
             page_context_url=self._page_context_url(
-                payload.get("source_pdf", ""), int(payload.get("page", 0))
+                payload.get("source_pdf", ""),
+                int(payload.get("page", 0)),
+                payload.get("source_version_id"),
             ),
             page_text_url=self._page_text_url(
-                payload.get("source_pdf", ""), int(payload.get("page", 0))
+                payload.get("source_pdf", ""),
+                int(payload.get("page", 0)),
+                payload.get("source_version_id"),
             ),
             debug=debug or {},
         )
@@ -505,7 +581,7 @@ class RagStore:
             points, offset = self.client.scroll(
                 collection_name=self.settings.collection_name,
                 scroll_filter=qfilter,
-                limit=256,
+                limit=1024,
                 offset=offset,
                 with_payload=SOURCE_SUMMARY_FIELDS,
                 with_vectors=False,
@@ -545,17 +621,29 @@ class RagStore:
         grouped: dict[str, _SourceAccumulator] = {}
         for payload in payloads:
             source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
-            accumulator = grouped.get(source_id)
+            source_version_id = str(payload.get("source_version_id") or source_id)
+            accumulator = grouped.get(source_version_id)
             if accumulator is None:
                 accumulator = _SourceAccumulator(
                     source_id=source_id,
+                    source_version=payload.get("source_version"),
+                    source_version_id=source_version_id,
                     source_pdf=payload.get("source_pdf", ""),
                     team=payload.get("team"),
                     year=payload.get("year"),
                     ingested_at=payload.get("ingested_at"),
                     source_url=payload.get("source_url"),
                 )
-                grouped[source_id] = accumulator
+                grouped[source_version_id] = accumulator
+            accumulator.source_version = accumulator.source_version or payload.get("source_version")
+            accumulator.source_url = accumulator.source_url or payload.get("source_url")
+            accumulator.team = accumulator.team or payload.get("team")
+            accumulator.year = accumulator.year or payload.get("year")
+            incoming_ingested_at = payload.get("ingested_at")
+            if incoming_ingested_at and (
+                accumulator.ingested_at is None or incoming_ingested_at > accumulator.ingested_at
+            ):
+                accumulator.ingested_at = incoming_ingested_at
             page = int(payload.get("page", 0))
             if page:
                 accumulator.pages.add(page)
@@ -580,6 +668,8 @@ class RagStore:
             summaries.append(
                 SourceSummary(
                     source_id=accumulator.source_id,
+                    source_version=accumulator.source_version,
+                    source_version_id=accumulator.source_version_id,
                     source_pdf=accumulator.source_pdf,
                     team=accumulator.team,
                     year=accumulator.year,
@@ -614,11 +704,23 @@ class RagStore:
             return None
         return f"{self.settings.artifact_url_base.rstrip('/')}/{rel.as_posix()}"
 
-    def _page_context_url(self, source_pdf: str, page: int) -> str:
-        return f"/pages/{quote(source_pdf, safe='')}/{page}"
+    def _page_context_url(
+        self,
+        source_pdf: str,
+        page: int,
+        source_version_id: str | None = None,
+    ) -> str:
+        path = f"/pages/{quote(source_pdf, safe='')}/{page}"
+        return _with_source_version(path, source_version_id)
 
-    def _page_text_url(self, source_pdf: str, page: int) -> str:
-        return f"/pages/{quote(source_pdf, safe='')}/{page}/text"
+    def _page_text_url(
+        self,
+        source_pdf: str,
+        page: int,
+        source_version_id: str | None = None,
+    ) -> str:
+        path = f"/pages/{quote(source_pdf, safe='')}/{page}/text"
+        return _with_source_version(path, source_version_id)
 
 
 def _metadata_filter(
@@ -690,3 +792,14 @@ def _score_band(score: float, minimum: float) -> ScoreBand:
 def _chunk_sort_key(payload: dict) -> tuple[int, str]:
     match = re.search(r"_text_(\d+)$", str(payload.get("id", "")))
     return (int(match.group(1)) if match else 0, str(payload.get("id", "")))
+
+
+def _page_key(payload: dict) -> tuple[str, int]:
+    source = str(payload.get("source_version_id") or payload.get("source_pdf", ""))
+    return source, int(payload.get("page", 0))
+
+
+def _with_source_version(path: str, source_version_id: str | None) -> str:
+    if not source_version_id:
+        return path
+    return f"{path}?source_version_id={quote(source_version_id, safe='')}"

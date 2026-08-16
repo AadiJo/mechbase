@@ -26,6 +26,8 @@ class SearchItem(BaseModel):
     title: str
     url: str
     source_id: str
+    source_version_id: str
+    source_version: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -66,6 +68,8 @@ class FetchOutput(BaseModel):
 
 class SourceItem(BaseModel):
     source_id: str
+    source_version_id: str
+    source_version: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -123,42 +127,43 @@ def search_output(
     *,
     applied_filters: AppliedSearchFilters | None = None,
 ) -> SearchOutput:
+    items = [
+        SearchItem(
+            id=result.id,
+            title=_result_title(result.source_pdf, result.page, result.team),
+            url=_result_url(result, public_base_url),
+            source_id=result.source_id,
+            source_version=result.source_version,
+            source_version_id=result.source_version_id,
+            source_pdf=result.source_pdf,
+            team=result.team,
+            year=result.year,
+            page=result.page,
+            snippet=_truncate(result.text.strip(), 500),
+            score_band=result.score_band,
+            evidence=EvidenceClassification(
+                direct_source_text=bool(result.text.strip()),
+                visible_image=bool(result.artifact_url or result.linked_artifact_urls),
+                missing=[
+                    label
+                    for missing, label in (
+                        (not result.text.strip(), "direct source text"),
+                        (
+                            not (result.artifact_url or result.linked_artifact_urls),
+                            "visible image evidence",
+                        ),
+                    )
+                    if missing
+                ],
+            ),
+        )
+        for result in response.results
+        if result.id
+    ]
     return SearchOutput(
-        results=[
-            SearchItem(
-                id=result.id,
-                title=_result_title(result.source_pdf, result.page, result.team),
-                url=_result_url(result, public_base_url),
-                source_id=result.source_id,
-                source_pdf=result.source_pdf,
-                team=result.team,
-                year=result.year,
-                page=result.page,
-                snippet=_truncate(result.text.strip(), 500),
-                score_band=result.score_band,
-                evidence=EvidenceClassification(
-                    direct_source_text=bool(result.text.strip()),
-                    visible_image=result.modality in {"page_image", "extracted_image"}
-                    and bool(result.artifact_url),
-                    missing=[
-                        label
-                        for missing, label in (
-                            (not result.text.strip(), "direct source text"),
-                            (
-                                result.modality not in {"page_image", "extracted_image"}
-                                or not result.artifact_url,
-                                "visible image evidence",
-                            ),
-                        )
-                        if missing
-                    ],
-                ),
-            )
-            for result in response.results
-            if result.id
-        ],
+        results=items,
         applied_filters=applied_filters or AppliedSearchFilters(),
-        coverage=response.coverage,
+        coverage=response.coverage.model_copy(update={"returned_pages": len(items)}),
         abstention_reason=response.abstention_reason,
     )
 
@@ -177,6 +182,9 @@ def fetch_output(
         text=context.text,
         url=canonical_url,
         metadata={
+            "source_id": context.source_id,
+            "source_version": context.source_version,
+            "source_version_id": context.source_version_id,
             "source_pdf": context.source_pdf,
             "team": context.team,
             "year": context.year,
@@ -194,6 +202,8 @@ def source_output(
         sources=[
             SourceItem(
                 source_id=source.source_id,
+                source_version=source.source_version,
+                source_version_id=source.source_version_id,
                 source_pdf=source.source_pdf,
                 team=source.team,
                 year=source.year,
