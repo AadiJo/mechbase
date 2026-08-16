@@ -648,7 +648,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 2
+                        assert len(backend.list_source_calls) == 1
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -662,12 +662,12 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 3
+                        assert len(backend.list_source_calls) == 2
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],
                             "source_ids": ["4414-2024"],
-                            "source_query": "4414",
+                            "source_query": None,
                         }
 
                         invalid = await session.call_tool(

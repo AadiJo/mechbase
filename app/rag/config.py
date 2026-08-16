@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     voyage_api_key: str | None = Field(default=None, alias="VOYAGE_API_KEY")
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
+    qdrant_timeout_seconds: float = Field(
+        default=10,
+        gt=0,
+        le=120,
+        alias="QDRANT_TIMEOUT_SECONDS",
+    )
     artifact_dir: Path = Field(default=Path("artifacts"), alias="ARTIFACT_DIR")
     rag_state_dir_override: Path | None = Field(default=None, alias="RAG_STATE_DIR")
     data_dir: Path = Field(default=Path("data"), alias="DATA_DIR")

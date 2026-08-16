@@ -83,7 +83,10 @@ class _SourceAccumulator:
 class RagStore:
     def __init__(self, settings: Settings, client: QdrantClient | None = None):
         self.settings = settings
-        self.client = client or QdrantClient(url=settings.qdrant_url)
+        self.client = client or QdrantClient(
+            url=settings.qdrant_url,
+            timeout=settings.qdrant_timeout_seconds,
+        )
 
     def ensure_collection(self) -> None:
         existing = {collection.name for collection in self.client.get_collections().collections}

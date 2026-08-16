@@ -19,6 +19,7 @@ services:
       - qdrant
     environment:
       PYTHONUNBUFFERED: "1"
+      RAG_STATE_DIR: /app/rag-state
     command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 
   ingest:
@@ -32,4 +33,5 @@ services:
       - qdrant
     environment:
       PYTHONUNBUFFERED: "1"
+      RAG_STATE_DIR: /app/rag-state
     command: python -m app.rag.ingest --data-dir /app/data

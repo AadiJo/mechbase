@@ -30,6 +30,7 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
     """
     lowered = query.lower()
     extra: list[str] = []
+    mechanism_years = SEASON_MECHANISM_TERMS if years is None else years
     for key, synonyms in MECHANISM_TERMS.items():
         season_synonyms = {
             term
@@ -38,13 +39,14 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
         }
         if key in lowered or any(term in lowered for term in [*synonyms, *season_synonyms]):
             extra.extend([key, *synonyms])
-            for year in years or []:
+            for year in mechanism_years:
                 extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))
     if "multi ball" in lowered:
         extra.append("shooter")
         # Unknown explicit seasons must not borrow game-piece names from other games.
+        multi_piece_years = MULTI_PIECE_TERMS if years is None else years
         selected_terms = [
-            term for year in years or MULTI_PIECE_TERMS for term in MULTI_PIECE_TERMS.get(year, [])
+            term for year in multi_piece_years for term in MULTI_PIECE_TERMS.get(year, [])
         ]
         extra.extend(selected_terms)
     return " ".join([query, *dict.fromkeys(extra)])

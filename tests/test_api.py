@@ -1,5 +1,10 @@
 import asyncio
+import threading
+from contextlib import suppress
+from pathlib import Path
+from types import SimpleNamespace
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import app.api.auth as auth
@@ -8,6 +13,7 @@ from app.api.auth import ApiKeyContext
 from app.api.main import app
 from app.rag.config import Settings
 from app.rag.models import SearchResponse
+from app.rag.store import RagStore
 
 
 def test_health() -> None:
@@ -17,20 +23,61 @@ def test_health() -> None:
     assert response.json()["ok"] is True
 
 
-def test_shutdown_cancels_the_payload_index_task() -> None:
+def test_api_startup_migrates_and_denies_legacy_control_state(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    state_dir = tmp_path / "state"
+    artifact_dir.mkdir()
+    (artifact_dir / "active-generations.json").write_text(
+        '{"254":"generation-a"}', encoding="utf-8"
+    )
+    (artifact_dir / "ingestion-manifest.jsonl").write_text(
+        '{"source":"254.pdf"}\n', encoding="utf-8"
+    )
+    (artifact_dir / ".embedding-cache").mkdir()
+    (artifact_dir / ".embedding-cache" / "preview.jpg").write_bytes(b"private")
+    settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
+
+    main.prepare_control_state(settings)
+
+    store = RagStore(settings, client=SimpleNamespace())
+    assert store.active_generations() == {"254": "generation-a"}
+    assert not (artifact_dir / "active-generations.json").exists()
+    assert not (artifact_dir / "ingestion-manifest.jsonl").exists()
+    static_app = FastAPI()
+    static_app.mount("/images", main.ArtifactStaticFiles(directory=artifact_dir))
+    client = TestClient(static_app)
+    assert client.get("/images/active-generations.json").status_code == 404
+    assert client.get("/images/ingestion-manifest.jsonl").status_code == 404
+    assert client.get("/images/ingestion.lock").status_code == 404
+    assert client.get("/images/.embedding-cache/preview.jpg").status_code == 404
+
+
+def test_compose_services_share_the_configured_private_state_volume() -> None:
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+
+    assert compose.count("- ./rag_state:/app/rag-state") == 2
+    assert compose.count("RAG_STATE_DIR: /app/rag-state") == 2
+
+
+def test_cancelled_startup_awaits_its_bounded_index_worker() -> None:
     async def verify() -> tuple[bool, bool]:
-        stopped = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
 
-        async def index_worker() -> None:
-            try:
-                await asyncio.Event().wait()
-            finally:
-                stopped.set()
+        def worker() -> None:
+            started.set()
+            release.wait(timeout=2)
 
-        task = asyncio.create_task(index_worker())
+        task = asyncio.create_task(main._run_blocking_safely(worker))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
         await asyncio.sleep(0)
-        await main._cancel_task(task)
-        return task.cancelled(), stopped.is_set()
+        still_waiting = not task.done()
+        release.set()
+        with suppress(asyncio.CancelledError):
+            await task
+        return still_waiting, task.cancelled()
 
     assert asyncio.run(verify()) == (True, True)
 
@@ -64,6 +111,7 @@ def test_validate_api_key_accepts_valid_key(monkeypatch) -> None:
 
 def test_rate_limit_defaults_to_20_requests() -> None:
     settings = Settings()
+    assert settings.qdrant_timeout_seconds == 10
     assert settings.rate_limit_enabled is True
     assert settings.rate_limit_max_requests == 20
     assert settings.rate_limit_window_seconds == 60

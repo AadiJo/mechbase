@@ -317,6 +317,13 @@ def ingestion_lock(state_dir: Path) -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def control_state_lock(settings: Settings) -> Iterator[None]:
+    """Coordinate new readers and writers with ingestion processes from the prior release."""
+    with ingestion_lock(settings.artifact_dir), ingestion_lock(settings.rag_state_dir):
+        yield
+
+
 def migrate_legacy_control_state(settings: Settings) -> None:
     """Move legacy control files out of the public artifact directory."""
     settings.rag_state_dir.mkdir(parents=True, exist_ok=True)
@@ -502,7 +509,7 @@ def main() -> None:
     embedder = VoyageEmbedder(settings)
 
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
-    with ingestion_lock(settings.rag_state_dir):
+    with control_state_lock(settings):
         migrate_legacy_control_state(settings)
         remove_abandoned_artifact_staging(settings.artifact_dir)
         ingest_sources(

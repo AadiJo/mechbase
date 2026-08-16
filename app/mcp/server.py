@@ -42,6 +42,7 @@ from app.rag.models import (
     SimilarPagesResponse,
     SourceIdFilter,
     SourceListResponse,
+    SourceSummary,
 )
 from app.rag.search import search as rag_search
 from app.rag.store import RagStore
@@ -444,7 +445,6 @@ def create_mcp_server(
                 teams,
                 normalized_years,
                 normalized_source_ids,
-                normalized_source_query,
             )
         )
         response = source_cache.get_or_compute(
@@ -453,16 +453,32 @@ def create_mcp_server(
                 team_numbers=teams,
                 years=normalized_years,
                 source_ids=normalized_source_ids,
-                source_query=normalized_source_query,
             ),
         )
+        sources = _filter_source_query(response.sources, normalized_source_query)
         return source_output(
-            response.sources[:limit],
+            sources[:limit],
             public_base_url,
-            total_matching_sources=len(response.sources),
+            total_matching_sources=len(sources),
         )
 
     return server
+
+
+def _filter_source_query(
+    sources: list[SourceSummary],
+    source_query: str | None,
+) -> list[SourceSummary]:
+    if source_query is None:
+        return sources
+    needle = source_query.casefold()
+    return [
+        source
+        for source in sources
+        if needle in source.source_id.casefold()
+        or needle in source.source_pdf.casefold()
+        or needle in source.source_version_id.casefold()
+    ]
 
 
 def create_mcp_http_app(server: MCPServer, settings: Settings) -> ASGIApp:

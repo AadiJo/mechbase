@@ -11,6 +11,7 @@ from qdrant_client import QdrantClient, models
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SearchRequest
 from app.rag.pdf import _document_id
+from app.rag.search import _expansion_years
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
 
 
@@ -61,6 +62,16 @@ def test_build_filter_unions_legacy_and_multi_value_filters() -> None:
     assert team_condition.match.any == ["254", "4414"]
     assert year_condition.match.any == [2023, 2024]
     assert source_condition.match.value == "254-2023.pdf"
+
+
+def test_query_expansion_uses_the_same_legacy_and_plural_year_union() -> None:
+    request = SearchRequest(
+        query="multi ball",
+        year=2020,
+        years=[2024, 2020],
+    )
+
+    assert _expansion_years(request) == [2020, 2024]
 
 
 def test_active_generation_filter_has_constant_condition_count() -> None:

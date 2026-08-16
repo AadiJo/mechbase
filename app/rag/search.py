@@ -37,7 +37,7 @@ def search(
     )
     expanded = expand_query(
         " ".join([query, *request.mechanism_types]),
-        request.years or ([request.year] if request.year else None),
+        _expansion_years(request),
     )
     embedder = VoyageEmbedder(settings)
     text_vector = embedder.embed_texts([expanded], "query")[0]
@@ -58,3 +58,10 @@ def search(
         coverage=coverage,
         abstention_reason=abstention_reason,
     )
+
+
+def _expansion_years(request: SearchRequest) -> list[int] | None:
+    years = list(
+        dict.fromkeys([*([request.year] if request.year is not None else []), *request.years])
+    )
+    return years or None

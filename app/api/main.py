@@ -1,17 +1,18 @@
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import RedirectResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 
 from app.api.auth import ApiKeyContext, record_usage, require_api_key
 from app.mcp.server import create_mcp_http_app, create_mcp_server
-from app.rag.config import get_settings
+from app.rag.config import Settings, get_settings
+from app.rag.ingest import control_state_lock, migrate_legacy_control_state
 from app.rag.models import (
     ImageContextResponse,
     PageContextResponse,
@@ -36,25 +37,22 @@ mcp_http_app = create_mcp_http_app(mcp_server, settings)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    index_task = asyncio.create_task(_ensure_payload_indexes())
-    try:
-        async with mcp_server.session_manager.run():
-            yield
-    finally:
-        await _cancel_task(index_task)
+    prepare_control_state(settings)
+    await _ensure_payload_indexes()
+    async with mcp_server.session_manager.run():
+        yield
 
 
-async def _cancel_task(task: asyncio.Task[None]) -> None:
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+def prepare_control_state(current_settings: Settings) -> None:
+    with control_state_lock(current_settings):
+        migrate_legacy_control_state(current_settings)
 
 
 async def _ensure_payload_indexes() -> None:
-    """Create newly declared Qdrant indexes without delaying API startup."""
+    """Create declared Qdrant indexes before accepting traffic."""
     store = RagStore(settings)
     try:
-        await asyncio.to_thread(store.ensure_payload_indexes)
+        await _run_blocking_safely(store.ensure_payload_indexes)
     except Exception:
         LOGGER.warning("Could not ensure Qdrant payload indexes during startup.", exc_info=True)
     finally:
@@ -64,16 +62,40 @@ async def _ensure_payload_indexes() -> None:
             LOGGER.warning("Could not close the startup Qdrant client.", exc_info=True)
 
 
+async def _run_blocking_safely(operation: Callable[[], object]) -> None:
+    worker = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await worker
+        finally:
+            raise cancellation
+
+
+PRIVATE_ARTIFACT_ROOTS = frozenset(
+    {"active-generations.json", "ingestion-manifest.jsonl", "ingestion.lock"}
+)
+
+
+class ArtifactStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        root_name = path.split("/", 1)[0]
+        if root_name.startswith(".") or root_name in PRIVATE_ARTIFACT_ROOTS:
+            return PlainTextResponse("Not Found", status_code=404)
+        return await super().get_response(path, scope)
+
+
 app = FastAPI(title="FRC Mechanism RAG", version="0.1.0", lifespan=lifespan)
 app.mount(
     settings.artifact_url_base,
-    StaticFiles(directory=settings.artifact_dir, check_dir=False),
+    ArtifactStaticFiles(directory=settings.artifact_dir, check_dir=False),
     name="images",
 )
 if settings.artifact_url_base != "/artifacts":
     app.mount(
         "/artifacts",
-        StaticFiles(directory=settings.artifact_dir, check_dir=False),
+        ArtifactStaticFiles(directory=settings.artifact_dir, check_dir=False),
         name="artifacts",
     )
 

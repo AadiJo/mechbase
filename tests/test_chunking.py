@@ -8,6 +8,15 @@ def test_expand_multi_ball_query() -> None:
     assert "flywheel" in expanded
 
 
+def test_unfiltered_climber_query_uses_all_known_season_aliases() -> None:
+    expanded = expand_query("climber")
+
+    assert "trap" in expanded
+    assert "stage chain" in expanded
+    assert "cage" in expanded
+    assert "deep cage" in expanded
+
+
 def test_expand_multi_ball_query_uses_only_matching_season_terms() -> None:
     charged_up = expand_query("multi ball shooter", years=[2023])
     crescendo = expand_query("multi ball shooter", years=[2024])

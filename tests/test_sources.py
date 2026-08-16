@@ -10,6 +10,7 @@ from app.rag.image_cache import cached_resized_image
 from app.rag.ingest import (
     artifact_fingerprint,
     completed_sources,
+    control_state_lock,
     ingest_sources,
     ingestion_fingerprint,
     ingestion_lock,
@@ -351,6 +352,19 @@ def test_ingestion_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
         ingestion_lock(tmp_path),
         pytest.raises(RuntimeError, match="already running"),
         ingestion_lock(tmp_path),
+    ):
+        pass
+
+
+def test_control_state_lock_coordinates_with_a_legacy_writer(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    state_dir = tmp_path / "state"
+    settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
+
+    with (
+        ingestion_lock(artifact_dir),
+        pytest.raises(RuntimeError, match="already running"),
+        control_state_lock(settings),
     ):
         pass
 
