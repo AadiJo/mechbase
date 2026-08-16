@@ -144,9 +144,7 @@ def _fact(
     is_interpretation = topic == "terminology"
     return GameFact(
         topic=topic,
-        evidence_kind=(
-            "engineering_interpretation" if is_interpretation else "official_summary"
-        ),
+        evidence_kind=("engineering_interpretation" if is_interpretation else "official_summary"),
         summary=summary,
         aliases=aliases,
         citation=_citation(year, game_name, manual_url, section, pages),
@@ -447,7 +445,7 @@ _GAME_CONTEXTS = {
                 "endgame",
                 "Robots parked by or climbed a STAGE chain, and could score a NOTE in a TRAP while onstage.",
                 ["stage", "chain", "onstage", "trap", "climb"],
-                "Sections 4 and 6.4, Game Overview and Scoring",
+                "Sections 4 and 6.5, Game Overview and Scoring",
                 "19-20, 46-48",
             ),
             (

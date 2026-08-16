@@ -15,6 +15,73 @@ EXPECTED_CITATION_PAGES = {
     2026: ["32", "15, 44-47", "46-47", "17-33", "15", "15-47"],
 }
 
+EXPECTED_CITATION_SECTIONS = {
+    2018: [
+        "Section 3.8, POWER CUBE",
+        "Section 2, Overview",
+        "Section 2, Overview",
+        "Section 3, ARCADE",
+        "Section 7, Game Rules, G22",
+        "Sections 2-3",
+    ],
+    2019: [
+        "Section 4, ARENA, GAME PIECES",
+        "Sections 3 and 5, Game and MATCH Play",
+        "Section 5, MATCH Play, Scoring",
+        "Section 4, ARENA",
+        "Section 7, Game Rules, G4-G6",
+        "Sections 3-5",
+    ],
+    2020: [
+        "Section 3.6, POWER CELL",
+        "Section 4.4, Scoring",
+        "Section 4.4.4, GENERATOR SWITCH Scoring",
+        "Section 3, ARENA",
+        "Section 7.2.2, POWER CELL Interaction, G6",
+        "Sections 2-4",
+    ],
+    2022: [
+        "Section 5.7, CARGO",
+        "Sections 4 and 6, Game Overview and MATCH Play",
+        "Section 6, MATCH Play, Scoring",
+        "Section 5, ARENA",
+        "Section 7, Game Rules, G403",
+        "Sections 4-6",
+    ],
+    2023: [
+        "Section 5.8, GAME PIECES",
+        "Section 6.4, Scoring",
+        "Section 6.4, CHARGE STATION Scoring",
+        "Section 5, ARENA",
+        "Section 7.4, GAME PIECES, G403",
+        "Sections 5-6",
+    ],
+    2024: [
+        "Section 5.7, GAME PIECES",
+        "Section 4, Game Overview",
+        "Sections 4 and 6.5, Game Overview and Scoring",
+        "Section 5, ARENA",
+        "Section 7.4, Game Rules, G403 and G409",
+        "Sections 4-6",
+    ],
+    2025: [
+        "Section 5.7, SCORING ELEMENTS",
+        "Sections 4 and 6, Game Overview and Scoring",
+        "Section 6.5, Scoring",
+        "Section 5, ARENA",
+        "Section 7.4, Game Rules, G409",
+        "Sections 4-6",
+    ],
+    2026: [
+        "Section 5.10.1, FUEL",
+        "Sections 4 and 6.4-6.5, Game Overview and Scoring",
+        "Section 6.5, Scoring",
+        "Section 5, ARENA",
+        "Section 4, Game Overview",
+        "Sections 4-6",
+    ],
+}
+
 
 @pytest.mark.parametrize(("year", "expected_pages"), EXPECTED_CITATION_PAGES.items())
 def test_every_reviewed_game_fact_has_validated_official_provenance(
@@ -27,6 +94,7 @@ def test_every_reviewed_game_fact_has_validated_official_provenance(
     assert output.requested_topics == list(ALL_GAME_TOPICS)
     assert [fact.topic for fact in output.facts] == list(ALL_GAME_TOPICS)
     assert [fact.citation.pages for fact in output.facts] == expected_pages
+    assert [fact.citation.section for fact in output.facts] == EXPECTED_CITATION_SECTIONS[year]
     assert all(
         fact.citation.url == output.official_manual_url
         and fact.citation.url.startswith("https://firstfrc.blob.core.windows.net/")
@@ -52,9 +120,7 @@ def test_unsupported_game_defaults_to_all_topics_as_missing() -> None:
 
 
 def test_first_events_targets_start_at_its_archive_boundary() -> None:
-    assert [target.provider for target in team_research_targets(254, 2014)] == [
-        "the_blue_alliance"
-    ]
+    assert [target.provider for target in team_research_targets(254, 2014)] == ["the_blue_alliance"]
     assert [target.provider for target in team_research_targets(254, 2015)] == [
         "the_blue_alliance",
         "first_events",
