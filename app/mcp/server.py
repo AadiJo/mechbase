@@ -77,7 +77,6 @@ class RagRetrievalBackend:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._store = RagStore(settings)
-        self._revision_cache: TTLCache[str, str] = TTLCache(ttl_seconds=10, max_entries=1)
         self._last_revision = "unknown"
 
     def search(self, request: SearchRequest) -> SearchResponse:
@@ -95,17 +94,12 @@ class RagRetrievalBackend:
         )
 
     def corpus_revision(self) -> str:
-        cached = self._revision_cache.get("corpus")
-        if cached is not None:
-            return cached
         try:
             revision = self._store.corpus_revision()
         except (ApiException, ResponseHandlingException):
             LOGGER.warning("Could not refresh the Qdrant corpus revision; using the last value.")
-            self._revision_cache.put("corpus", self._last_revision)
             return self._last_revision
         self._last_revision = revision
-        self._revision_cache.put("corpus", revision)
         return revision
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
@@ -442,7 +436,11 @@ def create_mcp_server(
             source_ids=normalized_source_ids,
             source_query=normalized_source_query,
         )
-        return source_output(sources[:limit], public_base_url)
+        return source_output(
+            sources[:limit],
+            public_base_url,
+            total_matching_sources=len(sources),
+        )
 
     return server
 

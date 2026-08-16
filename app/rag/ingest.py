@@ -7,6 +7,7 @@ from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
+from app.rag.artifacts import generation_namespace, source_artifact_root
 from app.rag.config import Settings, get_settings
 from app.rag.models import SourceDoc
 from app.rag.pdf import extract_documents
@@ -76,18 +77,33 @@ def remove_superseded_artifacts(
     source_id: str,
     current_namespace: str,
 ) -> None:
-    root = artifact_dir.resolve()
+    artifact_root = artifact_dir.resolve()
+    root_path = source_artifact_root(artifact_root, source_id)
+    if root_path.is_symlink():
+        return
+    root = root_path.resolve()
+    try:
+        root.relative_to(artifact_root)
+    except ValueError:
+        return
     if not root.exists():
         return
     for candidate in root.iterdir():
         if candidate.is_symlink() or not candidate.is_dir() or candidate.name == current_namespace:
             continue
-        if candidate.name == source_id or candidate.name.startswith(f"{source_id}@"):
-            shutil.rmtree(candidate)
+        shutil.rmtree(candidate)
 
 
-def remove_artifact_generation(artifact_dir: Path, namespace: str) -> None:
-    root = artifact_dir.resolve()
+def remove_artifact_generation(artifact_dir: Path, source_id: str, namespace: str) -> None:
+    artifact_root = artifact_dir.resolve()
+    root_path = source_artifact_root(artifact_root, source_id)
+    if root_path.is_symlink():
+        return
+    root = root_path.resolve()
+    try:
+        root.relative_to(artifact_root)
+    except ValueError:
+        return
     target_path = root / namespace
     if target_path.is_symlink():
         return
@@ -130,7 +146,7 @@ def main() -> None:
                 continue
             print(f"Ingesting {source.path.name}...", flush=True)
             ingestion_id = uuid4().hex
-            artifact_namespace = f"{source.source_version_id}#{ingestion_id}"
+            artifact_namespace = generation_namespace(source.source_version, ingestion_id)
             try:
                 docs = extract_documents(source, settings, ingestion_id=ingestion_id)
                 if not docs:
@@ -151,16 +167,22 @@ def main() -> None:
                     image_vectors = multimodal_vectors(batch, embedder, settings)
                     store.upsert(batch, text_vectors, image_vectors)
                     print(f"  upserted batch {batch_idx}", flush=True)
-            except Exception:
+                store.publish_source_generation(source.source_id, ingestion_id)
+            except BaseException:
                 try:
                     store.delete_source_generation(source.source_id, ingestion_id)
-                except Exception as cleanup_error:
+                except BaseException as cleanup_error:
                     print(
                         f"Could not remove failed generation {ingestion_id}: {cleanup_error}",
                         flush=True,
                     )
-                remove_artifact_generation(settings.artifact_dir, artifact_namespace)
+                remove_artifact_generation(
+                    settings.artifact_dir,
+                    source.source_id,
+                    artifact_namespace,
+                )
                 raise
+            store.mark_corpus_revision(ingestion_id)
             store.delete_superseded_source_generations(
                 source.source_id,
                 ingestion_id,

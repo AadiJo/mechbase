@@ -1,11 +1,16 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SearchRequest
-from app.rag.store import TEXT_VECTOR, RagStore, _build_filter
+from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
 
 
 def test_build_filter_uses_exact_multi_value_metadata_filters() -> None:
@@ -23,6 +28,8 @@ def test_build_filter_uses_exact_multi_value_metadata_filters() -> None:
     assert conditions["team"].match.any == ["254", "4414"]
     assert conditions["year"].match.any == [2023, 2024]
     assert conditions["source_id"].match.any == ["254-2023", "4414-2024"]
+    assert qfilter.must_not[0].key == "is_staged"
+    assert qfilter.must_not[0].match.value is True
 
 
 def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
@@ -69,14 +76,65 @@ def test_ensure_collection_adds_missing_metadata_indexes() -> None:
 
     created_fields = {field for field, _schema in client.created_indexes}
     assert created_fields == {
+        "id",
         "year",
         "source_id",
         "source_version",
         "source_version_id",
         "ingestion_id",
+        "is_staged",
         "source_pdf",
         "modality",
+        "artifact_path",
+        "linked_artifacts",
     }
+
+
+class MissingCollectionClient:
+    def __init__(self) -> None:
+        self.created = False
+
+    def get_collections(self):
+        return SimpleNamespace(collections=[])
+
+    def create_collection(self, **_kwargs):
+        self.created = True
+
+
+def test_payload_index_migration_does_not_create_a_missing_collection() -> None:
+    client = MissingCollectionClient()
+    store = RagStore(Settings(), client=client)
+
+    assert store.ensure_payload_indexes() is False
+    assert client.created is False
+
+
+class RevisionClient:
+    def __init__(self) -> None:
+        self.points_count = 10
+        self.indexed_vectors_count = 1
+
+    def get_collection(self, _name: str):
+        return SimpleNamespace(
+            points_count=self.points_count,
+            indexed_vectors_count=self.indexed_vectors_count,
+        )
+
+
+def test_corpus_revision_ignores_optimizer_progress_and_tracks_generation_commit(
+    tmp_path: Path,
+) -> None:
+    client = RevisionClient()
+    store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=client)
+    baseline = store.corpus_revision()
+    client.points_count = 99
+    client.indexed_vectors_count = 9
+
+    assert store.corpus_revision() == baseline
+
+    store.mark_corpus_revision("generation-new")
+
+    assert store.corpus_revision() != baseline
 
 
 class VersionedPointClient:
@@ -103,6 +161,16 @@ class VersionedPointClient:
             )
         }
 
+    def set_payload(self, **kwargs):
+        qfilter = kwargs["points"]
+        conditions = {condition.key: condition.match.value for condition in qfilter.must}
+        for payload in self.payloads.values():
+            if (
+                payload["source_id"] == conditions["source_id"]
+                and payload.get("ingestion_id") == conditions["ingestion_id"]
+            ):
+                payload.update(kwargs["payload"])
+
 
 def _versioned_doc(
     version: str,
@@ -115,7 +183,8 @@ def _versioned_doc(
     version_id = f"254-2023@{version}"
     namespace = f"{version_id}#{ingestion_id}" if ingestion_id else version_id
     return RagDocument(
-        id=f"{namespace}_{page}_text_0",
+        id=f"{version_id}_{page}_text_0",
+        storage_id=f"{namespace}_{page}_text_0",
         source_id="254-2023",
         source_version=version,
         source_version_id=version_id,
@@ -162,6 +231,47 @@ def test_failed_generation_cleanup_preserves_previous_generation() -> None:
     assert len(client.payloads) == 1
     remaining = next(iter(client.payloads.values()))
     assert remaining["ingestion_id"] == "old"
+
+
+def test_generation_is_published_only_by_an_explicit_commit() -> None:
+    client = VersionedPointClient()
+    store = RagStore(Settings(EMBEDDING_DIM=1), client=client)
+    staged = _versioned_doc("same", 1, ingestion_id="new").model_copy(update={"is_staged": True})
+    store.upsert([staged], [[1.0]], [[1.0]])
+
+    store.publish_source_generation("254-2023", "new")
+
+    published = next(iter(client.payloads.values()))
+    assert published["is_staged"] is False
+
+
+def test_staged_generation_is_hidden_from_source_and_page_reads() -> None:
+    client = QdrantClient(":memory:")
+    vector_params = models.VectorParams(size=1, distance=models.Distance.COSINE)
+    client.create_collection(
+        collection_name="frc_mechanisms",
+        vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
+    )
+    store = RagStore(Settings(EMBEDDING_DIM=1), client=client)
+    active = _versioned_doc(
+        "same",
+        1,
+        ingestion_id="active",
+        ingested_at="2026-08-15T12:00:00+00:00",
+    )
+    staged = _versioned_doc(
+        "same",
+        2,
+        ingestion_id="staged",
+        ingested_at="2026-08-16T12:00:00+00:00",
+    ).model_copy(update={"is_staged": True})
+    store.upsert([active, staged], [[1.0], [1.0]], [[1.0], [1.0]])
+
+    summaries = store.list_sources().sources
+
+    assert [summary.pages for summary in summaries] == [[1]]
+    assert store.page_context("254-2023.pdf", 2) is None
+    client.close()
 
 
 def test_source_summaries_do_not_mix_versions() -> None:
@@ -235,6 +345,7 @@ def test_page_context_is_scoped_to_the_result_generation() -> None:
     conditions = {condition.key: condition for condition in client.scroll_filter.must}
     assert conditions["source_version_id"].match.value == "254-2023@new"
     assert conditions["ingestion_id"].match.value == "generation-new"
+    assert client.scroll_filter.must_not[0].key == "is_staged"
     assert context.source_version_id == "254-2023@new"
 
 
@@ -265,6 +376,48 @@ def test_versionless_page_context_uses_latest_complete_generation() -> None:
     assert context is not None
     assert context.ingestion_id == "generation-new"
     assert context.text == "new text"
+
+
+class StableResultLookupClient:
+    def __init__(self) -> None:
+        self.scroll_filter = None
+
+    def scroll(self, **kwargs):
+        self.scroll_filter = kwargs["scroll_filter"]
+        old = _versioned_doc(
+            "same",
+            1,
+            ingestion_id="generation-old",
+            ingested_at="2026-08-15T12:00:00+00:00",
+        ).model_dump()
+        new = _versioned_doc(
+            "same",
+            1,
+            ingestion_id="generation-new",
+            ingested_at="2026-08-16T12:00:00+00:00",
+        ).model_dump()
+        return (
+            [
+                SimpleNamespace(payload=old, vector={TEXT_VECTOR: [0.1]}),
+                SimpleNamespace(payload=new, vector={TEXT_VECTOR: [0.2]}),
+            ],
+            None,
+        )
+
+
+def test_stable_result_id_resolves_to_latest_published_generation() -> None:
+    client = StableResultLookupClient()
+    store = RagStore(Settings(), client=client)
+    result_id = _versioned_doc("same", 1, ingestion_id="generation-old").id
+
+    payload, vectors = store._payload_and_vectors_for_result_id(result_id)
+
+    assert payload is not None
+    assert payload["ingestion_id"] == "generation-new"
+    assert vectors == {TEXT_VECTOR: [0.2]}
+    conditions = {condition.key: condition for condition in client.scroll_filter.must}
+    assert conditions["id"].match.value == result_id
+    assert client.scroll_filter.must_not[0].key == "is_staged"
 
 
 class FakeQdrantClient:
@@ -434,10 +587,12 @@ class PagingQdrantClient:
     def __init__(self) -> None:
         self.calls = 0
         self.payload_fields: list[str] = []
+        self.scroll_filter = None
 
     def scroll(self, **kwargs):
         self.calls += 1
         self.payload_fields = kwargs["with_payload"]
+        self.scroll_filter = kwargs["scroll_filter"]
         if kwargs.get("offset") is None:
             return (
                 [
@@ -486,3 +641,25 @@ def test_list_sources_paginates_and_filters_by_source_query() -> None:
     assert response.sources[0].source_id == "4414-2024"
     assert response.sources[0].page_image_count == 1
     assert response.sources[0].source_url == "https://example.com/4414-2024.pdf"
+    assert client.scroll_filter.must_not[0].key == "is_staged"
+
+
+def test_artifact_urls_encode_fragments_and_round_trip_through_static_files(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "generation#one" / "page.png"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"page-image")
+    store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=SimpleNamespace())
+
+    artifact_url = store._artifact_url(str(artifact))
+
+    assert artifact_url == "/images/generation%23one/page.png"
+    assert store._artifact_path_from_url(f"https://api.example.com{artifact_url}") == str(
+        artifact.resolve()
+    )
+    static_app = FastAPI()
+    static_app.mount("/images", StaticFiles(directory=tmp_path))
+    response = TestClient(static_app).get(artifact_url)
+    assert response.status_code == 200
+    assert response.content == b"page-image"

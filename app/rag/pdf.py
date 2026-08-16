@@ -4,6 +4,7 @@ import fitz
 import pytesseract
 from PIL import Image
 
+from app.rag.artifacts import generation_namespace, source_artifact_root
 from app.rag.chunking import section_from_text, split_text
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SourceDoc
@@ -31,10 +32,10 @@ def extract_documents(
     *,
     ingestion_id: str | None = None,
 ) -> list[RagDocument]:
-    document_namespace = (
-        f"{source.source_version_id}#{ingestion_id}" if ingestion_id else source.source_version_id
+    document_namespace = generation_namespace(source.source_version, ingestion_id)
+    artifact_root = (
+        source_artifact_root(settings.artifact_dir, source.source_id) / document_namespace
     )
-    artifact_root = settings.artifact_dir / document_namespace
     docs: list[RagDocument] = []
     pdf = fitz.open(source.path)
     try:
@@ -54,7 +55,14 @@ def extract_documents(
 
             linked_artifacts = [str(page_image_path)]
             extracted_images = _extract_page_images(
-                pdf, page, page_dir, source, page_num, page_text, ingestion_id
+                pdf,
+                page,
+                page_dir,
+                source,
+                page_num,
+                page_text,
+                document_namespace,
+                ingestion_id,
             )
             linked_artifacts.extend(
                 doc.artifact_path for doc in extracted_images if doc.artifact_path
@@ -64,11 +72,13 @@ def extract_documents(
             section = section_from_text(page_text)
             docs.append(
                 RagDocument(
-                    id=_safe_id(document_namespace, page_num, "page"),
+                    id=_safe_id(source.source_version_id, page_num, "page"),
+                    storage_id=_safe_id(document_namespace, page_num, "page"),
                     source_id=source.source_id,
                     source_version=source.source_version,
                     source_version_id=source.source_version_id,
                     ingestion_id=ingestion_id,
+                    is_staged=ingestion_id is not None,
                     source_pdf=source.path.name,
                     team=source.team,
                     year=source.year,
@@ -86,11 +96,13 @@ def extract_documents(
             ):
                 docs.append(
                     RagDocument(
-                        id=_safe_id(document_namespace, page_num, "text", chunk_idx),
+                        id=_safe_id(source.source_version_id, page_num, "text", chunk_idx),
+                        storage_id=_safe_id(document_namespace, page_num, "text", chunk_idx),
                         source_id=source.source_id,
                         source_version=source.source_version,
                         source_version_id=source.source_version_id,
                         ingestion_id=ingestion_id,
+                        is_staged=ingestion_id is not None,
                         source_pdf=source.path.name,
                         team=source.team,
                         year=source.year,
@@ -114,6 +126,7 @@ def _extract_page_images(
     source: SourceDoc,
     page_num: int,
     page_text: str,
+    document_namespace: str,
     ingestion_id: str | None,
 ) -> list[RagDocument]:
     docs: list[RagDocument] = []
@@ -138,18 +151,13 @@ def _extract_page_images(
             out_path.write_bytes(image["image"])
         docs.append(
             RagDocument(
-                id=_safe_id(
-                    f"{source.source_version_id}#{ingestion_id}"
-                    if ingestion_id
-                    else source.source_version_id,
-                    page_num,
-                    "image",
-                    image_idx,
-                ),
+                id=_safe_id(source.source_version_id, page_num, "image", image_idx),
+                storage_id=_safe_id(document_namespace, page_num, "image", image_idx),
                 source_id=source.source_id,
                 source_version=source.source_version,
                 source_version_id=source.source_version_id,
                 ingestion_id=ingestion_id,
+                is_staged=ingestion_id is not None,
                 source_pdf=source.path.name,
                 team=source.team,
                 year=source.year,

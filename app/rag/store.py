@@ -2,7 +2,7 @@ import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import QdrantClient, models
@@ -39,14 +39,18 @@ SOURCE_SUMMARY_FIELDS = [
     "source_url",
 ]
 PAYLOAD_INDEXES = {
+    "id": models.PayloadSchemaType.KEYWORD,
     "team": models.PayloadSchemaType.KEYWORD,
     "year": models.PayloadSchemaType.INTEGER,
     "source_id": models.PayloadSchemaType.KEYWORD,
     "source_version": models.PayloadSchemaType.KEYWORD,
     "source_version_id": models.PayloadSchemaType.KEYWORD,
     "ingestion_id": models.PayloadSchemaType.KEYWORD,
+    "is_staged": models.PayloadSchemaType.BOOL,
     "source_pdf": models.PayloadSchemaType.KEYWORD,
     "modality": models.PayloadSchemaType.KEYWORD,
+    "artifact_path": models.PayloadSchemaType.KEYWORD,
+    "linked_artifacts": models.PayloadSchemaType.KEYWORD,
 }
 
 
@@ -85,6 +89,13 @@ class RagStore:
                 vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
             )
 
+        self.ensure_payload_indexes()
+
+    def ensure_payload_indexes(self) -> bool:
+        existing = {collection.name for collection in self.client.get_collections().collections}
+        if self.settings.collection_name not in existing:
+            return False
+
         collection = self.client.get_collection(self.settings.collection_name)
         indexed_fields = set((getattr(collection, "payload_schema", None) or {}).keys())
         for field_name, field_schema in PAYLOAD_INDEXES.items():
@@ -96,22 +107,29 @@ class RagStore:
                 field_schema=field_schema,
                 wait=True,
             )
+        return True
 
     def corpus_revision(self) -> str:
-        collection = self.client.get_collection(self.settings.collection_name)
+        self.client.get_collection(self.settings.collection_name)
         manifest_path = self.settings.artifact_dir / "ingestion-manifest.jsonl"
+        revision_path = self.settings.artifact_dir / "corpus-revision"
         try:
             manifest = manifest_path.stat()
             manifest_revision = f"{manifest.st_mtime_ns}:{manifest.st_size}"
         except FileNotFoundError:
             manifest_revision = "missing"
-        return ":".join(
-            [
-                str(getattr(collection, "points_count", 0)),
-                str(getattr(collection, "indexed_vectors_count", 0)),
-                manifest_revision,
-            ]
-        )
+        try:
+            ingestion_revision = revision_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            ingestion_revision = "missing"
+        return f"{manifest_revision}:{ingestion_revision}"
+
+    def mark_corpus_revision(self, ingestion_id: str) -> None:
+        revision_path = self.settings.artifact_dir / "corpus-revision"
+        revision_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = revision_path.with_name(f".{revision_path.name}.{ingestion_id}.tmp")
+        temporary_path.write_text(ingestion_id, encoding="utf-8")
+        temporary_path.replace(revision_path)
 
     def upsert(
         self,
@@ -123,7 +141,7 @@ class RagStore:
         for doc, text_vector, image_vector in zip(docs, text_vectors, image_vectors, strict=True):
             points.append(
                 models.PointStruct(
-                    id=str(uuid5(NAMESPACE_URL, doc.id)),
+                    id=str(uuid5(NAMESPACE_URL, doc.storage_id or doc.id)),
                     vector={TEXT_VECTOR: text_vector, IMAGE_VECTOR: image_vector},
                     payload=doc.model_dump(),
                 )
@@ -179,6 +197,25 @@ class RagStore:
             wait=True,
         )
 
+    def publish_source_generation(self, source_id: str, ingestion_id: str) -> None:
+        self.client.set_payload(
+            collection_name=self.settings.collection_name,
+            payload={"is_staged": False},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    ),
+                    models.FieldCondition(
+                        key="ingestion_id",
+                        match=models.MatchValue(value=ingestion_id),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+
     def search(
         self,
         request: SearchRequest,
@@ -187,7 +224,7 @@ class RagStore:
         expanded_query: str,
     ) -> tuple[list[SearchResult], SearchCoverage]:
         qfilter = _build_filter(request)
-        limit = max(request.top_k * 3, request.top_k)
+        limit = max(request.top_k * 12, 60)
         text_hits = self.client.query_points(
             collection_name=self.settings.collection_name,
             query=text_vector,
@@ -278,6 +315,7 @@ class RagStore:
             candidate_sources=len(candidate_sources),
             weak_pages_dropped=weak_pages_dropped,
             returned_pages=len(results),
+            candidate_window_truncated=(len(text_hits) == limit or len(image_hits) == limit),
         )
 
     def page_context(
@@ -306,7 +344,7 @@ class RagStore:
                 )
             )
         payloads = self._scroll_payloads(
-            models.Filter(must=conditions),
+            _active_filter(must=conditions),
             limit=None,
         )
         if not payloads:
@@ -376,7 +414,7 @@ class RagStore:
                 source_ids=source_ids,
             )
         )
-        summaries = self._summarize_sources(payloads)
+        summaries = _latest_source_summaries(self._summarize_sources(payloads))
         if source_query:
             needle = source_query.casefold()
             summaries = [
@@ -452,7 +490,7 @@ class RagStore:
         self, source_pdf: str, page: int, top_k: int
     ) -> SimilarPagesResponse | None:
         payloads = self._scroll_payloads(
-            models.Filter(
+            _active_filter(
                 must=[
                     models.FieldCondition(
                         key="source_pdf", match=models.MatchValue(value=source_pdf)
@@ -484,7 +522,7 @@ class RagStore:
             artifact_path = self._artifact_path_from_url(image_url)
             if artifact_path:
                 payloads = self._scroll_payloads(
-                    models.Filter(
+                    _active_filter(
                         should=[
                             models.FieldCondition(
                                 key="artifact_path", match=models.MatchValue(value=artifact_path)
@@ -533,11 +571,13 @@ class RagStore:
         top_k: int,
         seed_payload: dict,
     ) -> SimilarPagesResponse:
+        limit = max(top_k * 12, 60)
         hits = self.client.query_points(
             collection_name=self.settings.collection_name,
             query=vector,
             using=vector_name,
-            limit=max(top_k * 4, top_k + 5),
+            query_filter=_active_filter(),
+            limit=limit,
             with_payload=True,
         ).points
         results: list[SearchResult] = []
@@ -578,6 +618,7 @@ class RagStore:
                 candidate_sources=len(candidate_sources),
                 weak_pages_dropped=len(candidate_pages - relevant_pages),
                 returned_pages=len(results),
+                candidate_window_truncated=len(hits) == limit,
             ),
         )
 
@@ -634,16 +675,26 @@ class RagStore:
         )
 
     def _payload_and_vectors_for_result_id(self, result_id: str) -> tuple[dict | None, dict | None]:
-        points = self.client.retrieve(
-            collection_name=self.settings.collection_name,
-            ids=[str(uuid5(NAMESPACE_URL, result_id))],
-            with_payload=True,
+        matches = self._scroll_payloads(
+            _active_filter(
+                must=[
+                    models.FieldCondition(
+                        key="id",
+                        match=models.MatchValue(value=result_id),
+                    )
+                ]
+            ),
+            limit=None,
             with_vectors=True,
         )
-        if not points:
+        if not matches:
             return None, None
-        point = points[0]
-        return dict(point.payload or {}), dict(point.vector or {})
+        latest_generation = _latest_generation(payload for payload, _vectors in matches)
+        return next(
+            (payload, vectors)
+            for payload, vectors in matches
+            if _generation_key(payload) == latest_generation
+        )
 
     def _iter_source_payloads(
         self,
@@ -765,11 +816,21 @@ class RagStore:
         )
 
     def _artifact_path_from_url(self, image_url: str) -> str | None:
-        prefixes = [self.settings.artifact_url_base.rstrip("/"), "/artifacts"]
+        request_path = unquote(urlsplit(image_url).path)
+        prefixes = [
+            urlsplit(self.settings.artifact_url_base).path.rstrip("/"),
+            "/artifacts",
+        ]
         for prefix in prefixes:
-            if image_url.startswith(prefix + "/"):
-                rel = image_url.removeprefix(prefix + "/")
-                return str((self.settings.artifact_dir / rel).resolve())
+            if request_path.startswith(prefix + "/"):
+                rel = request_path.removeprefix(prefix + "/")
+                artifact_root = self.settings.artifact_dir.resolve()
+                candidate = (artifact_root / rel).resolve()
+                try:
+                    candidate.relative_to(artifact_root)
+                except ValueError:
+                    return None
+                return str(candidate)
         return None
 
     def _artifact_url(self, artifact_path: str | None) -> str | None:
@@ -779,7 +840,8 @@ class RagStore:
             rel = Path(artifact_path).resolve().relative_to(self.settings.artifact_dir.resolve())
         except ValueError:
             return None
-        return f"{self.settings.artifact_url_base.rstrip('/')}/{rel.as_posix()}"
+        encoded_path = quote(rel.as_posix(), safe="/")
+        return f"{self.settings.artifact_url_base.rstrip('/')}/{encoded_path}"
 
     def _page_context_url(
         self,
@@ -809,7 +871,7 @@ def _metadata_filter(
     team_numbers: list[str] | None = None,
     years: list[int] | None = None,
     source_ids: list[str] | None = None,
-) -> models.Filter | None:
+) -> models.Filter:
     conditions = []
     if team:
         conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=team)))
@@ -825,10 +887,10 @@ def _metadata_filter(
         )
     if source_ids:
         conditions.append(_match_values("source_id", list(dict.fromkeys(source_ids))))
-    return models.Filter(must=conditions) if conditions else None
+    return _active_filter(must=conditions)
 
 
-def _build_filter(request: SearchRequest) -> models.Filter | None:
+def _build_filter(request: SearchRequest) -> models.Filter:
     metadata_filter = _metadata_filter(
         team=request.team,
         year=request.year,
@@ -837,12 +899,29 @@ def _build_filter(request: SearchRequest) -> models.Filter | None:
         years=request.years,
         source_ids=request.source_ids,
     )
-    conditions = list(metadata_filter.must or []) if metadata_filter else []
+    conditions = list(metadata_filter.must or [])
     if request.modality:
         conditions.append(
             models.FieldCondition(key="modality", match=models.MatchValue(value=request.modality))
         )
-    return models.Filter(must=conditions) if conditions else None
+    return _active_filter(must=conditions)
+
+
+def _active_filter(
+    *,
+    must: list[models.FieldCondition] | None = None,
+    should: list[models.FieldCondition] | None = None,
+) -> models.Filter:
+    return models.Filter(
+        must=must or [],
+        should=should,
+        must_not=[
+            models.FieldCondition(
+                key="is_staged",
+                match=models.MatchValue(value=True),
+            )
+        ],
+    )
 
 
 def _match_values(key: str, values: list[str] | list[int]) -> models.FieldCondition:
@@ -897,6 +976,21 @@ def _latest_generation(payloads: Iterable[dict]) -> str:
         ingested_at_by_generation,
         key=lambda generation: (ingested_at_by_generation[generation], generation),
     )
+
+
+def _latest_source_summaries(summaries: Iterable[SourceSummary]) -> list[SourceSummary]:
+    latest: dict[str, SourceSummary] = {}
+    for summary in summaries:
+        current = latest.get(summary.source_id)
+        if current is None or (
+            summary.ingested_at or "",
+            summary.ingestion_id or summary.source_version_id,
+        ) > (
+            current.ingested_at or "",
+            current.ingestion_id or current.source_version_id,
+        ):
+            latest[summary.source_id] = summary
+    return list(latest.values())
 
 
 def _with_source_revision(

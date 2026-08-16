@@ -88,6 +88,8 @@ class SourceItem(BaseModel):
 class SourceOutput(BaseModel):
     sources: list[SourceItem]
     coverage_found: bool
+    total_matching_sources: int
+    truncated: bool
 
 
 class VisualCandidate(BaseModel):
@@ -201,7 +203,10 @@ def fetch_output(
 def source_output(
     sources: list[SourceSummary],
     public_base_url: str,
+    *,
+    total_matching_sources: int | None = None,
 ) -> SourceOutput:
+    total = len(sources) if total_matching_sources is None else total_matching_sources
     return SourceOutput(
         sources=[
             SourceItem(
@@ -225,7 +230,9 @@ def source_output(
             )
             for source in sources
         ],
-        coverage_found=bool(sources),
+        coverage_found=total > 0,
+        total_matching_sources=total,
+        truncated=len(sources) < total,
     )
 
 

@@ -30,10 +30,12 @@ class SourceDoc(BaseModel):
 
 class RagDocument(BaseModel):
     id: str
+    storage_id: str | None = None
     source_id: str
     source_version: str
     source_version_id: str
     ingestion_id: str | None = None
+    is_staged: bool = False
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -92,6 +94,7 @@ class SearchCoverage(BaseModel):
     candidate_sources: int = 0
     weak_pages_dropped: int = 0
     returned_pages: int = 0
+    candidate_window_truncated: bool = False
 
 
 class SearchResponse(BaseModel):

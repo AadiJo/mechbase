@@ -7,7 +7,6 @@ from urllib.parse import quote, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from qdrant_client.http.exceptions import ApiException, ResponseHandlingException
 from starlette.responses import RedirectResponse
 
 from app.api.auth import ApiKeyContext, record_usage, require_api_key
@@ -47,10 +46,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 async def _ensure_payload_indexes() -> None:
     """Create newly declared Qdrant indexes without delaying API startup."""
+    store = RagStore(settings)
     try:
-        await asyncio.to_thread(RagStore(settings).ensure_collection)
-    except (ApiException, ResponseHandlingException):
+        await asyncio.to_thread(store.ensure_payload_indexes)
+    except Exception:
         LOGGER.warning("Could not ensure Qdrant payload indexes during startup.", exc_info=True)
+    finally:
+        try:
+            store.client.close()
+        except Exception:
+            LOGGER.warning("Could not close the startup Qdrant client.", exc_info=True)
 
 
 app = FastAPI(title="FRC Mechanism RAG", version="0.1.0", lifespan=lifespan)

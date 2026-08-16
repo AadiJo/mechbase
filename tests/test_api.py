@@ -179,6 +179,7 @@ def test_search_accepts_valid_key_and_records_usage(monkeypatch) -> None:
             "candidate_sources": 0,
             "weak_pages_dropped": 0,
             "returned_pages": 0,
+            "candidate_window_truncated": False,
         },
         "abstention_reason": None,
     }

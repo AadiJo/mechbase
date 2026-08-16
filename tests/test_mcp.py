@@ -422,6 +422,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "candidate_sources": 1,
                                 "weak_pages_dropped": 0,
                                 "returned_pages": 1,
+                                "candidate_window_truncated": False,
                             },
                             "abstention_reason": None,
                             "evidence_limits": [
@@ -544,6 +545,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             == "254-2020@version-a"
                         )
                         assert sources.structured_content["coverage_found"] is True
+                        assert sources.structured_content["total_matching_sources"] == 1
+                        assert sources.structured_content["truncated"] is False
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         ]

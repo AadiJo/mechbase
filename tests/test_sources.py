@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from app.rag.artifacts import source_artifact_root
 from app.rag.config import Settings
 from app.rag.ingest import (
     completed_sources,
@@ -88,27 +89,47 @@ def test_remove_superseded_artifacts_only_removes_matching_source_generations(
     tmp_path: Path,
 ) -> None:
     current = "254-2023@version#current"
+    root = source_artifact_root(tmp_path, "254-2023")
+    root.mkdir(parents=True)
     for name in ["254-2023", "254-2023@old#old", current, "254-20230@other#other"]:
-        (tmp_path / name).mkdir()
+        (root / name).mkdir()
 
     remove_superseded_artifacts(tmp_path, "254-2023", current)
 
-    assert not (tmp_path / "254-2023").exists()
-    assert not (tmp_path / "254-2023@old#old").exists()
-    assert (tmp_path / current).is_dir()
-    assert (tmp_path / "254-20230@other#other").is_dir()
+    assert not (root / "254-2023").exists()
+    assert not (root / "254-2023@old#old").exists()
+    assert (root / current).is_dir()
+    assert not (root / "254-20230@other#other").exists()
 
 
 def test_remove_artifact_generation_removes_only_the_exact_namespace(tmp_path: Path) -> None:
-    target = tmp_path / "254-2023@version#failed"
-    neighbor = tmp_path / "254-2023@version#complete"
+    root = source_artifact_root(tmp_path, "254-2023")
+    root.mkdir(parents=True)
+    target = root / "254-2023@version#failed"
+    neighbor = root / "254-2023@version#complete"
     target.mkdir()
     neighbor.mkdir()
 
-    remove_artifact_generation(tmp_path, target.name)
+    remove_artifact_generation(tmp_path, "254-2023", target.name)
 
     assert not target.exists()
     assert neighbor.is_dir()
+
+
+def test_artifact_cleanup_cannot_cross_source_id_prefixes(tmp_path: Path) -> None:
+    first_root = source_artifact_root(tmp_path, "254")
+    prefixed_root = source_artifact_root(tmp_path, "254@prototype")
+    first_root.mkdir(parents=True)
+    prefixed_root.mkdir(parents=True)
+    (first_root / "current").mkdir()
+    (first_root / "old").mkdir()
+    (prefixed_root / "other-source").mkdir()
+
+    remove_superseded_artifacts(tmp_path, "254", "current")
+
+    assert (first_root / "current").is_dir()
+    assert not (first_root / "old").exists()
+    assert (prefixed_root / "other-source").is_dir()
 
 
 def test_iter_pdfs_rejects_non_http_source_urls(tmp_path: Path) -> None:
