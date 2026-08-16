@@ -1,5 +1,6 @@
 import argparse
 import json
+from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 
@@ -50,11 +51,15 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--force", action="store_true", help="Reingest sources even if manifest says done.")
+    parser.add_argument(
+        "--force", action="store_true", help="Reingest sources even if manifest says done."
+    )
     args = parser.parse_args()
 
     settings = get_settings()
-    data_dir = settings.data_dir if args.data_dir is None else settings.data_dir.__class__(args.data_dir)
+    data_dir = (
+        settings.data_dir if args.data_dir is None else settings.data_dir.__class__(args.data_dir)
+    )
     sources = iter_pdfs(data_dir)
     if args.limit:
         sources = list(islice(sources, args.limit))
@@ -73,10 +78,14 @@ def main() -> None:
                 continue
             print(f"Ingesting {source.path.name}...", flush=True)
             docs = extract_documents(source, settings)
+            ingested_at = datetime.now(UTC).isoformat()
+            docs = [doc.model_copy(update={"ingested_at": ingested_at}) for doc in docs]
             print(f"Extracted {len(docs)} retrieval objects from {source.path.name}.", flush=True)
             for batch_idx, batch in enumerate(batched(docs, args.batch_size), start=1):
                 print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
-                text_vectors = embedder.embed_texts([doc.text or doc.source_pdf for doc in batch], "document")
+                text_vectors = embedder.embed_texts(
+                    [doc.text or doc.source_pdf for doc in batch], "document"
+                )
                 image_vectors = multimodal_vectors(batch, embedder, settings)
                 store.upsert(batch, text_vectors, image_vectors)
                 print(f"  upserted batch {batch_idx}", flush=True)

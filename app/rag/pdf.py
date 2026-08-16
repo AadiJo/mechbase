@@ -45,8 +45,12 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
                     _render_page(page, settings.render_dpi, page_image_path)
 
             linked_artifacts = [str(page_image_path)]
-            extracted_images = _extract_page_images(pdf, page, page_dir, source, page_num, page_text)
-            linked_artifacts.extend(doc.artifact_path for doc in extracted_images if doc.artifact_path)
+            extracted_images = _extract_page_images(
+                pdf, page, page_dir, source, page_num, page_text
+            )
+            linked_artifacts.extend(
+                doc.artifact_path for doc in extracted_images if doc.artifact_path
+            )
             docs.extend(extracted_images)
 
             section = section_from_text(page_text)
@@ -63,6 +67,7 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
                     artifact_path=str(page_image_path),
                     linked_artifacts=linked_artifacts,
                     section=section,
+                    source_url=source.source_url,
                 )
             )
             for chunk_idx, chunk in enumerate(
@@ -80,6 +85,7 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
                         text=chunk,
                         linked_artifacts=linked_artifacts,
                         section=section,
+                        source_url=source.source_url,
                     )
                 )
     finally:
@@ -128,6 +134,7 @@ def _extract_page_images(
                 artifact_path=str(out_path),
                 linked_artifacts=[str(out_path)],
                 section=section_from_text(page_text),
+                source_url=source.source_url,
             )
         )
     return docs

@@ -171,6 +171,16 @@ def test_search_accepts_valid_key_and_records_usage(monkeypatch) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {"query": "shooter", "results": []}
+    assert response.json() == {
+        "query": "shooter",
+        "results": [],
+        "coverage": {
+            "candidate_pages": 0,
+            "candidate_sources": 0,
+            "weak_pages_dropped": 0,
+            "returned_pages": 0,
+        },
+        "abstention_reason": None,
+    }
     assert recorded["context"].api_key_id == "api_key_test"
     assert recorded["status_code"] == 200

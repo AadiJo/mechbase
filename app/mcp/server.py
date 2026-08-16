@@ -14,6 +14,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
+from app.mcp.cache import TTLCache
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
     AppliedSearchFilters,
@@ -32,10 +33,12 @@ from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET
 from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
+    MechanismTypeFilter,
     SearchRequest,
     SearchResponse,
     SearchSort,
     SimilarPagesResponse,
+    SourceIdFilter,
     SourceListResponse,
 )
 from app.rag.search import search as rag_search
@@ -50,8 +53,8 @@ READ_ONLY = ToolAnnotations(
 MODEL_ONLY = Annotations(audience=["assistant"], priority=1.0)
 TeamNumber = Annotated[int, Field(ge=1, le=99999)]
 SeasonYear = Annotated[int, Field(ge=1992, le=2100)]
-SourceId = Annotated[str, Field(min_length=1, max_length=160)]
-MechanismType = Annotated[str, Field(min_length=1, max_length=80)]
+SourceId = SourceIdFilter
+MechanismType = MechanismTypeFilter
 
 
 class RetrievalBackend(Protocol):
@@ -70,7 +73,10 @@ class RetrievalBackend(Protocol):
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
+        source_query: str | None,
     ) -> SourceListResponse: ...
+
+    def corpus_revision(self) -> str: ...
 
 
 class RagRetrievalBackend:
@@ -90,6 +96,9 @@ class RagRetrievalBackend:
             sort=request.sort,
         )
 
+    def corpus_revision(self) -> str:
+        return RagStore(self._settings).corpus_revision()
+
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         return RagStore(self._settings).image_context(result_id=result_id)
 
@@ -105,6 +114,7 @@ class RagRetrievalBackend:
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
+        source_query: str | None,
     ) -> SourceListResponse:
         return RagStore(self._settings).list_sources(
             team=team,
@@ -113,6 +123,7 @@ class RagRetrievalBackend:
             team_numbers=team_numbers,
             years=years,
             source_ids=source_ids,
+            source_query=source_query,
         )
 
 
@@ -150,6 +161,8 @@ def create_mcp_server(
         token_verifier=verifier,
     )
     public_base_url = str(settings.mcp_public_base_url)
+    search_cache: TTLCache[str, SearchResponse] = TTLCache(ttl_seconds=15 * 60)
+    source_cache: TTLCache[str, SourceListResponse] = TTLCache(ttl_seconds=5 * 60)
     parsed_public_url = urlparse(public_base_url)
     public_origin = f"{parsed_public_url.scheme}://{parsed_public_url.netloc}"
 
@@ -198,7 +211,7 @@ def create_mcp_server(
         structured_output=True,
     )
     def search(
-        query: str,
+        query: Annotated[str, Field(max_length=500)],
         team_numbers: Annotated[list[TeamNumber], Field(max_length=20)] | None = None,
         years: Annotated[list[SeasonYear], Field(max_length=20)] | None = None,
         source_ids: Annotated[list[SourceId], Field(max_length=20)] | None = None,
@@ -214,7 +227,11 @@ def create_mcp_server(
             sort=sort,
         )
         if not query.strip():
-            return SearchOutput(results=[], applied_filters=filters)
+            return SearchOutput(
+                results=[],
+                applied_filters=filters,
+                abstention_reason="The query was empty.",
+            )
         request = SearchRequest(
             query=query.strip(),
             top_k=top_k or settings.mcp_search_top_k,
@@ -224,9 +241,13 @@ def create_mcp_server(
             mechanism_types=filters.mechanism_types,
             sort=filters.sort,
         )
-        response = retrieval.search(request)
+        cache_key = f"{retrieval.corpus_revision()}:{request.model_dump_json()}"
+        response = search_cache.get(cache_key)
+        if response is None:
+            response = retrieval.search(request)
+            search_cache.put(cache_key, response)
         return search_output(
-            response.results,
+            response,
             public_base_url,
             applied_filters=filters,
         )
@@ -343,7 +364,10 @@ def create_mcp_server(
         response = retrieval.find_similar(id, top_k)
         if response is None:
             raise ValueError(f"No result found for id {id!r}.")
-        return search_output(response.results, public_base_url)
+        return search_output(
+            SearchResponse(query="", results=response.results),
+            public_base_url,
+        )
 
     @server.tool(
         title="Display selected FRC mechanism pages",
@@ -387,28 +411,50 @@ def create_mcp_server(
         description=(
             "List indexed technical binders and their text and image coverage. Use exact team, "
             "year, filename, or source-id filters to check whether Mechbase covers a request "
-            "before substituting results from another team or season."
+            "before substituting results from another team or season. source_query performs a "
+            "case-insensitive filename and source-id substring match without an embedding call."
         ),
         annotations=READ_ONLY,
         structured_output=True,
     )
     def list_sources(
-        team: str | None = None,
-        year: int | None = None,
-        source: str | None = None,
+        team: Annotated[str | None, Field(pattern=r"^\d{1,5}$")] = None,
+        year: SeasonYear | None = None,
+        source: Annotated[str | None, Field(min_length=1, max_length=255)] = None,
         team_numbers: Annotated[list[TeamNumber], Field(max_length=50)] | None = None,
         years: Annotated[list[SeasonYear], Field(max_length=35)] | None = None,
         source_ids: Annotated[list[SourceId], Field(max_length=50)] | None = None,
+        source_query: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
     ) -> SourceOutput:
-        response = retrieval.list_sources(
-            team=team,
-            year=year,
-            source=source,
-            team_numbers=[str(value) for value in dict.fromkeys(team_numbers or [])],
-            years=list(dict.fromkeys(years or [])),
-            source_ids=list(dict.fromkeys(source_ids or [])),
+        teams = [str(value) for value in dict.fromkeys(team_numbers or [])]
+        normalized_years = list(dict.fromkeys(years or []))
+        normalized_source_ids = list(dict.fromkeys(source_ids or []))
+        normalized_source_query = source_query.strip() if source_query else None
+        cache_key = repr(
+            (
+                retrieval.corpus_revision(),
+                team,
+                year,
+                source,
+                teams,
+                normalized_years,
+                normalized_source_ids,
+                normalized_source_query,
+            )
         )
+        response = source_cache.get(cache_key)
+        if response is None:
+            response = retrieval.list_sources(
+                team=team,
+                year=year,
+                source=source,
+                team_numbers=teams,
+                years=normalized_years,
+                source_ids=normalized_source_ids,
+                source_query=normalized_source_query,
+            )
+            source_cache.put(cache_key, response)
         return source_output(response.sources[:limit], public_base_url)
 
     return server

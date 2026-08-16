@@ -34,9 +34,24 @@ def search(
         sort=sort,
         modality=modality,  # type: ignore[arg-type]
     )
-    expanded = expand_query(" ".join([query, *request.mechanism_types]))
+    expanded = expand_query(
+        " ".join([query, *request.mechanism_types]),
+        request.years or ([request.year] if request.year else None),
+    )
     embedder = VoyageEmbedder(settings)
     text_vector = embedder.embed_texts([expanded], "query")[0]
     image_vector = embedder.embed_multimodal([expanded], [None], "query")[0]
-    results = RagStore(settings).search(request, text_vector, image_vector, expanded)
-    return SearchResponse(query=query, results=results)
+    results, coverage = RagStore(settings).search(request, text_vector, image_vector, expanded)
+    abstention_reason = None
+    if not results:
+        abstention_reason = (
+            "No indexed pages met the calibrated relevance threshold for this query and filter set."
+            if coverage.candidate_pages
+            else "No indexed pages matched this query and filter set."
+        )
+    return SearchResponse(
+        query=query,
+        results=results,
+        coverage=coverage,
+        abstention_reason=abstention_reason,
+    )

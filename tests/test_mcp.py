@@ -20,6 +20,7 @@ from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
     ImageContextResponse,
+    SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchResult,
@@ -50,7 +51,18 @@ class FakeRetrievalBackend:
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
-        return SearchResponse(query=request.query, results=[_search_result("result_1", 12)])
+        return SearchResponse(
+            query=request.query,
+            results=[_search_result("result_1", 12)],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
+        )
+
+    def corpus_revision(self) -> str:
+        return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         if result_id == "missing":
@@ -86,6 +98,7 @@ class FakeRetrievalBackend:
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
+        source_query: str | None,
     ) -> SourceListResponse:
         self.list_source_calls.append(
             {
@@ -95,6 +108,7 @@ class FakeRetrievalBackend:
                 "team_numbers": team_numbers,
                 "years": years,
                 "source_ids": source_ids,
+                "source_query": source_query,
             }
         )
         resolved_team = team or next(iter(team_numbers), None) or "254"
@@ -103,6 +117,9 @@ class FakeRetrievalBackend:
         return SourceListResponse(
             sources=[
                 SourceSummary(
+                    source_id=(
+                        source_ids[0] if source_ids else resolved_source.removesuffix(".pdf")
+                    ),
                     source_pdf=resolved_source,
                     team=resolved_team,
                     year=resolved_year,
@@ -121,6 +138,8 @@ def _search_result(result_id: str, page: int) -> SearchResult:
     return SearchResult(
         id=result_id,
         score=0.9,
+        score_band="strong",
+        source_id="254-2020",
         source_pdf="254-2020.pdf",
         team="254",
         year=2020,
@@ -320,7 +339,10 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert set(tools["search"].output_schema["properties"]) == {
                             "results",
                             "applied_filters",
+                            "coverage",
+                            "abstention_reason",
                         }
+                        assert "source_query" in tools["list_sources"].input_schema["properties"]
                         assert tools["inspect_candidates"].output_schema is None
                         assert "Always follow visual review with render_search_results" in (
                             tools["inspect_candidates"].description or ""
@@ -349,11 +371,22 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "url": (
                                         "https://api.example.com/images/254-2020/page-012/page.png"
                                     ),
+                                    "source_id": "254-2020",
                                     "source_pdf": "254-2020.pdf",
                                     "team": "254",
                                     "year": 2020,
                                     "page": 12,
                                     "snippet": "elevator",
+                                    "score_band": "strong",
+                                    "evidence": {
+                                        "direct_source_text": True,
+                                        "visible_image": True,
+                                        "model_inference": False,
+                                        "missing": [
+                                            "independent competition performance verification",
+                                            "comparative design quality evidence",
+                                        ],
+                                    },
                                 }
                             ],
                             "applied_filters": {
@@ -363,11 +396,21 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "mechanism_types": [],
                                 "sort": "relevance",
                             },
+                            "coverage": {
+                                "candidate_pages": 1,
+                                "candidate_sources": 1,
+                                "weak_pages_dropped": 0,
+                                "returned_pages": 1,
+                            },
+                            "abstention_reason": None,
                         }
                         assert json.loads(searched.content[0].text) == searched.structured_content
                         assert len(backend.search_calls) == 1
                         assert backend.search_calls[0].query == "elevator"
                         assert backend.search_calls[0].top_k == 10
+                        cached_search = await session.call_tool("search", {"query": " elevator "})
+                        assert cached_search.is_error is False
+                        assert len(backend.search_calls) == 1
 
                         filtered = await session.call_tool(
                             "search",
@@ -465,6 +508,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         sources = await session.call_tool("list_sources", {"team": "254"})
                         assert sources.is_error is False
                         assert sources.structured_content["sources"][0]["team"] == "254"
+                        assert sources.structured_content["sources"][0]["source_id"] == "254-2020"
+                        assert sources.structured_content["coverage_found"] is True
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         ]
@@ -473,6 +518,9 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert (
                             sources.structured_content["sources"][0]["extracted_image_count"] == 1
                         )
+                        cached_sources = await session.call_tool("list_sources", {"team": "254"})
+                        assert cached_sources.is_error is False
+                        assert len(backend.list_source_calls) == 1
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -480,6 +528,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "team_numbers": [4414],
                                 "years": [2024],
                                 "source_ids": ["4414-2024"],
+                                "source_query": "4414",
                             },
                         )
                         assert filtered_sources.is_error is False
@@ -492,6 +541,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "team_numbers": ["4414"],
                             "years": [2024],
                             "source_ids": ["4414-2024"],
+                            "source_query": "4414",
                         }
 
                         invalid = await session.call_tool(

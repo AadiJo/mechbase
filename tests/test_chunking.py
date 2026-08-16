@@ -8,6 +8,19 @@ def test_expand_multi_ball_query() -> None:
     assert "flywheel" in expanded
 
 
+def test_expansion_only_adds_game_specific_terms_for_matching_season() -> None:
+    historical = expand_query("climber", years=[2018])
+    crescendo = expand_query("climber", years=[2024])
+    reefscape = expand_query("climber", years=[2025])
+
+    assert "trap" not in historical
+    assert "cage" not in historical
+    assert "trap" in crescendo
+    assert "cage" not in crescendo
+    assert "deep cage" in reefscape
+    assert "trap" not in reefscape
+
+
 def test_split_text_keeps_content() -> None:
     text = "A" * 400 + "\n\n" + "B" * 400 + "\n\n" + "C" * 400
     chunks = split_text(text, target_chars=700, overlap_chars=50)

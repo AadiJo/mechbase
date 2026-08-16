@@ -1,10 +1,20 @@
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 Modality = Literal["text", "page_image", "extracted_image"]
 SearchSort = Literal["relevance", "newest", "oldest"]
+ScoreBand = Literal["relevant", "good", "strong"]
+TeamFilter = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^\d{1,5}$")]
+SeasonFilter = Annotated[int, Field(ge=1992, le=2100)]
+SourceIdFilter = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
+]
+MechanismTypeFilter = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
+]
 
 
 class SourceDoc(BaseModel):
@@ -12,6 +22,7 @@ class SourceDoc(BaseModel):
     team: str | None
     year: int | None
     source_id: str
+    source_url: str | None = None
 
 
 class RagDocument(BaseModel):
@@ -26,18 +37,25 @@ class RagDocument(BaseModel):
     artifact_path: str | None = None
     linked_artifacts: list[str] = Field(default_factory=list)
     section: str | None = None
+    source_url: str | None = None
+    ingested_at: str | None = None
 
 
 class SearchRequest(BaseModel):
-    query: str
+    query: str = Field(max_length=500)
     top_k: int = Field(default=10, ge=1, le=100)
-    team: str | None = None
-    year: int | None = None
-    source: str | None = None
-    team_numbers: list[str] = Field(default_factory=list)
-    years: list[int] = Field(default_factory=list)
-    source_ids: list[str] = Field(default_factory=list)
-    mechanism_types: list[str] = Field(default_factory=list)
+    team: TeamFilter | None = None
+    year: SeasonFilter | None = None
+    source: (
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+        | None
+    ) = None
+    team_numbers: Annotated[list[TeamFilter], Field(max_length=20)] = Field(default_factory=list)
+    years: Annotated[list[SeasonFilter], Field(max_length=20)] = Field(default_factory=list)
+    source_ids: Annotated[list[SourceIdFilter], Field(max_length=20)] = Field(default_factory=list)
+    mechanism_types: Annotated[list[MechanismTypeFilter], Field(max_length=8)] = Field(
+        default_factory=list
+    )
     sort: SearchSort = "relevance"
     modality: Modality | None = None
     debug: bool = False
@@ -46,6 +64,8 @@ class SearchRequest(BaseModel):
 class SearchResult(BaseModel):
     id: str
     score: float
+    score_band: ScoreBand
+    source_id: str
     source_pdf: str
     team: str | None
     year: int | None
@@ -61,9 +81,18 @@ class SearchResult(BaseModel):
     debug: dict = Field(default_factory=dict)
 
 
+class SearchCoverage(BaseModel):
+    candidate_pages: int = 0
+    candidate_sources: int = 0
+    weak_pages_dropped: int = 0
+    returned_pages: int = 0
+
+
 class SearchResponse(BaseModel):
     query: str
     results: list[SearchResult]
+    coverage: SearchCoverage = Field(default_factory=SearchCoverage)
+    abstention_reason: str | None = None
 
 
 class PageContextResponse(BaseModel):
@@ -85,6 +114,7 @@ class PageTextResponse(BaseModel):
 
 
 class SourceSummary(BaseModel):
+    source_id: str
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -94,6 +124,8 @@ class SourceSummary(BaseModel):
     page_image_count: int = 0
     extracted_image_count: int = 0
     sample_image_urls: list[str] = Field(default_factory=list)
+    ingested_at: str | None = None
+    source_url: str | None = None
 
 
 class SourceListResponse(BaseModel):

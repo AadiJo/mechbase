@@ -4,18 +4,25 @@ MECHANISM_TERMS = {
     "shooter": ["launcher", "flywheel", "hood", "turret", "drum shooter", "multi lane"],
     "intake": ["collector", "acquire", "floor pickup", "feeder"],
     "indexer": ["serializer", "conveyor", "hopper", "magazine"],
-    "climber": ["hang", "trap", "cage", "winch"],
+    "climber": ["hang", "winch"],
     "end effector": ["grabber", "manipulator", "wrist", "scorer"],
     "elevator": ["lift", "arm", "extension"],
 }
 
+SEASON_MECHANISM_TERMS = {
+    2024: {"climber": ["trap", "stage chain"]},
+    2025: {"climber": ["cage", "deep cage", "shallow cage"]},
+}
 
-def expand_query(query: str) -> str:
+
+def expand_query(query: str, years: list[int] | None = None) -> str:
     lowered = query.lower()
     extra: list[str] = []
     for key, synonyms in MECHANISM_TERMS.items():
         if key in lowered or any(s in lowered for s in synonyms):
             extra.extend([key, *synonyms])
+            for year in years or []:
+                extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))
     if "multi ball" in lowered:
         extra.extend(["multi note", "two ball", "three ball", "cargo", "power cell", "shooter"])
     return " ".join([query, *dict.fromkeys(extra)])

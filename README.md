@@ -48,15 +48,16 @@ The MCP endpoint accepts Clerk OAuth access tokens only.
 The server provides six read-only tools:
 
 - `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
-  result-count controls. Results include source metadata and a short evidence snippet.
+  result-count controls. Results include stable source IDs, evidence classification, calibrated
+  score bands, coverage, and an abstention reason when no page is relevant enough.
 - `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
   model can check visual relevance before anything is displayed.
 - `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
 - `find_similar(id, top_k)` finds related mechanism pages.
 - `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
   hosts that support MCP Apps. Other clients still receive its structured result.
-- `list_sources(...)` lists indexed technical binders with exact metadata filters and coverage
-  counts for text, page images, and extracted figures.
+- `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
+  search, stable source IDs, provenance when known, and complete text and image coverage counts.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.
@@ -71,6 +72,7 @@ MCP_OAUTH_SCOPES=openid
 MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://claude.ai
 CLERK_OAUTH_ISSUER_URL=https://clerk.example.com
 CLERK_SECRET_KEY=sk_live_...
+SEARCH_MIN_SCORE=0.25
 ```
 
 In the same Clerk instance, enable Dynamic client registration and set its default scope to

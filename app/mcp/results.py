@@ -3,18 +3,36 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, JsonValue
 
 from app.mcp.images import preview_image_url
-from app.rag.models import ImageContextResponse, SearchResult, SearchSort, SourceSummary
+from app.rag.models import (
+    ImageContextResponse,
+    ScoreBand,
+    SearchCoverage,
+    SearchResponse,
+    SearchResult,
+    SearchSort,
+    SourceSummary,
+)
+
+
+class EvidenceClassification(BaseModel):
+    direct_source_text: bool
+    visible_image: bool
+    model_inference: bool = False
+    missing: list[str] = Field(default_factory=list)
 
 
 class SearchItem(BaseModel):
     id: str
     title: str
     url: str
+    source_id: str
     source_pdf: str
     team: str | None = None
     year: int | None = None
     page: int
     snippet: str = ""
+    score_band: ScoreBand
+    evidence: EvidenceClassification
 
 
 class AppliedSearchFilters(BaseModel):
@@ -28,6 +46,8 @@ class AppliedSearchFilters(BaseModel):
 class SearchOutput(BaseModel):
     results: list[SearchItem]
     applied_filters: AppliedSearchFilters = Field(default_factory=AppliedSearchFilters)
+    coverage: SearchCoverage = Field(default_factory=SearchCoverage)
+    abstention_reason: str | None = None
 
 
 class FetchOutput(BaseModel):
@@ -39,6 +59,7 @@ class FetchOutput(BaseModel):
 
 
 class SourceItem(BaseModel):
+    source_id: str
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -48,10 +69,13 @@ class SourceItem(BaseModel):
     page_image_count: int
     extracted_image_count: int
     sample_image_urls: list[str] = Field(default_factory=list)
+    ingested_at: str | None = None
+    source_url: str | None = None
 
 
 class SourceOutput(BaseModel):
     sources: list[SourceItem]
+    coverage_found: bool
 
 
 class VisualCandidate(BaseModel):
@@ -88,7 +112,7 @@ class RenderOutput(BaseModel):
 
 
 def search_output(
-    results: list[SearchResult],
+    response: SearchResponse,
     public_base_url: str,
     *,
     applied_filters: AppliedSearchFilters | None = None,
@@ -99,16 +123,28 @@ def search_output(
                 id=result.id,
                 title=_result_title(result.source_pdf, result.page, result.team),
                 url=_result_url(result, public_base_url),
+                source_id=result.source_id,
                 source_pdf=result.source_pdf,
                 team=result.team,
                 year=result.year,
                 page=result.page,
                 snippet=_truncate(result.text.strip(), 500),
+                score_band=result.score_band,
+                evidence=EvidenceClassification(
+                    direct_source_text=bool(result.text.strip()),
+                    visible_image=bool(result.artifact_url or result.linked_artifact_urls),
+                    missing=[
+                        "independent competition performance verification",
+                        "comparative design quality evidence",
+                    ],
+                ),
             )
-            for result in results
+            for result in response.results
             if result.id
         ],
         applied_filters=applied_filters or AppliedSearchFilters(),
+        coverage=response.coverage,
+        abstention_reason=response.abstention_reason,
     )
 
 
@@ -142,6 +178,7 @@ def source_output(
     return SourceOutput(
         sources=[
             SourceItem(
+                source_id=source.source_id,
                 source_pdf=source.source_pdf,
                 team=source.team,
                 year=source.year,
@@ -153,9 +190,12 @@ def source_output(
                 sample_image_urls=[
                     _absolute_url(public_base_url, url) for url in source.sample_image_urls
                 ],
+                ingested_at=source.ingested_at,
+                source_url=source.source_url,
             )
             for source in sources
-        ]
+        ],
+        coverage_found=bool(sources),
     )
 
 
