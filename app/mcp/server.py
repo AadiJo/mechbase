@@ -39,6 +39,7 @@ from app.mcp.results import (
 from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET_URI
 from app.rag.config import Settings
 from app.rag.models import (
+    FetchContextResponse,
     ImageContextResponse,
     MechanismTypeFilter,
     PageContextResponse,
@@ -46,6 +47,7 @@ from app.rag.models import (
     SearchResponse,
     SearchSort,
     SimilarPagesResponse,
+    SourceBrowseResponse,
     SourceIdFilter,
     SourceListResponse,
     SourceSummary,
@@ -67,13 +69,18 @@ SourceId = SourceIdFilter
 MechanismType = MechanismTypeFilter
 ResultId = Annotated[str, Field(min_length=1, max_length=256)]
 BROWSE_SECTION_SCAN_PAGES = 50
-STABLE_READ_ATTEMPTS = 3
 
 
 class RetrievalBackend(Protocol):
     def search(self, request: SearchRequest) -> SearchResponse: ...
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
+
+    def fetch_contexts(
+        self,
+        result_id: str,
+        adjacent_pages: int,
+    ) -> FetchContextResponse | None: ...
 
     def find_similar(
         self,
@@ -92,6 +99,16 @@ class RetrievalBackend(Protocol):
         source_version_id: str | None,
         ingestion_id: str | None,
     ) -> list[PageContextResponse]: ...
+
+    def browse_contexts(
+        self,
+        source_id: str,
+        *,
+        start_page: int | None,
+        end_page: int | None,
+        resume_page: int | None,
+        scan_limit: int,
+    ) -> SourceBrowseResponse | None: ...
 
     def list_sources(
         self,
@@ -137,6 +154,13 @@ class RagRetrievalBackend:
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         return self._store.image_context(result_id=result_id)
 
+    def fetch_contexts(
+        self,
+        result_id: str,
+        adjacent_pages: int,
+    ) -> FetchContextResponse | None:
+        return self._store.fetch_contexts(result_id, adjacent_pages)
+
     def find_similar(
         self,
         result_id: str,
@@ -166,6 +190,23 @@ class RagRetrievalBackend:
             pages,
             source_version_id,
             ingestion_id,
+        )
+
+    def browse_contexts(
+        self,
+        source_id: str,
+        *,
+        start_page: int | None,
+        end_page: int | None,
+        resume_page: int | None,
+        scan_limit: int,
+    ) -> SourceBrowseResponse | None:
+        return self._store.browse_contexts(
+            source_id,
+            start_page=start_page,
+            end_page=end_page,
+            resume_page=resume_page,
+            scan_limit=scan_limit,
         )
 
     def list_sources(
@@ -401,39 +442,14 @@ def create_mcp_server(
         id: ResultId,
         adjacent_pages: Annotated[int, Field(ge=0, le=1)] = 0,
     ) -> FetchOutput:
-        for _attempt in range(STABLE_READ_ATTEMPTS):
-            corpus_revision = retrieval.corpus_revision()
-            context = retrieval.fetch(id)
-            if context is None:
-                if retrieval.corpus_revision() != corpus_revision:
-                    continue
-                raise ValueError(f"No result found for id {id!r}.")
-            adjacent_contexts = []
-            if adjacent_pages:
-                pages = [
-                    page
-                    for page in range(
-                        context.page - adjacent_pages,
-                        context.page + adjacent_pages + 1,
-                    )
-                    if page >= 1 and page != context.page
-                ]
-                adjacent_contexts = retrieval.page_contexts(
-                    context.source_pdf,
-                    pages,
-                    context.source_version_id,
-                    context.ingestion_id,
-                )
-            output = fetch_output(
-                context,
-                id,
-                public_base_url,
-                adjacent_contexts=adjacent_contexts,
-            )
-            if retrieval.corpus_revision() == corpus_revision:
-                return output
-        raise ValueError(
-            "The indexed corpus changed repeatedly during this fetch; retry the request."
+        response = retrieval.fetch_contexts(id, adjacent_pages)
+        if response is None:
+            raise ValueError(f"No result found for id {id!r}.")
+        return fetch_output(
+            response.context,
+            id,
+            public_base_url,
+            adjacent_contexts=response.adjacent_contexts,
         )
 
     @server.tool(
@@ -599,94 +615,68 @@ def create_mcp_server(
                 "section or restart browse_source without a cursor."
             )
 
-        for _attempt in range(STABLE_READ_ATTEMPTS):
-            corpus_revision = retrieval.corpus_revision()
-            cache_key = repr((corpus_revision, [], [], [source_id]))
-            catalog = source_cache.get_or_compute(
-                cache_key,
-                lambda: retrieval.list_sources(
-                    team_numbers=[],
-                    years=[],
-                    source_ids=[source_id],
-                ),
+        has_range = start_page is not None and end_page is not None
+        response = retrieval.browse_contexts(
+            source_id,
+            start_page=start_page,
+            end_page=end_page,
+            resume_page=cursor.page if cursor is not None else None,
+            scan_limit=BROWSE_SECTION_SCAN_PAGES if section_needle else 10,
+        )
+        if response is None:
+            raise ValueError(f"No indexed source found for source_id {source_id!r}.")
+        source = response.source
+        if cursor is not None and (
+            cursor.source_version_id != source.source_version_id
+            or cursor.ingestion_id != source.ingestion_id
+        ):
+            raise ValueError(
+                "The source generation changed after this browse cursor was issued; restart "
+                "browse_source without a cursor."
             )
-            source = next((item for item in catalog.sources if item.source_id == source_id), None)
-            if source is None:
-                if retrieval.corpus_revision() != corpus_revision:
-                    continue
-                raise ValueError(f"No indexed source found for source_id {source_id!r}.")
-            if cursor is not None and (
-                cursor.source_version_id != source.source_version_id
-                or cursor.ingestion_id != source.ingestion_id
-            ):
-                if retrieval.corpus_revision() != corpus_revision:
-                    continue
-                raise ValueError(
-                    "The source generation changed after this browse cursor was issued; restart "
-                    "browse_source without a cursor."
-                )
 
-            available_pages = sorted(source.pages)
-            has_range = start_page is not None and end_page is not None
-            if has_range:
-                requested_pages = list(range(start_page, end_page + 1))
+        available_pages = sorted(source.pages)
+        requested_pages = response.requested_pages
+        missing_pages = [page for page in requested_pages if page not in source.pages]
+        pages_to_load = [page for page in requested_pages if page in source.pages]
+        contexts = [context for context in response.contexts if context.page in pages_to_load]
+        loaded_pages = {context.page for context in contexts}
+        missing_pages.extend(page for page in pages_to_load if page not in loaded_pages)
+        matching_contexts = [
+            context
+            for context in contexts
+            if section_needle is None or section_needle in (context.section or "").casefold()
+        ]
+        total_matches = len(matching_contexts)
+        matching_contexts = matching_contexts[:10]
+        next_cursor = None
+        if not has_range and pages_to_load:
+            if total_matches > len(matching_contexts):
+                resume_after = matching_contexts[-1].page
             else:
-                eligible_pages = [
-                    page for page in available_pages if cursor is None or page >= cursor.page
-                ]
-                scan_limit = BROWSE_SECTION_SCAN_PAGES if section_needle else 10
-                requested_pages = eligible_pages[:scan_limit]
-            missing_pages = [page for page in requested_pages if page not in source.pages]
-            pages_to_load = [page for page in requested_pages if page in source.pages]
-            contexts = retrieval.page_contexts(
-                source.source_pdf,
-                pages_to_load,
-                source.source_version_id,
-                source.ingestion_id,
+                resume_after = pages_to_load[-1]
+            next_page = next(
+                (page for page in available_pages if page > resume_after),
+                None,
             )
-            contexts = [context for context in contexts if context.page in pages_to_load]
-            loaded_pages = {context.page for context in contexts}
-            missing_pages.extend(page for page in pages_to_load if page not in loaded_pages)
-            matching_contexts = [
-                context
-                for context in contexts
-                if section_needle is None or section_needle in (context.section or "").casefold()
-            ]
-            total_matches = len(matching_contexts)
-            matching_contexts = matching_contexts[:10]
-            next_cursor = None
-            if not has_range and pages_to_load:
-                if total_matches > len(matching_contexts):
-                    resume_after = matching_contexts[-1].page
-                else:
-                    resume_after = pages_to_load[-1]
-                next_page = next(
-                    (page for page in available_pages if page > resume_after),
-                    None,
+            if next_page is not None:
+                next_cursor = BrowseCursor(
+                    page=next_page,
+                    source_id=source_id,
+                    section=section_needle,
+                    source_version_id=source.source_version_id,
+                    ingestion_id=source.ingestion_id,
                 )
-                if next_page is not None:
-                    next_cursor = BrowseCursor(
-                        page=next_page,
-                        source_id=source_id,
-                        section=section_needle,
-                        source_version_id=source.source_version_id,
-                        ingestion_id=source.ingestion_id,
-                    )
 
-            output = browse_source_output(
-                source,
-                matching_contexts,
-                public_base_url,
-                include_previews=include_previews,
-                missing_pages=sorted(set(missing_pages)),
-                scanned_pages=len(pages_to_load),
-                next_cursor=next_cursor,
-                truncated=next_cursor is not None,
-            )
-            if retrieval.corpus_revision() == corpus_revision:
-                return output
-        raise ValueError(
-            "The indexed corpus changed repeatedly during this browse; retry the request."
+        return browse_source_output(
+            source,
+            matching_contexts,
+            public_base_url,
+            include_previews=include_previews,
+            missing_pages=sorted(set(missing_pages)),
+            scanned_pages=len(pages_to_load),
+            next_cursor=next_cursor,
+            truncated=next_cursor is not None,
         )
 
     return server

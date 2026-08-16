@@ -21,6 +21,7 @@ from app.mcp.results import fetch_output, search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
+    FetchContextResponse,
     ImageContextResponse,
     PageContextResponse,
     SearchCoverage,
@@ -28,6 +29,7 @@ from app.rag.models import (
     SearchResponse,
     SearchResult,
     SimilarPagesResponse,
+    SourceBrowseResponse,
     SourceListResponse,
     SourceSummary,
 )
@@ -51,11 +53,12 @@ class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
         self.fetch_calls: list[str] = []
+        self.fetch_context_calls: list[dict[str, object]] = []
         self.similar_calls: list[dict[str, object]] = []
         self.similar_attempts: list[str] = []
         self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
-        self.revision_sequence: list[str] = []
+        self.browse_context_calls: list[dict[str, object]] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -70,8 +73,6 @@ class FakeRetrievalBackend:
         )
 
     def corpus_revision(self) -> str:
-        if self.revision_sequence:
-            return self.revision_sequence.pop(0)
         return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
@@ -94,6 +95,28 @@ class FakeRetrievalBackend:
             text="A compact two-stage elevator with a continuous belt rigging layout.",
             page_image_url="/images/254-2020/page-012/page.png",
             image_urls=["/images/254-2020/page-012/page.png"],
+        )
+
+    def fetch_contexts(
+        self,
+        result_id: str,
+        adjacent_pages: int,
+    ) -> FetchContextResponse | None:
+        self.fetch_context_calls.append({"result_id": result_id, "adjacent_pages": adjacent_pages})
+        context = self.fetch(result_id)
+        if context is None:
+            return None
+        adjacent_contexts = []
+        if adjacent_pages:
+            adjacent_contexts = self.page_contexts(
+                context.source_pdf,
+                [context.page - 1, context.page + 1],
+                context.source_version_id,
+                context.ingestion_id,
+            )
+        return FetchContextResponse(
+            context=context,
+            adjacent_contexts=adjacent_contexts,
         )
 
     def find_similar(
@@ -184,7 +207,26 @@ class FakeRetrievalBackend:
                 "source_query": source_query,
             }
         )
-        sources = [
+        sources = self._catalog_sources()
+        needle = source_query.casefold() if source_query else None
+        return SourceListResponse(
+            sources=[
+                source
+                for source in sources
+                if (not team_numbers or source.team in team_numbers)
+                and (not years or source.year in years)
+                and (not source_ids or source.source_id in source_ids)
+                and (
+                    needle is None
+                    or needle in source.source_id.casefold()
+                    or needle in source.source_pdf.casefold()
+                )
+            ]
+        )
+
+    @staticmethod
+    def _catalog_sources() -> list[SourceSummary]:
+        return [
             SourceSummary(
                 source_id="254-2020",
                 source_version="version-a",
@@ -229,20 +271,47 @@ class FakeRetrievalBackend:
                 extracted_image_count=0,
             ),
         ]
-        needle = source_query.casefold() if source_query else None
-        return SourceListResponse(
-            sources=[
-                source
-                for source in sources
-                if (not team_numbers or source.team in team_numbers)
-                and (not years or source.year in years)
-                and (not source_ids or source.source_id in source_ids)
-                and (
-                    needle is None
-                    or needle in source.source_id.casefold()
-                    or needle in source.source_pdf.casefold()
-                )
-            ]
+
+    def browse_contexts(
+        self,
+        source_id: str,
+        *,
+        start_page: int | None,
+        end_page: int | None,
+        resume_page: int | None,
+        scan_limit: int,
+    ) -> SourceBrowseResponse | None:
+        self.browse_context_calls.append(
+            {
+                "source_id": source_id,
+                "start_page": start_page,
+                "end_page": end_page,
+                "resume_page": resume_page,
+                "scan_limit": scan_limit,
+            }
+        )
+        source = next(
+            (item for item in self._catalog_sources() if item.source_id == source_id),
+            None,
+        )
+        if source is None:
+            return None
+        if start_page is not None and end_page is not None:
+            requested_pages = list(range(start_page, end_page + 1))
+        else:
+            requested_pages = [
+                page for page in sorted(source.pages) if resume_page is None or page >= resume_page
+            ][:scan_limit]
+        contexts = self.page_contexts(
+            source.source_pdf,
+            [page for page in requested_pages if page in source.pages],
+            source.source_version_id,
+            source.ingestion_id,
+        )
+        return SourceBrowseResponse(
+            source=source,
+            requested_pages=requested_pages,
+            contexts=contexts,
         )
 
 
@@ -703,14 +772,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert backend.page_context_calls[-1]["pages"] == [11, 13]
 
-                        page_context_calls_before_refresh = len(backend.page_context_calls)
-                        fetch_calls_before_refresh = len(backend.fetch_calls)
-                        backend.revision_sequence = [
-                            "fetch-old",
-                            "fetch-new",
-                            "fetch-new",
-                            "fetch-new",
-                        ]
+                        fetch_context_calls_before_refresh = len(backend.fetch_context_calls)
                         refreshed_fetch = await session.call_tool(
                             "fetch", {"id": "result_1", "adjacent_pages": 1}
                         )
@@ -718,11 +780,14 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert [
                             page["page"] for page in refreshed_fetch.structured_content["pages"]
                         ] == [11, 12, 13]
-                        assert len(backend.fetch_calls) == fetch_calls_before_refresh + 2
                         assert (
-                            len(backend.page_context_calls) == page_context_calls_before_refresh + 2
+                            len(backend.fetch_context_calls)
+                            == fetch_context_calls_before_refresh + 1
                         )
-                        assert backend.revision_sequence == []
+                        assert backend.fetch_context_calls[-1] == {
+                            "result_id": "result_1",
+                            "adjacent_pages": 1,
+                        }
 
                         similar = await session.call_tool(
                             "find_similar",
@@ -854,11 +919,12 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert browsed.structured_content["scanned_pages"] == 1
                         assert browsed.structured_content["next_cursor"] is None
                         assert backend.page_context_calls[-1]["pages"] == [1]
-                        assert backend.list_source_calls[-1] == {
-                            "team_numbers": [],
-                            "years": [],
-                            "source_ids": ["254-2020"],
-                            "source_query": None,
+                        assert backend.browse_context_calls[-1] == {
+                            "source_id": "254-2020",
+                            "start_page": 1,
+                            "end_page": 2,
+                            "resume_page": None,
+                            "scan_limit": 10,
                         }
 
                         browsed_section = await session.call_tool(
@@ -962,7 +1028,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 3
+                        assert len(backend.list_source_calls) == 1
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -976,7 +1042,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 4
+                        assert len(backend.list_source_calls) == 2
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],
@@ -984,14 +1050,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "source_query": None,
                         }
 
-                        list_source_calls_before_refresh = len(backend.list_source_calls)
-                        page_context_calls_before_browse_refresh = len(backend.page_context_calls)
-                        backend.revision_sequence = [
-                            "browse-old",
-                            "browse-new",
-                            "browse-new",
-                            "browse-new",
-                        ]
+                        browse_context_calls_before_refresh = len(backend.browse_context_calls)
                         refreshed_browse = await session.call_tool(
                             "browse_source",
                             {
@@ -1003,13 +1062,16 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert refreshed_browse.is_error is False
                         assert refreshed_browse.structured_content["missing_pages"] == [2]
                         assert (
-                            len(backend.list_source_calls) == list_source_calls_before_refresh + 2
+                            len(backend.browse_context_calls)
+                            == browse_context_calls_before_refresh + 1
                         )
-                        assert (
-                            len(backend.page_context_calls)
-                            == page_context_calls_before_browse_refresh + 2
-                        )
-                        assert backend.revision_sequence == []
+                        assert backend.browse_context_calls[-1] == {
+                            "source_id": "254-2020",
+                            "start_page": 1,
+                            "end_page": 2,
+                            "resume_page": None,
+                            "scan_limit": 10,
+                        }
 
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}

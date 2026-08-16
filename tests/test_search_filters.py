@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
-from app.rag.models import RagDocument, SearchRequest, SimilarPagesResponse
+from app.rag.models import PageContextResponse, RagDocument, SearchRequest, SimilarPagesResponse
 from app.rag.pdf import _document_id
 from app.rag.search import _expansion_years
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
@@ -374,6 +374,182 @@ def test_read_retries_when_active_generation_changes_mid_query(tmp_path: Path) -
     assert value == 1
     assert active == {"254-2023": "new"}
     assert reads == [{"254-2023": "old"}, {"254-2023": "new"}]
+
+
+class SnapshotBoundFetchStore(RagStore):
+    def __init__(
+        self,
+        snapshots: list[dict[str, str]],
+        *,
+        missing_generations: set[str] | None = None,
+    ) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(snapshots)
+        self.missing_generations = missing_generations or set()
+        self.payload_snapshots: list[dict[str, str]] = []
+        self.context_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        return next(self._snapshots)
+
+    def _payload_and_vectors_for_result_id_active(
+        self,
+        result_id: str,
+        active_generations: dict[str, str],
+    ) -> tuple[dict | None, dict | None]:
+        self.payload_snapshots.append(active_generations)
+        ingestion_id = active_generations["254-2023"]
+        if ingestion_id in self.missing_generations:
+            return None, None
+        payload = _versioned_doc(
+            "same",
+            2,
+            ingestion_id=ingestion_id,
+            text=f"{ingestion_id} intake",
+        ).model_dump()
+        payload["id"] = result_id
+        return payload, None
+
+    def _page_contexts_for_active(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+        active_generations: dict[str, str],
+    ) -> list[PageContextResponse]:
+        self.context_snapshots.append(active_generations)
+        assert source_pdf == "254-2023.pdf"
+        assert source_version_id == "254-2023@same"
+        assert ingestion_id == active_generations["254-2023"]
+        return [
+            PageContextResponse(
+                source_id="254-2023",
+                source_version="same",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2023,
+                page=page,
+                text=f"{ingestion_id} page {page}",
+            )
+            for page in pages or []
+        ]
+
+
+def test_fetch_contexts_retries_the_whole_source_read_after_activation() -> None:
+    old = {"254-2023": "old", "4414-2023": "steady"}
+    new = {"254-2023": "new", "4414-2023": "steady"}
+    store = SnapshotBoundFetchStore([old, new, new, new])
+
+    response = store.fetch_contexts("result", adjacent_pages=1)
+
+    assert response is not None
+    assert response.context.ingestion_id == "new"
+    assert [context.ingestion_id for context in response.adjacent_contexts] == ["new", "new"]
+    assert store.payload_snapshots == [old, new]
+    assert store.context_snapshots == [old, new]
+
+
+def test_fetch_contexts_ignores_unrelated_source_activation() -> None:
+    before = {"254-2023": "steady", "4414-2023": "old"}
+    after = {"254-2023": "steady", "4414-2023": "new"}
+    store = SnapshotBoundFetchStore([before, after])
+
+    response = store.fetch_contexts("result", adjacent_pages=0)
+
+    assert response is not None
+    assert response.context.ingestion_id == "steady"
+    assert store.payload_snapshots == [before]
+    assert store.context_snapshots == [before]
+
+
+def test_fetch_contexts_retries_a_missing_id_when_the_active_map_changes() -> None:
+    old = {"254-2023": "old"}
+    new = {"254-2023": "new"}
+    store = SnapshotBoundFetchStore(
+        [old, new, new, new],
+        missing_generations={"old"},
+    )
+
+    response = store.fetch_contexts("new-result", adjacent_pages=0)
+
+    assert response is not None
+    assert response.context.result_id == "new-result"
+    assert response.context.ingestion_id == "new"
+    assert store.payload_snapshots == [old, new]
+    assert store.context_snapshots == [new]
+
+
+class SnapshotBoundBrowseStore(RagStore):
+    def __init__(self, snapshots: list[dict[str, str]]) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(snapshots)
+        self.current_snapshot: dict[str, str] = {}
+        self.summary_snapshots: list[dict[str, str]] = []
+        self.context_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        self.current_snapshot = next(self._snapshots)
+        return self.current_snapshot
+
+    def _iter_source_payloads(self, qfilter: models.Filter | None):
+        assert qfilter is not None
+        snapshot = dict(self.current_snapshot)
+        self.summary_snapshots.append(snapshot)
+        ingestion_id = snapshot["254-2023"]
+        for page in (1, 2):
+            yield _versioned_doc(
+                "same",
+                page,
+                ingestion_id=ingestion_id,
+                text=f"{ingestion_id} page {page}",
+            ).model_dump()
+
+    def _page_contexts_for_active(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+        active_generations: dict[str, str],
+    ) -> list[PageContextResponse]:
+        self.context_snapshots.append(active_generations)
+        return [
+            PageContextResponse(
+                source_id="254-2023",
+                source_version="same",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2023,
+                page=page,
+                text=f"{ingestion_id} page {page}",
+            )
+            for page in pages or []
+        ]
+
+
+def test_browse_contexts_retries_summary_and_pages_under_one_source_snapshot() -> None:
+    old = {"254-2023": "old", "4414-2023": "steady"}
+    new = {"254-2023": "new", "4414-2023": "steady"}
+    store = SnapshotBoundBrowseStore([old, new, new, new])
+
+    response = store.browse_contexts(
+        "254-2023",
+        start_page=1,
+        end_page=2,
+        resume_page=None,
+        scan_limit=10,
+    )
+
+    assert response is not None
+    assert response.source.ingestion_id == "new"
+    assert [context.ingestion_id for context in response.contexts] == ["new", "new"]
+    assert store.summary_snapshots == [old, new]
+    assert store.context_snapshots == [old, new]
 
 
 def test_source_summaries_do_not_mix_versions() -> None:

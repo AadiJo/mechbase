@@ -13,6 +13,7 @@ from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
 from app.rag.models import (
+    FetchContextResponse,
     ImageContextResponse,
     PageContextResponse,
     RagDocument,
@@ -21,6 +22,7 @@ from app.rag.models import (
     SearchRequest,
     SearchResult,
     SimilarPagesResponse,
+    SourceBrowseResponse,
     SourceListResponse,
     SourcePageMatch,
     SourceSummary,
@@ -200,6 +202,22 @@ class RagStore:
             if active == self.active_generations():
                 return value, active
         raise RuntimeError("The active source generation changed repeatedly; retry the read.")
+
+    def _read_with_source_snapshot(
+        self,
+        source_id: str,
+        read: Callable[[dict[str, str]], ReadValue],
+    ) -> ReadValue:
+        """Read one source consistently without retrying for unrelated source activations."""
+        for _attempt in range(3):
+            active = self.active_generations()
+            source_generation = active.get(source_id)
+            value = read(active)
+            if self.active_generations().get(source_id) == source_generation:
+                return value
+        raise RuntimeError(
+            f"The active generation for source {source_id!r} changed repeatedly; retry the read."
+        )
 
     def upsert(
         self,
@@ -442,6 +460,25 @@ class RagStore:
     ) -> list[PageContextResponse]:
         if pages == []:
             return []
+        contexts, _active_generations = self._read_with_active_snapshot(
+            lambda active: self._page_contexts_for_active(
+                source_pdf,
+                pages,
+                source_version_id,
+                ingestion_id,
+                active,
+            )
+        )
+        return contexts
+
+    def _page_contexts_for_active(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+        active_generations: dict[str, str],
+    ) -> list[PageContextResponse]:
         conditions = [
             models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
         ]
@@ -461,11 +498,9 @@ class RagStore:
                     match=models.MatchValue(value=ingestion_id),
                 )
             )
-        payloads, active_generations = self._read_with_active_snapshot(
-            lambda active: self._scroll_payloads(
-                _active_filter(must=conditions, active_generations=active),
-                limit=None,
-            )
+        payloads = self._scroll_payloads(
+            _active_filter(must=conditions, active_generations=active_generations),
+            limit=None,
         )
         payloads = [
             payload for payload in payloads if _is_current_generation(payload, active_generations)
@@ -785,58 +820,172 @@ class RagStore:
                 vectors[IMAGE_VECTOR] = page_image_vector
         return payload, vectors
 
+    def fetch_contexts(
+        self,
+        result_id: str,
+        adjacent_pages: int,
+    ) -> FetchContextResponse | None:
+        for _attempt in range(3):
+            active = self.active_generations()
+            payload, _vectors = self._payload_and_vectors_for_result_id_active(result_id, active)
+            if payload is None:
+                if active == self.active_generations():
+                    return None
+                continue
+            source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+            source_generation = active.get(source_id)
+            page = int(payload.get("page", 0))
+            requested_pages = [
+                candidate
+                for candidate in range(page - adjacent_pages, page + adjacent_pages + 1)
+                if candidate >= 1
+            ]
+            contexts = self._page_contexts_for_active(
+                str(payload.get("source_pdf") or ""),
+                requested_pages,
+                payload.get("source_version_id"),
+                payload.get("ingestion_id"),
+                active,
+            )
+            primary_context = next(
+                (context for context in contexts if context.page == page),
+                None,
+            )
+            response = (
+                FetchContextResponse(
+                    context=self._image_context_from_payload(payload, primary_context),
+                    adjacent_contexts=[context for context in contexts if context.page != page],
+                )
+                if primary_context is not None
+                else None
+            )
+            if self.active_generations().get(source_id) == source_generation:
+                return response
+        raise RuntimeError(
+            f"The active generation for source {source_id!r} changed repeatedly; retry the read."
+        )
+
+    def browse_contexts(
+        self,
+        source_id: str,
+        *,
+        start_page: int | None,
+        end_page: int | None,
+        resume_page: int | None,
+        scan_limit: int,
+    ) -> SourceBrowseResponse | None:
+        def read(active: dict[str, str]) -> SourceBrowseResponse | None:
+            payloads = list(
+                self._iter_source_payloads(
+                    _metadata_filter(source_ids=[source_id], active_generations=active)
+                )
+            )
+            current_payloads = (
+                payload for payload in payloads if _is_current_generation(payload, active)
+            )
+            summaries = _latest_source_summaries(self._summarize_sources(current_payloads))
+            source = next(
+                (summary for summary in summaries if summary.source_id == source_id), None
+            )
+            if source is None:
+                return None
+            available_pages = sorted(source.pages)
+            if start_page is not None and end_page is not None:
+                requested_pages = list(range(start_page, end_page + 1))
+            else:
+                requested_pages = [
+                    page for page in available_pages if resume_page is None or page >= resume_page
+                ][:scan_limit]
+            pages_to_load = [page for page in requested_pages if page in source.pages]
+            contexts = self._page_contexts_for_active(
+                source.source_pdf,
+                pages_to_load,
+                source.source_version_id,
+                source.ingestion_id,
+                active,
+            )
+            return SourceBrowseResponse(
+                source=source,
+                requested_pages=requested_pages,
+                contexts=contexts,
+            )
+
+        return self._read_with_source_snapshot(source_id, read)
+
     def image_context(
         self,
         result_id: str | None = None,
         image_url: str | None = None,
     ) -> ImageContextResponse | None:
-        payload = None
-        if result_id:
-            payload, _ = self._payload_and_vectors_for_result_id(result_id)
-        elif image_url:
-            artifact_path = self._artifact_path_from_url(image_url)
-            if artifact_path:
-                artifact_conditions = [
-                    models.FieldCondition(
-                        key="artifact_path", match=models.MatchValue(value=artifact_path)
-                    ),
-                    models.FieldCondition(
-                        key="linked_artifacts", match=models.MatchAny(any=[artifact_path])
-                    ),
-                ]
-                payloads, active_generations = self._read_with_active_snapshot(
-                    lambda active: self._scroll_payloads(
+        def read(active: dict[str, str]) -> ImageContextResponse | None:
+            payload = None
+            if result_id:
+                payload, _vectors = self._payload_and_vectors_for_result_id_active(
+                    result_id,
+                    active,
+                )
+            elif image_url:
+                artifact_path = self._artifact_path_from_url(image_url)
+                if artifact_path:
+                    artifact_conditions = [
+                        models.FieldCondition(
+                            key="artifact_path", match=models.MatchValue(value=artifact_path)
+                        ),
+                        models.FieldCondition(
+                            key="linked_artifacts", match=models.MatchAny(any=[artifact_path])
+                        ),
+                    ]
+                    payloads = self._scroll_payloads(
                         _active_filter(
                             should=artifact_conditions,
                             active_generations=active,
                         ),
                         limit=None,
                     )
-                )
-                payload = next(
-                    (
-                        candidate
-                        for candidate in payloads
-                        if _is_current_generation(candidate, active_generations)
-                    ),
-                    None,
-                )
-        if payload is None:
-            return None
-        source_pdf = payload.get("source_pdf", "")
+                    payload = next(
+                        (
+                            candidate
+                            for candidate in payloads
+                            if _is_current_generation(candidate, active)
+                        ),
+                        None,
+                    )
+            if payload is None:
+                return None
+            source_pdf = str(payload.get("source_pdf") or "")
+            page = int(payload.get("page", 0))
+            contexts = self._page_contexts_for_active(
+                source_pdf,
+                [page],
+                payload.get("source_version_id"),
+                payload.get("ingestion_id"),
+                active,
+            )
+            return (
+                self._image_context_from_payload(payload, contexts[0], image_url=image_url)
+                if contexts
+                else None
+            )
+
+        context, _active_generations = self._read_with_active_snapshot(read)
+        return context
+
+    def _image_context_from_payload(
+        self,
+        payload: dict,
+        context: PageContextResponse,
+        *,
+        image_url: str | None = None,
+    ) -> ImageContextResponse:
+        source_pdf = str(payload.get("source_pdf") or "")
         page = int(payload.get("page", 0))
-        source_version_id = payload.get("source_version_id")
-        ingestion_id = payload.get("ingestion_id")
-        context = self.page_context(source_pdf, page, source_version_id, ingestion_id)
-        if context is None:
-            return None
         return ImageContextResponse(
             result_id=payload.get("id"),
             image_url=self._artifact_url(payload.get("artifact_path")) or image_url,
             source_id=payload.get("source_id"),
             source_version=payload.get("source_version"),
-            source_version_id=source_version_id,
-            ingestion_id=ingestion_id,
+            source_version_id=payload.get("source_version_id"),
+            ingestion_id=payload.get("ingestion_id"),
             source_pdf=source_pdf,
             source_url=payload.get("source_url"),
             team=payload.get("team"),
@@ -1039,18 +1188,26 @@ class RagStore:
         )
 
     def _payload_and_vectors_for_result_id(self, result_id: str) -> tuple[dict | None, dict | None]:
+        result, _active_generations = self._read_with_active_snapshot(
+            lambda active: self._payload_and_vectors_for_result_id_active(result_id, active)
+        )
+        return result
+
+    def _payload_and_vectors_for_result_id_active(
+        self,
+        result_id: str,
+        active_generations: dict[str, str],
+    ) -> tuple[dict | None, dict | None]:
         conditions = [
             models.FieldCondition(
                 key="id",
                 match=models.MatchValue(value=result_id),
             )
         ]
-        matches, active_generations = self._read_with_active_snapshot(
-            lambda active: self._scroll_payloads(
-                _active_filter(must=conditions, active_generations=active),
-                limit=None,
-                with_vectors=True,
-            )
+        matches = self._scroll_payloads(
+            _active_filter(must=conditions, active_generations=active_generations),
+            limit=None,
+            with_vectors=True,
         )
         if not matches:
             return None, None

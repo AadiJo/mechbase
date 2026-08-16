@@ -202,3 +202,14 @@ class ImageContextResponse(BaseModel):
     text: str
     page_image_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
+
+
+class FetchContextResponse(BaseModel):
+    context: ImageContextResponse
+    adjacent_contexts: list[PageContextResponse] = Field(default_factory=list)
+
+
+class SourceBrowseResponse(BaseModel):
+    source: SourceSummary
+    requested_pages: list[int] = Field(default_factory=list)
+    contexts: list[PageContextResponse] = Field(default_factory=list)
