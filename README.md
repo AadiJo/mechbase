@@ -48,7 +48,7 @@ The API also exposes a stateless Streamable HTTP MCP server at `/mcp`. It is add
 frontend and all existing REST endpoints continue to use Mechbase API keys without changes.
 The MCP endpoint accepts Clerk OAuth access tokens only.
 
-The server provides seven read-only tools:
+The server provides nine read-only tools:
 
 - `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
   result-count controls. Results include stable source IDs, evidence classification, calibrated
@@ -71,11 +71,23 @@ The server provides seven read-only tools:
   text, immutable preview citations, and primary result IDs without leaving that source. Long
   section scans return a generation-pinned `next_cursor` so follow-up calls stay bounded and
   cannot silently cross a source refresh.
+- `get_game_context(year, topics)` returns reviewed, mechanism-relevant season facts and aliases
+  for standard 2018-2026 games, with a citation to the official FIRST manual for every fact. The
+  nonstandard 2021 at-home season and missing coverage are reported explicitly.
+- `get_team_context(team_number, year, mechanism_query, top_k)` resolves exact indexed coverage
+  and can run a team- and season-filtered mechanism search. It returns public FIRST Events and The
+  Blue Alliance pages for live performance research; the server does not scrape them and needs no
+  TBA API key.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.
 Inspection images are model-only inputs. The render tool is the only path for displaying images,
 so irrelevant RAG results do not appear just because they ranked highly.
+
+`get_team_context` deliberately reports `performance_checked: false`. When the user asks about
+records, rankings, awards, matches, or performance, the MCP host should browse and cite one of the
+returned public targets before answering. Binder evidence and competition results remain separate:
+neither proves that a particular mechanism caused a team's performance.
 
 Configure the resource server with:
 

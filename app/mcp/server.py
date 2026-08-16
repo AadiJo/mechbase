@@ -17,6 +17,14 @@ from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.cache import TTLCache
+from app.mcp.contexts import (
+    GameContextOutput,
+    GameTopic,
+    TeamContextOutput,
+    game_context,
+    team_research_targets,
+    team_web_queries,
+)
 from app.mcp.images import (
     CandidateAssetSource,
     PreviewImage,
@@ -266,10 +274,12 @@ def create_mcp_server(
             "render_search_results with the inspected result and asset ids. If none "
             "are relevant, do not call the render tool and say that no useful image was found. "
             "Use fetch only when complete page text is needed. Use browse_source for multi-page "
-            "evidence from the same binder; find_similar can return pages from other binders. All "
-            "tools are read-only."
+            "evidence from the same binder; find_similar can return pages from other binders. Use "
+            "get_game_context to ground season terminology. Use get_team_context for exact team "
+            "coverage and browse its public targets before making performance claims. All tools "
+            "are read-only."
         ),
-        version="0.4.0",
+        version="0.5.0",
         auth=AuthSettings(
             issuer_url=settings.clerk_oauth_issuer_url,
             required_scopes=settings.mcp_required_scopes,
@@ -916,6 +926,106 @@ def create_mcp_server(
             scanned_pages=len(pages_to_load),
             next_cursor=next_cursor,
             truncated=next_cursor is not None,
+        )
+
+    @server.tool(
+        title="Get reviewed FRC game context",
+        description=(
+            "Get reviewed, structured season terminology and mechanism-relevant game context "
+            "with citations to the official FIRST manual. Use this before interpreting historical "
+            "binder language or comparing mechanisms across games. Request only the topics needed. "
+            "This summary is not a substitute for the official manual and explicitly reports "
+            "unsupported seasons or missing topics."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def get_game_context(
+        year: SeasonYear,
+        topics: Annotated[list[GameTopic] | None, Field(max_length=6)] = None,
+    ) -> GameContextOutput:
+        return game_context(year, list(dict.fromkeys(topics or [])))
+
+    @server.tool(
+        title="Get exact FRC team context",
+        description=(
+            "Resolve exact indexed binder coverage for one FRC team and optional season. When a "
+            "mechanism query is supplied, search only that team's matching indexed sources. This "
+            "tool does not fetch live competition performance. If the user asks about records, "
+            "rankings, awards, matches, or performance, browse and cite the returned public FIRST "
+            "Events and The Blue Alliance targets before answering. Do not infer performance from "
+            "binder content or infer mechanism causality from event results."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def get_team_context(
+        team_number: TeamNumber,
+        year: SeasonYear | None = None,
+        mechanism_query: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
+        top_k: Annotated[int, Field(ge=1, le=20)] = 8,
+    ) -> TeamContextOutput:
+        team = str(team_number)
+        years = [year] if year is not None else []
+        corpus_revision = retrieval.corpus_revision()
+        cache_key = repr((corpus_revision, [team], years, []))
+        catalog = source_cache.get_or_compute(
+            cache_key,
+            lambda: retrieval.list_sources(
+                team_numbers=[team],
+                years=years,
+                source_ids=[],
+            ),
+        )
+        matching_sources = catalog.sources
+        indexed_sources = source_output(
+            matching_sources,
+            public_base_url,
+            total_matching_sources=len(matching_sources),
+        )
+        mechanism_search = None
+        if mechanism_query is not None:
+            query = mechanism_query.strip()
+            if not query:
+                raise ValueError("mechanism_query must contain non-whitespace text.")
+            filters = AppliedSearchFilters(
+                team_numbers=[team],
+                years=[year] if year is not None else [],
+            )
+            if matching_sources:
+                request = SearchRequest(
+                    query=query,
+                    top_k=top_k,
+                    team_numbers=filters.team_numbers,
+                    years=filters.years,
+                )
+                cache_key = f"{corpus_revision}:{request.model_dump_json()}"
+                response = search_cache.get_or_compute(
+                    cache_key,
+                    lambda: retrieval.search(request),
+                )
+                mechanism_search = search_output(
+                    response,
+                    public_base_url,
+                    applied_filters=filters,
+                )
+            else:
+                mechanism_search = SearchOutput(
+                    results=[],
+                    applied_filters=filters,
+                    abstention_reason=(
+                        "No indexed binder matches the requested team and season, so mechanism "
+                        "search was not run."
+                    ),
+                )
+
+        return TeamContextOutput(
+            team_number=team_number,
+            year=year,
+            indexed_sources=indexed_sources,
+            mechanism_search=mechanism_search,
+            live_research_targets=team_research_targets(team_number, year),
+            suggested_web_queries=team_web_queries(team_number, year),
         )
 
     return server
