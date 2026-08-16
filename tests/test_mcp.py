@@ -69,6 +69,7 @@ class FakeRetrievalBackend:
         self.asset_generation: str | None = None
         self.extra_figure_names: list[str] = []
         self.revision_sequence: list[str] = []
+        self.extra_sources: list[SourceSummary] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -242,7 +243,7 @@ class FakeRetrievalBackend:
                 "source_query": source_query,
             }
         )
-        sources = self._catalog_sources()
+        sources = [*self._catalog_sources(), *self.extra_sources]
         needle = source_query.casefold() if source_query else None
         return SourceListResponse(
             sources=[
@@ -698,6 +699,12 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "top_k",
                         }
                         assert "does not fetch live competition performance" in (
+                            tools["get_team_context"].description or ""
+                        )
+                        assert "Render only inspected assets that are relevant" in (
+                            tools["get_team_context"].description or ""
+                        )
+                        assert "if none are useful, do not call render_search_results" in (
                             tools["get_team_context"].description or ""
                         )
                         assert tools["inspect_candidates"].output_schema is None
@@ -1364,6 +1371,38 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert len(backend.search_calls) == searches_before_refresh + 2
                         assert backend.revision_sequence == []
 
+                        backend.extra_sources = [
+                            SourceSummary(
+                                source_id=f"254-archive-{index}",
+                                source_version_id=f"254-archive-{index}@version-a",
+                                source_pdf=f"254-archive-{index}.pdf",
+                                team="254",
+                                year=2019,
+                            )
+                            for index in range(21)
+                        ]
+                        backend.revision_sequence = ["many-sources", "many-sources"]
+                        searches_before_large_catalog = len(backend.search_calls)
+                        large_catalog_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 254,
+                                "mechanism_query": "archive intake",
+                            },
+                        )
+                        assert large_catalog_context.is_error is False
+                        large_catalog_calls = backend.search_calls[searches_before_large_catalog:]
+                        assert len(large_catalog_calls) == 2
+                        assert all(len(request.source_ids) <= 20 for request in large_catalog_calls)
+                        assert {
+                            source_id
+                            for request in large_catalog_calls
+                            for source_id in request.source_ids
+                        } == {
+                            "254-2020",
+                            *(f"254-archive-{index}" for index in range(21)),
+                        }
+
                         browsed = await session.call_tool(
                             "browse_source",
                             {
@@ -1564,7 +1603,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 5
+                        assert len(backend.list_source_calls) == 6
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -1578,7 +1617,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 6
+                        assert len(backend.list_source_calls) == 7
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],

@@ -385,7 +385,7 @@ _GAME_CONTEXTS = {
                 "Robots handled two geometrically different GAME PIECES: cones and inflatable cubes.",
                 ["cone", "cube", "game piece"],
                 "Section 5.8, GAME PIECES",
-                "37",
+                "36-37",
             ),
             (
                 "scoring",
@@ -447,8 +447,8 @@ _GAME_CONTEXTS = {
                 "endgame",
                 "Robots parked by or climbed a STAGE chain, and could score a NOTE in a TRAP while onstage.",
                 ["stage", "chain", "onstage", "trap", "climb"],
-                "Sections 4 and 6, Game Overview and Scoring",
-                "19-20, 50-55",
+                "Sections 4 and 6.4, Game Overview and Scoring",
+                "19-20, 46-48",
             ),
             (
                 "field_elements",

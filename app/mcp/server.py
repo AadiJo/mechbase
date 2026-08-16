@@ -60,6 +60,7 @@ from app.rag.models import (
     ImageContextResponse,
     MechanismTypeFilter,
     PageContextResponse,
+    SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchSort,
@@ -89,6 +90,7 @@ BROWSE_SECTION_SCAN_PAGES = 50
 MAX_INSPECTED_FIGURES = 4
 MAX_INSPECTION_IMAGES = 12
 MAX_INSPECTION_ENCODED_BYTES = 8 * 1024 * 1024
+SEARCH_SOURCE_FILTER_LIMIT = 20
 
 
 class RetrievalBackend(Protocol):
@@ -957,7 +959,8 @@ def create_mcp_server(
             "rankings, awards, matches, or performance, browse and cite the returned public FIRST "
             "Events and The Blue Alliance targets before answering. Do not infer performance from "
             "binder content or infer mechanism causality from event results. When mechanism_search "
-            "returns results, call inspect_candidates and render_search_results before answering."
+            "returns results, call inspect_candidates. Render only inspected assets that are "
+            "relevant to the request; if none are useful, do not call render_search_results."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -1000,17 +1003,26 @@ def create_mcp_server(
                 source_ids=list(dict.fromkeys(source.source_id for source in matching_sources)),
             )
             if query is not None and matching_sources:
-                request = SearchRequest(
-                    query=query,
+                responses: list[SearchResponse] = []
+                for offset in range(0, len(filters.source_ids), SEARCH_SOURCE_FILTER_LIMIT):
+                    request = SearchRequest(
+                        query=query,
+                        top_k=top_k,
+                        team_numbers=filters.team_numbers,
+                        years=filters.years,
+                        source_ids=filters.source_ids[offset : offset + SEARCH_SOURCE_FILTER_LIMIT],
+                    )
+                    cache_key = f"{corpus_revision}:{request.model_dump_json()}"
+                    responses.append(
+                        search_cache.get_or_compute(
+                            cache_key,
+                            lambda current_request=request: retrieval.search(current_request),
+                        )
+                    )
+                response = _merge_search_responses(
+                    query,
+                    responses,
                     top_k=top_k,
-                    team_numbers=filters.team_numbers,
-                    years=filters.years,
-                    source_ids=filters.source_ids,
-                )
-                cache_key = f"{corpus_revision}:{request.model_dump_json()}"
-                response = search_cache.get_or_compute(
-                    cache_key,
-                    lambda current_request=request: retrieval.search(current_request),
                 )
                 mechanism_search = search_output(
                     response,
@@ -1046,6 +1058,45 @@ def create_mcp_server(
         )
 
     return server
+
+
+def _merge_search_responses(
+    query: str,
+    responses: list[SearchResponse],
+    *,
+    top_k: int,
+) -> SearchResponse:
+    if len(responses) == 1:
+        return responses[0]
+
+    results_by_id = {result.id: result for response in responses for result in response.results}
+    results = sorted(
+        results_by_id.values(),
+        key=lambda result: result.score,
+        reverse=True,
+    )[:top_k]
+    coverage = SearchCoverage(
+        candidate_pages=sum(response.coverage.candidate_pages for response in responses),
+        candidate_sources=sum(response.coverage.candidate_sources for response in responses),
+        weak_pages_dropped=sum(response.coverage.weak_pages_dropped for response in responses),
+        returned_pages=len(results),
+        candidate_window_truncated=any(
+            response.coverage.candidate_window_truncated for response in responses
+        ),
+    )
+    abstention_reason = None
+    if not results:
+        abstention_reason = (
+            "No indexed pages met the calibrated relevance threshold for this query and filter set."
+            if coverage.candidate_pages
+            else "No indexed pages matched this query and filter set."
+        )
+    return SearchResponse(
+        query=query,
+        results=results,
+        coverage=coverage,
+        abstention_reason=abstention_reason,
+    )
 
 
 def _filter_source_query(
