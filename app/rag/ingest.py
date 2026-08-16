@@ -2,6 +2,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ from app.rag.voyage_client import VoyageEmbedder
 
 EXTRACTION_SCHEMA_VERSION = "2"
 ARTIFACT_COMPLETE_FILE = ".complete.json"
+STAGING_NAMESPACE_PATTERN = re.compile(r"~[0-9a-f]{32}$")
 
 
 def batched(items, size: int):
@@ -104,7 +106,7 @@ def publish_artifact_generation(
     source_id: str,
     staging_namespace: str,
     published_namespace: str,
-) -> None:
+) -> str:
     artifact_root = artifact_dir.resolve()
     root_path = source_artifact_root(artifact_root, source_id)
     if root_path.is_symlink():
@@ -126,19 +128,41 @@ def publish_artifact_generation(
         raise RuntimeError("Artifact namespace escapes its source directory.")
     if not staging.is_dir():
         raise RuntimeError(f"Artifact staging generation {staging_namespace} is missing.")
-    if published.exists():
-        if not published.is_dir():
-            raise RuntimeError("Published artifact generation must be a directory.")
-        if _artifact_tree_is_complete(published):
+    expected_inventory = _write_artifact_completion_marker(staging)
+    _fsync_tree(staging)
+    if not published.exists():
+        staging.replace(published)
+        for directory in [root, root.parent, artifact_root]:
+            _fsync_directory(directory)
+        return published_namespace
+    if published.is_dir() and _artifact_tree_matches(published, expected_inventory):
+        shutil.rmtree(staging)
+        _fsync_directory(root)
+        return published_namespace
+
+    inventory_digest = sha256(
+        json.dumps(expected_inventory, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    candidate_namespace = f"{published_namespace}~repair-{inventory_digest}"
+    candidate_index = 0
+    while True:
+        candidate_path = root / candidate_namespace
+        if candidate_path.is_symlink():
+            raise RuntimeError("Published artifact generation cannot be a symlink.")
+        if not candidate_path.exists():
+            published = candidate_path
+            break
+        if candidate_path.is_dir() and _artifact_tree_matches(candidate_path, expected_inventory):
             shutil.rmtree(staging)
             _fsync_directory(root)
-            return
-        shutil.rmtree(published)
-    _write_artifact_completion_marker(staging)
-    _fsync_tree(staging)
+            return candidate_namespace
+        candidate_index += 1
+        candidate_namespace = f"{published_namespace}~repair-{inventory_digest}-{candidate_index}"
+
     staging.replace(published)
     for directory in [root, root.parent, artifact_root]:
         _fsync_directory(directory)
+    return candidate_namespace
 
 
 def _artifact_inventory(root: Path) -> list[dict[str, int | str]]:
@@ -150,35 +174,46 @@ def _artifact_inventory(root: Path) -> list[dict[str, int | str]]:
         if path.is_symlink():
             raise RuntimeError(f"Artifact tree cannot contain symlinks: {path}")
         if path.is_file():
+            digest = sha256()
+            with path.open("rb") as artifact:
+                while chunk := artifact.read(1024 * 1024):
+                    digest.update(chunk)
             inventory.append(
                 {
                     "path": path.relative_to(root).as_posix(),
                     "size": path.stat().st_size,
+                    "sha256": digest.hexdigest(),
                 }
             )
     return inventory
 
 
-def _write_artifact_completion_marker(root: Path) -> None:
+def _write_artifact_completion_marker(root: Path) -> dict[str, list[dict[str, int | str]]]:
+    inventory = {"files": _artifact_inventory(root)}
     marker = root / ARTIFACT_COMPLETE_FILE
     marker.write_text(
         json.dumps(
-            {"files": _artifact_inventory(root)},
+            inventory,
             sort_keys=True,
             separators=(",", ":"),
         ),
         encoding="utf-8",
     )
+    return inventory
 
 
-def _artifact_tree_is_complete(root: Path) -> bool:
+def _artifact_tree_matches(
+    root: Path,
+    expected_inventory: dict[str, list[dict[str, int | str]]],
+) -> bool:
     marker = root / ARTIFACT_COMPLETE_FILE
     if marker.is_symlink() or not marker.is_file():
         return False
     try:
-        expected = json.loads(marker.read_text(encoding="utf-8"))
-        return expected == {"files": _artifact_inventory(root)}
-    except (OSError, json.JSONDecodeError, RuntimeError):
+        recorded = json.loads(marker.read_text(encoding="utf-8"))
+        actual = {"files": _artifact_inventory(root)}
+        return recorded == expected_inventory == actual
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
         return False
 
 
@@ -245,6 +280,28 @@ def remove_artifact_generation(artifact_dir: Path, source_id: str, namespace: st
     shutil.rmtree(target)
 
 
+def remove_abandoned_artifact_staging(artifact_dir: Path) -> None:
+    artifact_root = artifact_dir.resolve()
+    sources_root = artifact_root / "sources"
+    if sources_root.is_symlink() or not sources_root.is_dir():
+        return
+    for source_root in sources_root.iterdir():
+        if source_root.is_symlink() or not source_root.is_dir():
+            continue
+        removed = False
+        for candidate in source_root.iterdir():
+            if (
+                candidate.is_symlink()
+                or not candidate.is_dir()
+                or not STAGING_NAMESPACE_PATTERN.search(candidate.name)
+            ):
+                continue
+            shutil.rmtree(candidate)
+            removed = True
+        if removed:
+            _fsync_directory(source_root)
+
+
 @contextmanager
 def ingestion_lock(artifact_dir: Path) -> Iterator[None]:
     lock_path = artifact_dir / "ingestion.lock"
@@ -291,7 +348,6 @@ def ingest_sources(
             )
             source_root = source_artifact_root(settings.artifact_dir, source.source_id)
             staging_root = source_root / staging_namespace
-            published_root = source_root / published_namespace
             committed = False
             try:
                 docs = extract_documents(
@@ -310,18 +366,6 @@ def ingest_sources(
                     f"Extracted {len(docs)} retrieval objects from {source.path.name}.",
                     flush=True,
                 )
-                for batch_idx, batch in enumerate(batched(docs, batch_size), start=1):
-                    print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
-                    text_vectors = embedder.embed_texts(
-                        [doc.text or doc.source_pdf for doc in batch], "document"
-                    )
-                    image_vectors = multimodal_vectors(batch, embedder, settings)
-                    published_batch = [
-                        with_published_artifacts(document, staging_root, published_root)
-                        for document in batch
-                    ]
-                    store.upsert(published_batch, text_vectors, image_vectors)
-                    print(f"  upserted batch {batch_idx}", flush=True)
                 artifact_paths = {
                     path
                     for document in docs
@@ -333,13 +377,27 @@ def ingest_sources(
                     raise RuntimeError(
                         f"Artifact extraction left {len(missing_artifacts)} referenced files missing."
                     )
+                actual_published_namespace = published_namespace
                 if artifact_paths:
-                    publish_artifact_generation(
+                    actual_published_namespace = publish_artifact_generation(
                         settings.artifact_dir,
                         source.source_id,
                         staging_namespace,
                         published_namespace,
                     )
+                published_root = source_root / actual_published_namespace
+                published_docs = [
+                    with_published_artifacts(document, staging_root, published_root)
+                    for document in docs
+                ]
+                for batch_idx, batch in enumerate(batched(published_docs, batch_size), start=1):
+                    print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
+                    text_vectors = embedder.embed_texts(
+                        [doc.text or doc.source_pdf for doc in batch], "document"
+                    )
+                    image_vectors = multimodal_vectors(batch, embedder, settings)
+                    store.upsert(batch, text_vectors, image_vectors)
+                    print(f"  upserted batch {batch_idx}", flush=True)
                 store.publish_source_generation(source.source_id, ingestion_id)
                 store.set_active_generation(source.source_id, ingestion_id)
                 committed = True
@@ -418,6 +476,7 @@ def main() -> None:
 
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
     with ingestion_lock(settings.artifact_dir):
+        remove_abandoned_artifact_staging(settings.artifact_dir)
         ingest_sources(
             sources,
             batch_size=args.batch_size,

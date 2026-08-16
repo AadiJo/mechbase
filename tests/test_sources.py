@@ -12,6 +12,7 @@ from app.rag.ingest import (
     ingestion_fingerprint,
     ingestion_lock,
     publish_artifact_generation,
+    remove_abandoned_artifact_staging,
     remove_artifact_generation,
     with_published_artifacts,
 )
@@ -103,7 +104,7 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     (first_staging / "page.png").write_bytes(b"canonical")
     published_namespace = "version-current~fingerprint-current"
 
-    publish_artifact_generation(
+    first_published = publish_artifact_generation(
         tmp_path,
         "254-2023",
         first_staging.name,
@@ -111,6 +112,7 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     )
 
     published = root / published_namespace
+    assert first_published == published_namespace
     assert not first_staging.exists()
     assert (published / "page.png").read_bytes() == b"canonical"
     assert (published / ".complete.json").is_file()
@@ -118,25 +120,27 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
 
     duplicate_staging = root / "version-current~ingestion-two"
     duplicate_staging.mkdir()
-    (duplicate_staging / "page.png").write_bytes(b"duplicate")
+    (duplicate_staging / "page.png").write_bytes(b"canonical")
 
-    publish_artifact_generation(
+    duplicate_published = publish_artifact_generation(
         tmp_path,
         "254-2023",
         duplicate_staging.name,
         published_namespace,
     )
 
+    assert duplicate_published == published_namespace
     assert not duplicate_staging.exists()
     assert (published / "page.png").read_bytes() == b"canonical"
     assert (historical / "page.png").read_bytes() == b"historical"
 
     (published / ".complete.json").write_text("{}", encoding="utf-8")
+    (published / "page.png").write_bytes(b"corrupt")
     repair_staging = root / "version-current~ingestion-three"
     repair_staging.mkdir()
     (repair_staging / "page.png").write_bytes(b"repaired")
 
-    publish_artifact_generation(
+    repaired_namespace = publish_artifact_generation(
         tmp_path,
         "254-2023",
         repair_staging.name,
@@ -144,8 +148,11 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     )
 
     assert not repair_staging.exists()
-    assert (published / "page.png").read_bytes() == b"repaired"
-    assert (published / ".complete.json").is_file()
+    assert repaired_namespace != published_namespace
+    assert (published / "page.png").read_bytes() == b"corrupt"
+    repaired = root / repaired_namespace
+    assert (repaired / "page.png").read_bytes() == b"repaired"
+    assert (repaired / ".complete.json").is_file()
 
 
 def test_missing_artifact_staging_is_fatal(tmp_path: Path) -> None:
@@ -303,6 +310,24 @@ def test_artifact_cleanup_cannot_cross_source_id_prefixes(tmp_path: Path) -> Non
 
     assert not (first_root / "old").exists()
     assert (prefixed_root / "other-source").is_dir()
+
+
+def test_abandoned_random_staging_is_reclaimed_under_ingestion_lock(tmp_path: Path) -> None:
+    root = source_artifact_root(tmp_path, "254")
+    root.mkdir(parents=True)
+    abandoned = root / f"version~{'a' * 32}"
+    published = root / f"version~{'b' * 16}"
+    repaired = root / f"version~{'b' * 16}~repair-{'c' * 16}"
+    abandoned.mkdir()
+    published.mkdir()
+    repaired.mkdir()
+
+    with ingestion_lock(tmp_path):
+        remove_abandoned_artifact_staging(tmp_path)
+
+    assert not abandoned.exists()
+    assert published.is_dir()
+    assert repaired.is_dir()
 
 
 def test_ingestion_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
