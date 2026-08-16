@@ -25,8 +25,16 @@ def _ocr_image(path: Path) -> str:
         return pytesseract.image_to_string(image).strip()
 
 
-def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument]:
-    artifact_root = settings.artifact_dir / source.source_version_id
+def extract_documents(
+    source: SourceDoc,
+    settings: Settings,
+    *,
+    ingestion_id: str | None = None,
+) -> list[RagDocument]:
+    document_namespace = (
+        f"{source.source_version_id}#{ingestion_id}" if ingestion_id else source.source_version_id
+    )
+    artifact_root = settings.artifact_dir / document_namespace
     docs: list[RagDocument] = []
     pdf = fitz.open(source.path)
     try:
@@ -46,7 +54,7 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
 
             linked_artifacts = [str(page_image_path)]
             extracted_images = _extract_page_images(
-                pdf, page, page_dir, source, page_num, page_text
+                pdf, page, page_dir, source, page_num, page_text, ingestion_id
             )
             linked_artifacts.extend(
                 doc.artifact_path for doc in extracted_images if doc.artifact_path
@@ -56,10 +64,11 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
             section = section_from_text(page_text)
             docs.append(
                 RagDocument(
-                    id=_safe_id(source.source_version_id, page_num, "page"),
+                    id=_safe_id(document_namespace, page_num, "page"),
                     source_id=source.source_id,
                     source_version=source.source_version,
                     source_version_id=source.source_version_id,
+                    ingestion_id=ingestion_id,
                     source_pdf=source.path.name,
                     team=source.team,
                     year=source.year,
@@ -77,10 +86,11 @@ def extract_documents(source: SourceDoc, settings: Settings) -> list[RagDocument
             ):
                 docs.append(
                     RagDocument(
-                        id=_safe_id(source.source_version_id, page_num, "text", chunk_idx),
+                        id=_safe_id(document_namespace, page_num, "text", chunk_idx),
                         source_id=source.source_id,
                         source_version=source.source_version,
                         source_version_id=source.source_version_id,
+                        ingestion_id=ingestion_id,
                         source_pdf=source.path.name,
                         team=source.team,
                         year=source.year,
@@ -104,6 +114,7 @@ def _extract_page_images(
     source: SourceDoc,
     page_num: int,
     page_text: str,
+    ingestion_id: str | None,
 ) -> list[RagDocument]:
     docs: list[RagDocument] = []
     seen: set[int] = set()
@@ -127,10 +138,18 @@ def _extract_page_images(
             out_path.write_bytes(image["image"])
         docs.append(
             RagDocument(
-                id=_safe_id(source.source_version_id, page_num, "image", image_idx),
+                id=_safe_id(
+                    f"{source.source_version_id}#{ingestion_id}"
+                    if ingestion_id
+                    else source.source_version_id,
+                    page_num,
+                    "image",
+                    image_idx,
+                ),
                 source_id=source.source_id,
                 source_version=source.source_version,
                 source_version_id=source.source_version_id,
+                ingestion_id=ingestion_id,
                 source_pdf=source.path.name,
                 team=source.team,
                 year=source.year,

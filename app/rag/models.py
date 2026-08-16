@@ -33,6 +33,7 @@ class RagDocument(BaseModel):
     source_id: str
     source_version: str
     source_version_id: str
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -70,6 +71,7 @@ class SearchResult(BaseModel):
     source_id: str
     source_version_id: str
     source_version: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None
     year: int | None
@@ -103,6 +105,7 @@ class PageContextResponse(BaseModel):
     source_id: str | None = None
     source_version: str | None = None
     source_version_id: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -124,6 +127,7 @@ class SourceSummary(BaseModel):
     source_id: str
     source_version_id: str
     source_version: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -150,6 +154,8 @@ class SourceSearchRequest(BaseModel):
 
 
 class SourcePageMatch(BaseModel):
+    source_version_id: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -169,6 +175,7 @@ class SourceSearchResponse(BaseModel):
 class SimilarPagesResponse(BaseModel):
     seed: dict
     results: list[SearchResult]
+    coverage: SearchCoverage = Field(default_factory=SearchCoverage)
 
 
 class ImageContextResponse(BaseModel):
@@ -177,6 +184,7 @@ class ImageContextResponse(BaseModel):
     source_id: str | None = None
     source_version: str | None = None
     source_version_id: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None

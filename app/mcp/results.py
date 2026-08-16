@@ -28,6 +28,7 @@ class SearchItem(BaseModel):
     source_id: str
     source_version_id: str
     source_version: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -70,6 +71,7 @@ class SourceItem(BaseModel):
     source_id: str
     source_version_id: str
     source_version: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
@@ -135,6 +137,7 @@ def search_output(
             source_id=result.source_id,
             source_version=result.source_version,
             source_version_id=result.source_version_id,
+            ingestion_id=result.ingestion_id,
             source_pdf=result.source_pdf,
             team=result.team,
             year=result.year,
@@ -185,6 +188,7 @@ def fetch_output(
             "source_id": context.source_id,
             "source_version": context.source_version,
             "source_version_id": context.source_version_id,
+            "ingestion_id": context.ingestion_id,
             "source_pdf": context.source_pdf,
             "team": context.team,
             "year": context.year,
@@ -204,6 +208,7 @@ def source_output(
                 source_id=source.source_id,
                 source_version=source.source_version,
                 source_version_id=source.source_version_id,
+                ingestion_id=source.ingestion_id,
                 source_pdf=source.source_pdf,
                 team=source.team,
                 year=source.year,

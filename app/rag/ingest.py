@@ -1,14 +1,20 @@
 import argparse
 import json
+import shutil
 from datetime import UTC, datetime
+from hashlib import sha256
 from itertools import islice
 from pathlib import Path
+from uuid import uuid4
 
-from app.rag.config import get_settings
+from app.rag.config import Settings, get_settings
+from app.rag.models import SourceDoc
 from app.rag.pdf import extract_documents
 from app.rag.sources import iter_pdfs
 from app.rag.store import RagStore
 from app.rag.voyage_client import VoyageEmbedder
+
+EXTRACTION_SCHEMA_VERSION = "2"
 
 
 def batched(items, size: int):
@@ -41,10 +47,54 @@ def completed_sources(manifest_path: Path) -> dict[str, str | None]:
             continue
         try:
             record = json.loads(line)
-            done[record["source"]] = record.get("source_version")
+            done[record["source"]] = record.get("ingestion_fingerprint")
         except (json.JSONDecodeError, KeyError):
             continue
     return done
+
+
+def ingestion_fingerprint(source: SourceDoc, settings: Settings) -> str:
+    parameters = {
+        "schema": EXTRACTION_SCHEMA_VERSION,
+        "source_version": source.source_version,
+        "source_url": source.source_url,
+        "ocr_min_chars_per_page": settings.ocr_min_chars_per_page,
+        "render_dpi": settings.render_dpi,
+        "chunk_target_chars": settings.chunk_target_chars,
+        "chunk_overlap_chars": settings.chunk_overlap_chars,
+        "text_model": settings.text_model,
+        "multimodal_model": settings.multimodal_model,
+        "embedding_dim": settings.embedding_dim,
+        "max_embed_image_side": settings.max_embed_image_side,
+    }
+    encoded = json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode()
+    return sha256(encoded).hexdigest()[:16]
+
+
+def remove_superseded_artifacts(
+    artifact_dir: Path,
+    source_id: str,
+    current_namespace: str,
+) -> None:
+    root = artifact_dir.resolve()
+    if not root.exists():
+        return
+    for candidate in root.iterdir():
+        if candidate.is_symlink() or not candidate.is_dir() or candidate.name == current_namespace:
+            continue
+        if candidate.name == source_id or candidate.name.startswith(f"{source_id}@"):
+            shutil.rmtree(candidate)
+
+
+def remove_artifact_generation(artifact_dir: Path, namespace: str) -> None:
+    root = artifact_dir.resolve()
+    target_path = root / namespace
+    if target_path.is_symlink():
+        return
+    target = target_path.resolve()
+    if target.parent != root or not target.is_dir():
+        return
+    shutil.rmtree(target)
 
 
 def main() -> None:
@@ -74,29 +124,51 @@ def main() -> None:
     completed = {} if args.force else completed_sources(manifest_path)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         for source in sources:
-            if completed.get(source.path.name) == source.source_version:
+            fingerprint = ingestion_fingerprint(source, settings)
+            if completed.get(source.path.name) == fingerprint:
                 print(f"Skipping {source.path.name}; already in manifest.", flush=True)
                 continue
             print(f"Ingesting {source.path.name}...", flush=True)
-            docs = extract_documents(source, settings)
-            if not docs:
-                raise RuntimeError(
-                    f"Refusing to replace {source.path.name}: extraction produced no documents."
+            ingestion_id = uuid4().hex
+            artifact_namespace = f"{source.source_version_id}#{ingestion_id}"
+            try:
+                docs = extract_documents(source, settings, ingestion_id=ingestion_id)
+                if not docs:
+                    raise RuntimeError(
+                        f"Refusing to replace {source.path.name}: extraction produced no documents."
+                    )
+                ingested_at = datetime.now(UTC).isoformat()
+                docs = [doc.model_copy(update={"ingested_at": ingested_at}) for doc in docs]
+                print(
+                    f"Extracted {len(docs)} retrieval objects from {source.path.name}.",
+                    flush=True,
                 )
-            ingested_at = datetime.now(UTC).isoformat()
-            docs = [doc.model_copy(update={"ingested_at": ingested_at}) for doc in docs]
-            print(f"Extracted {len(docs)} retrieval objects from {source.path.name}.", flush=True)
-            for batch_idx, batch in enumerate(batched(docs, args.batch_size), start=1):
-                print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
-                text_vectors = embedder.embed_texts(
-                    [doc.text or doc.source_pdf for doc in batch], "document"
-                )
-                image_vectors = multimodal_vectors(batch, embedder, settings)
-                store.upsert(batch, text_vectors, image_vectors)
-                print(f"  upserted batch {batch_idx}", flush=True)
-            store.delete_superseded_source_versions(
+                for batch_idx, batch in enumerate(batched(docs, args.batch_size), start=1):
+                    print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
+                    text_vectors = embedder.embed_texts(
+                        [doc.text or doc.source_pdf for doc in batch], "document"
+                    )
+                    image_vectors = multimodal_vectors(batch, embedder, settings)
+                    store.upsert(batch, text_vectors, image_vectors)
+                    print(f"  upserted batch {batch_idx}", flush=True)
+            except Exception:
+                try:
+                    store.delete_source_generation(source.source_id, ingestion_id)
+                except Exception as cleanup_error:
+                    print(
+                        f"Could not remove failed generation {ingestion_id}: {cleanup_error}",
+                        flush=True,
+                    )
+                remove_artifact_generation(settings.artifact_dir, artifact_namespace)
+                raise
+            store.delete_superseded_source_generations(
                 source.source_id,
-                source.source_version,
+                ingestion_id,
+            )
+            remove_superseded_artifacts(
+                settings.artifact_dir,
+                source.source_id,
+                artifact_namespace,
             )
             manifest.write(
                 json.dumps(
@@ -104,6 +176,8 @@ def main() -> None:
                         "source": source.path.name,
                         "source_id": source.source_id,
                         "source_version": source.source_version,
+                        "ingestion_id": ingestion_id,
+                        "ingestion_fingerprint": fingerprint,
                         "documents": len(docs),
                     }
                 )

@@ -44,7 +44,6 @@ jobs:
 
             . .venv/bin/activate
             pip install -e .
-            python -c "from app.rag.config import get_settings; from app.rag.store import RagStore; RagStore(get_settings()).ensure_collection()"
 
             sudo systemctl restart "$SERVICE_NAME"
             systemctl is-active --quiet "$SERVICE_NAME"

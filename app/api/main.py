@@ -1,10 +1,13 @@
+import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
+from qdrant_client.http.exceptions import ApiException, ResponseHandlingException
 from starlette.responses import RedirectResponse
 
 from app.api.auth import ApiKeyContext, record_usage, require_api_key
@@ -27,14 +30,27 @@ from app.rag.store import RagStore
 from app.rag.voyage_client import MissingVoyageApiKey
 
 settings = get_settings()
+LOGGER = logging.getLogger(__name__)
 mcp_server = create_mcp_server(settings)
 mcp_http_app = create_mcp_http_app(mcp_server, settings)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    async with mcp_server.session_manager.run():
-        yield
+    index_task = asyncio.create_task(_ensure_payload_indexes())
+    try:
+        async with mcp_server.session_manager.run():
+            yield
+    finally:
+        await index_task
+
+
+async def _ensure_payload_indexes() -> None:
+    """Create newly declared Qdrant indexes without delaying API startup."""
+    try:
+        await asyncio.to_thread(RagStore(settings).ensure_collection)
+    except (ApiException, ResponseHandlingException):
+        LOGGER.warning("Could not ensure Qdrant payload indexes during startup.", exc_info=True)
 
 
 app = FastAPI(title="FRC Mechanism RAG", version="0.1.0", lifespan=lifespan)
@@ -145,8 +161,11 @@ def search_sources(
     source_matches = []
     for source_item in sources.sources[: request.top_k]:
         page = source_item.pages[0] if source_item.pages else 0
+        context_url, text_url = _source_page_urls(source_item, page)
         source_matches.append(
             {
+                "source_version_id": source_item.source_version_id,
+                "ingestion_id": source_item.ingestion_id,
                 "source_pdf": source_item.source_pdf,
                 "team": source_item.team,
                 "year": source_item.year,
@@ -154,12 +173,8 @@ def search_sources(
                 "score": 1.0,
                 "best_snippets": [],
                 "image_urls": source_item.sample_image_urls,
-                "page_context_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}"
-                if page
-                else "",
-                "page_text_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}/text"
-                if page
-                else "",
+                "page_context_url": context_url,
+                "page_text_url": text_url,
             }
         )
     return SourceSearchResponse(query=None, matches=source_matches)
@@ -215,9 +230,12 @@ def page_context(
     source_pdf: str,
     page: int,
     source_version_id: str | None = None,
+    ingestion_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageContextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page, source_version_id)
+    context = RagStore(get_settings()).page_context(
+        source_pdf, page, source_version_id, ingestion_id
+    )
     if context is None:
         raise HTTPException(status_code=404, detail="Page context not found.")
     return context
@@ -228,9 +246,12 @@ def page_text(
     source_pdf: str,
     page: int,
     source_version_id: str | None = None,
+    ingestion_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageTextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page, source_version_id)
+    context = RagStore(get_settings()).page_context(
+        source_pdf, page, source_version_id, ingestion_id
+    )
     if context is None or not context.text.strip():
         raise HTTPException(status_code=404, detail="Page text not found.")
     return PageTextResponse(source_pdf=source_pdf, page=page, text=context.text)
@@ -240,6 +261,24 @@ def page_text(
 def init_collection(_api_key: ApiKeyContext = Depends(require_api_key)) -> dict:
     RagStore(get_settings()).ensure_collection()
     return {"ok": True}
+
+
+def _source_page_urls(source: SourceSummary, page: int) -> tuple[str, str]:
+    if not page:
+        return "", ""
+    path = f"/pages/{quote(source.source_pdf, safe='')}/{page}"
+    query = urlencode(
+        {
+            key: value
+            for key, value in {
+                "source_version_id": source.source_version_id,
+                "ingestion_id": source.ingestion_id,
+            }.items()
+            if value
+        }
+    )
+    suffix = f"?{query}" if query else ""
+    return f"{path}{suffix}", f"{path}/text{suffix}"
 
 
 @app.get("/.well-known/oauth-authorization-server", include_in_schema=False)

@@ -73,6 +73,7 @@ def test_ensure_collection_adds_missing_metadata_indexes() -> None:
         "source_id",
         "source_version",
         "source_version_id",
+        "ingestion_id",
         "source_pdf",
         "modality",
     }
@@ -89,44 +90,78 @@ class VersionedPointClient:
     def delete(self, **kwargs):
         qfilter = kwargs["points_selector"].filter
         source_id = qfilter.must[0].match.value
-        current_version = qfilter.must_not[0].match.value
+        exact_ingestion = qfilter.must[1].match.value if len(qfilter.must) > 1 else None
+        current_ingestion = qfilter.must_not[0].match.value if qfilter.must_not else None
         self.payloads = {
             point_id: payload
             for point_id, payload in self.payloads.items()
-            if payload["source_id"] != source_id or payload["source_version"] == current_version
+            if payload["source_id"] != source_id
+            or (
+                payload.get("ingestion_id") == current_ingestion
+                if current_ingestion
+                else payload.get("ingestion_id") != exact_ingestion
+            )
         }
 
 
-def _versioned_doc(version: str, page: int) -> RagDocument:
+def _versioned_doc(
+    version: str,
+    page: int,
+    *,
+    ingestion_id: str | None = None,
+    text: str = "intake",
+    ingested_at: str | None = None,
+) -> RagDocument:
     version_id = f"254-2023@{version}"
+    namespace = f"{version_id}#{ingestion_id}" if ingestion_id else version_id
     return RagDocument(
-        id=f"{version_id}_{page}_text_0",
+        id=f"{namespace}_{page}_text_0",
         source_id="254-2023",
         source_version=version,
         source_version_id=version_id,
+        ingestion_id=ingestion_id,
         source_pdf="254-2023.pdf",
         team="254",
         year=2023,
         page=page,
         modality="text",
-        text="intake",
+        text=text,
+        ingested_at=ingested_at,
     )
 
 
 def test_revised_source_removes_superseded_pages_after_new_version_is_ready() -> None:
     client = VersionedPointClient()
     store = RagStore(Settings(EMBEDDING_DIM=1), client=client)
-    old_docs = [_versioned_doc("old", 1), _versioned_doc("old", 2)]
-    new_docs = [_versioned_doc("new", 1)]
+    old_docs = [
+        _versioned_doc("same", 1, ingestion_id="old"),
+        _versioned_doc("same", 2, ingestion_id="old"),
+    ]
+    new_docs = [_versioned_doc("same", 1, ingestion_id="new")]
 
     store.upsert(old_docs, [[0.0], [0.0]], [[0.0], [0.0]])
     store.upsert(new_docs, [[0.0]], [[0.0]])
-    store.delete_superseded_source_versions("254-2023", "new")
+    store.delete_superseded_source_generations("254-2023", "new")
 
     assert len(client.payloads) == 1
     remaining = next(iter(client.payloads.values()))
-    assert remaining["source_version"] == "new"
+    assert remaining["source_version"] == "same"
+    assert remaining["ingestion_id"] == "new"
     assert remaining["page"] == 1
+
+
+def test_failed_generation_cleanup_preserves_previous_generation() -> None:
+    client = VersionedPointClient()
+    store = RagStore(Settings(EMBEDDING_DIM=1), client=client)
+    old_doc = _versioned_doc("same", 1, ingestion_id="old")
+    failed_doc = _versioned_doc("same", 2, ingestion_id="failed")
+    store.upsert([old_doc, failed_doc], [[0.0], [0.0]], [[0.0], [0.0]])
+
+    store.delete_source_generation("254-2023", "failed")
+
+    assert len(client.payloads) == 1
+    remaining = next(iter(client.payloads.values()))
+    assert remaining["ingestion_id"] == "old"
 
 
 def test_source_summaries_do_not_mix_versions() -> None:
@@ -143,6 +178,19 @@ def test_source_summaries_do_not_mix_versions() -> None:
         "254-2023@old",
         "254-2023@new",
     }
+
+
+def test_source_summaries_do_not_mix_generations_of_the_same_version() -> None:
+    store = RagStore(Settings(), client=SimpleNamespace())
+
+    summaries = store._summarize_sources(
+        [
+            _versioned_doc("same", 1, ingestion_id="old").model_dump(),
+            _versioned_doc("same", 1, ingestion_id="new").model_dump(),
+        ]
+    )
+
+    assert {summary.ingestion_id for summary in summaries} == {"old", "new"}
 
 
 def test_source_summary_coalesces_provenance_from_all_version_payloads() -> None:
@@ -168,7 +216,7 @@ class VersionedPageClient:
             [
                 SimpleNamespace(
                     payload={
-                        **_versioned_doc("new", 1).model_dump(),
+                        **_versioned_doc("new", 1, ingestion_id="generation-new").model_dump(),
                         "id": "result-new",
                     }
                 )
@@ -177,16 +225,46 @@ class VersionedPageClient:
         )
 
 
-def test_page_context_is_scoped_to_the_result_source_version() -> None:
+def test_page_context_is_scoped_to_the_result_generation() -> None:
     client = VersionedPageClient()
     store = RagStore(Settings(), client=client)
 
-    context = store.page_context("254-2023.pdf", 1, "254-2023@new")
+    context = store.page_context("254-2023.pdf", 1, "254-2023@new", "generation-new")
 
     assert context is not None
     conditions = {condition.key: condition for condition in client.scroll_filter.must}
     assert conditions["source_version_id"].match.value == "254-2023@new"
+    assert conditions["ingestion_id"].match.value == "generation-new"
     assert context.source_version_id == "254-2023@new"
+
+
+class MixedGenerationPageClient:
+    def scroll(self, **_kwargs):
+        old = _versioned_doc(
+            "same",
+            1,
+            ingestion_id="generation-old",
+            text="old text",
+            ingested_at="2026-08-15T12:00:00+00:00",
+        ).model_dump()
+        new = _versioned_doc(
+            "same",
+            1,
+            ingestion_id="generation-new",
+            text="new text",
+            ingested_at="2026-08-16T12:00:00+00:00",
+        ).model_dump()
+        return ([SimpleNamespace(payload=old), SimpleNamespace(payload=new)], None)
+
+
+def test_versionless_page_context_uses_latest_complete_generation() -> None:
+    store = RagStore(Settings(), client=MixedGenerationPageClient())
+
+    context = store.page_context("254-2023.pdf", 1)
+
+    assert context is not None
+    assert context.ingestion_id == "generation-new"
+    assert context.text == "new text"
 
 
 class FakeQdrantClient:
@@ -300,6 +378,31 @@ def test_eligible_hit_survives_weak_page_duplicate_with_lexical_bonus() -> None:
     assert coverage.weak_pages_dropped == 0
 
 
+class SamePointMixedScoreClient:
+    def query_points(self, **kwargs):
+        if kwargs["using"] == "text":
+            hit = _hit("same-point", "254-2023.pdf", "254", 2023, 0.34)
+            hit.payload["text"] = "swerve azimuth backlash reduction module"
+        else:
+            hit = _hit("same-point", "254-2023.pdf", "254", 2023, 0.40)
+            hit.payload["text"] = "swerve module"
+        return SimpleNamespace(points=[hit])
+
+
+def test_search_gates_a_merged_point_on_its_best_raw_vector_score() -> None:
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=SamePointMixedScoreClient())
+
+    results, coverage = store.search(
+        SearchRequest(query="swerve azimuth backlash reduction module"),
+        [0.0],
+        [0.0],
+        "swerve azimuth backlash reduction module",
+    )
+
+    assert [result.id for result in results] == ["same-point"]
+    assert coverage.weak_pages_dropped == 0
+
+
 def test_find_similar_drops_hits_below_relevance_floor() -> None:
     client = FakeQdrantClient()
     client.hits = [_hit("weak", "111-2018.pdf", "111", 2018, 0.10)]
@@ -313,6 +416,9 @@ def test_find_similar_drops_hits_below_relevance_floor() -> None:
     )
 
     assert response.results == []
+    assert response.coverage.candidate_pages == 1
+    assert response.coverage.weak_pages_dropped == 1
+    assert response.coverage.returned_pages == 0
 
 
 def test_search_request_bounds_filter_cost() -> None:

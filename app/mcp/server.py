@@ -36,13 +36,13 @@ from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
     MechanismTypeFilter,
-    SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchSort,
     SimilarPagesResponse,
     SourceIdFilter,
     SourceListResponse,
+    SourceSummary,
 )
 from app.rag.search import search as rag_search
 from app.rag.store import RagStore
@@ -68,16 +68,7 @@ class RetrievalBackend(Protocol):
 
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None: ...
 
-    def list_sources(
-        self,
-        *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
-        team_numbers: list[str],
-        years: list[int],
-        source_ids: list[str],
-    ) -> SourceListResponse: ...
+    def list_sources(self) -> SourceListResponse: ...
 
     def corpus_revision(self) -> str: ...
 
@@ -123,24 +114,8 @@ class RagRetrievalBackend:
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
         return self._store.similar_from_result_id(result_id, top_k)
 
-    def list_sources(
-        self,
-        *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
-        team_numbers: list[str],
-        years: list[int],
-        source_ids: list[str],
-    ) -> SourceListResponse:
-        return self._store.list_sources(
-            team=team,
-            year=year,
-            source=source,
-            team_numbers=team_numbers,
-            years=years,
-            source_ids=source_ids,
-        )
+    def list_sources(self) -> SourceListResponse:
+        return self._store.list_sources()
 
 
 def create_mcp_server(
@@ -258,10 +233,7 @@ def create_mcp_server(
             sort=filters.sort,
         )
         cache_key = f"{retrieval.corpus_revision()}:{request.model_dump_json()}"
-        response = search_cache.get(cache_key)
-        if response is None:
-            response = retrieval.search(request)
-            search_cache.put(cache_key, response)
+        response = search_cache.get_or_compute(cache_key, lambda: retrieval.search(request))
         return search_output(
             response,
             public_base_url,
@@ -384,11 +356,7 @@ def create_mcp_server(
             SearchResponse(
                 query="",
                 results=response.results,
-                coverage=SearchCoverage(
-                    candidate_pages=len(response.results),
-                    candidate_sources=len({result.source_id for result in response.results}),
-                    returned_pages=len(response.results),
-                ),
+                coverage=response.coverage,
                 abstention_reason=(
                     None
                     if response.results
@@ -460,41 +428,53 @@ def create_mcp_server(
         normalized_years = list(dict.fromkeys(years or []))
         normalized_source_ids = list(dict.fromkeys(source_ids or []))
         normalized_source_query = source_query.strip() if source_query else None
-        cache_key = repr(
-            (
-                retrieval.corpus_revision(),
-                team,
-                year,
-                source,
-                teams,
-                normalized_years,
-                normalized_source_ids,
-            )
+        response = source_cache.get_or_compute(
+            retrieval.corpus_revision(),
+            retrieval.list_sources,
         )
-        response = source_cache.get(cache_key)
-        if response is None:
-            response = retrieval.list_sources(
-                team=team,
-                year=year,
-                source=source,
-                team_numbers=teams,
-                years=normalized_years,
-                source_ids=normalized_source_ids,
-            )
-            source_cache.put(cache_key, response)
-        sources = response.sources
-        if normalized_source_query:
-            needle = normalized_source_query.casefold()
-            sources = [
-                item
-                for item in sources
-                if needle in item.source_id.casefold()
-                or needle in item.source_pdf.casefold()
-                or needle in item.source_version_id.casefold()
-            ]
+        sources = _filter_sources(
+            response.sources,
+            team=team,
+            year=year,
+            source=source,
+            team_numbers=teams,
+            years=normalized_years,
+            source_ids=normalized_source_ids,
+            source_query=normalized_source_query,
+        )
         return source_output(sources[:limit], public_base_url)
 
     return server
+
+
+def _filter_sources(
+    sources: list[SourceSummary],
+    *,
+    team: str | None,
+    year: int | None,
+    source: str | None,
+    team_numbers: list[str],
+    years: list[int],
+    source_ids: list[str],
+    source_query: str | None,
+) -> list[SourceSummary]:
+    needle = source_query.casefold() if source_query else None
+    return [
+        item
+        for item in sources
+        if (team is None or item.team == team)
+        and (year is None or item.year == year)
+        and (source is None or item.source_pdf == source)
+        and (not team_numbers or item.team in team_numbers)
+        and (not years or item.year in years)
+        and (not source_ids or item.source_id in source_ids)
+        and (
+            needle is None
+            or needle in item.source_id.casefold()
+            or needle in item.source_pdf.casefold()
+            or needle in item.source_version_id.casefold()
+        )
+    ]
 
 
 def create_mcp_http_app(server: MCPServer, settings: Settings) -> ASGIApp:

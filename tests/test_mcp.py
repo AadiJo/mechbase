@@ -48,7 +48,7 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
-        self.list_source_calls: list[dict[str, object]] = []
+        self.list_source_calls = 0
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -74,6 +74,7 @@ class FakeRetrievalBackend:
             source_id="254-2020",
             source_version="version-a",
             source_version_id="254-2020@version-a",
+            ingestion_id="ingestion-a",
             source_pdf="254-2020.pdf",
             team="254",
             year=2020,
@@ -91,50 +92,46 @@ class FakeRetrievalBackend:
         return SimilarPagesResponse(
             seed={"id": result_id},
             results=[_search_result("result_2", 8)][:top_k],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
         )
 
-    def list_sources(
-        self,
-        *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
-        team_numbers: list[str],
-        years: list[int],
-        source_ids: list[str],
-    ) -> SourceListResponse:
-        self.list_source_calls.append(
-            {
-                "team": team,
-                "year": year,
-                "source": source,
-                "team_numbers": team_numbers,
-                "years": years,
-                "source_ids": source_ids,
-            }
-        )
-        resolved_team = team or next(iter(team_numbers), None) or "254"
-        resolved_year = year or next(iter(years), None) or 2020
-        resolved_source = source or (f"{source_ids[0]}.pdf" if source_ids else "254-2020.pdf")
+    def list_sources(self) -> SourceListResponse:
+        self.list_source_calls += 1
         return SourceListResponse(
             sources=[
                 SourceSummary(
-                    source_id=(
-                        source_ids[0] if source_ids else resolved_source.removesuffix(".pdf")
-                    ),
-                    source_version_id=(
-                        source_ids[0] if source_ids else resolved_source.removesuffix(".pdf")
-                    ),
-                    source_pdf=resolved_source,
-                    team=resolved_team,
-                    year=resolved_year,
+                    source_id="254-2020",
+                    source_version="version-a",
+                    source_version_id="254-2020@version-a",
+                    ingestion_id="ingestion-a",
+                    source_pdf="254-2020.pdf",
+                    team="254",
+                    year=2020,
                     pages=[1, 12],
                     page_count=2,
                     text_count=3,
                     page_image_count=2,
                     extracted_image_count=1,
                     sample_image_urls=["/images/254-2020/page-012/page.png"],
-                )
+                ),
+                SourceSummary(
+                    source_id="4414-2024",
+                    source_version="version-b",
+                    source_version_id="4414-2024@version-b",
+                    ingestion_id="ingestion-b",
+                    source_pdf="4414-2024.pdf",
+                    team="4414",
+                    year=2024,
+                    pages=[4],
+                    page_count=1,
+                    text_count=1,
+                    page_image_count=1,
+                    extracted_image_count=0,
+                ),
             ]
         )
 
@@ -147,6 +144,7 @@ def _search_result(result_id: str, page: int) -> SearchResult:
         source_id="254-2020",
         source_version="version-a",
         source_version_id="254-2020@version-a",
+        ingestion_id="ingestion-a",
         source_pdf="254-2020.pdf",
         team="254",
         year=2020,
@@ -397,6 +395,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "source_id": "254-2020",
                                     "source_version": "version-a",
                                     "source_version_id": "254-2020@version-a",
+                                    "ingestion_id": "ingestion-a",
                                     "source_pdf": "254-2020.pdf",
                                     "team": "254",
                                     "year": 2020,
@@ -542,7 +541,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert sources.structured_content["sources"][0]["source_id"] == "254-2020"
                         assert (
                             sources.structured_content["sources"][0]["source_version_id"]
-                            == "254-2020"
+                            == "254-2020@version-a"
                         )
                         assert sources.structured_content["coverage_found"] is True
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
@@ -555,14 +554,14 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         cached_sources = await session.call_tool("list_sources", {"team": "254"})
                         assert cached_sources.is_error is False
-                        assert len(backend.list_source_calls) == 1
+                        assert backend.list_source_calls == 1
                         queried_sources = await session.call_tool(
                             "list_sources",
                             {"team": "254", "source_query": "2020"},
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 1
+                        assert backend.list_source_calls == 1
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -576,14 +575,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert backend.list_source_calls[-1] == {
-                            "team": None,
-                            "year": None,
-                            "source": None,
-                            "team_numbers": ["4414"],
-                            "years": [2024],
-                            "source_ids": ["4414-2024"],
-                        }
+                        assert backend.list_source_calls == 1
 
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}
