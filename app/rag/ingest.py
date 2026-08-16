@@ -179,17 +179,27 @@ def ingest_sources(
             except BaseException:
                 if not committed:
                     try:
-                        store.delete_source_generation(source.source_id, ingestion_id)
-                    except BaseException as cleanup_error:
-                        print(
-                            f"Could not remove failed generation {ingestion_id}: {cleanup_error}",
-                            flush=True,
+                        pointer_committed = (
+                            store.active_generations().get(source.source_id) == ingestion_id
                         )
-                    remove_artifact_generation(
-                        settings.artifact_dir,
-                        source.source_id,
-                        artifact_namespace,
-                    )
+                    except BaseException:
+                        # A failed directory fsync may still follow a successful pointer rename.
+                        # Preserve the generation unless rollback is known to be safe.
+                        pointer_committed = True
+                    if not pointer_committed:
+                        try:
+                            store.delete_source_generation(source.source_id, ingestion_id)
+                        except BaseException as cleanup_error:
+                            print(
+                                f"Could not remove failed generation {ingestion_id}: "
+                                f"{cleanup_error}",
+                                flush=True,
+                            )
+                        remove_artifact_generation(
+                            settings.artifact_dir,
+                            source.source_id,
+                            artifact_namespace,
+                        )
                 raise
 
             store.retire_superseded_source_generations(

@@ -221,6 +221,80 @@ def test_committed_generation_stays_authoritative_when_retirement_fails(
     assert completed_sources(tmp_path / "ingestion-manifest.jsonl") == {}
 
 
+def test_generation_survives_an_error_after_the_active_pointer_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "254-2025.pdf"
+    source_path.write_bytes(b"binder")
+    source = SourceDoc(
+        path=source_path,
+        team="254",
+        year=2025,
+        source_id="254-2025",
+        source_version="content",
+        source_version_id="254-2025@content",
+    )
+    document = RagDocument(
+        id="result",
+        storage_id="result@new",
+        source_id=source.source_id,
+        source_version=source.source_version,
+        source_version_id=source.source_version_id,
+        source_pdf=source_path.name,
+        team="254",
+        year=2025,
+        page=1,
+        modality="text",
+        text="intake",
+        is_staged=True,
+    )
+
+    class RenameFailureStore:
+        def __init__(self) -> None:
+            self.active = {source.source_id: "old"}
+            self.failed_generation_deleted = False
+
+        def initialize_active_generation(self, _source_id: str) -> None:
+            pass
+
+        def active_generations(self) -> dict[str, str]:
+            return self.active.copy()
+
+        def upsert(self, docs, text_vectors, image_vectors) -> None:
+            assert docs and text_vectors and image_vectors
+
+        def publish_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            pass
+
+        def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
+            self.active[source_id] = ingestion_id
+            raise OSError("directory fsync failed")
+
+        def delete_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            self.failed_generation_deleted = True
+
+    class FakeEmbedder:
+        def embed_texts(self, texts, input_type):
+            return [[1.0] for _text in texts]
+
+    store = RenameFailureStore()
+    monkeypatch.setattr("app.rag.ingest.extract_documents", lambda *_args, **_kwargs: [document])
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        ingest_sources(
+            [source],
+            batch_size=1,
+            force=True,
+            settings=Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1),
+            store=store,
+            embedder=FakeEmbedder(),
+        )
+
+    assert store.active[source.source_id] != "old"
+    assert store.failed_generation_deleted is False
+
+
 def test_iter_pdfs_rejects_non_http_source_urls(tmp_path: Path) -> None:
     pdf = tmp_path / "254-2025.pdf"
     pdf.touch()

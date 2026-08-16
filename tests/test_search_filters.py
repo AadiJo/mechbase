@@ -295,6 +295,50 @@ def test_staged_generation_is_hidden_from_source_and_page_reads(tmp_path: Path) 
     client.close()
 
 
+def test_search_filter_excludes_superseded_published_generations(tmp_path: Path) -> None:
+    client = QdrantClient(":memory:")
+    vector_params = models.VectorParams(size=1, distance=models.Distance.COSINE)
+    client.create_collection(
+        collection_name="frc_mechanisms",
+        vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
+    )
+    store = RagStore(Settings(EMBEDDING_DIM=1, ARTIFACT_DIR=tmp_path), client=client)
+    old = _versioned_doc("same", 1, ingestion_id="old", text="old intake")
+    current = _versioned_doc("same", 2, ingestion_id="current", text="current intake")
+    store.upsert([old, current], [[1.0], [1.0]], [[1.0], [1.0]])
+    store.set_active_generation("254-2023", "current")
+
+    results, _coverage = store.search(
+        SearchRequest(query="intake", top_k=1),
+        [1.0],
+        [1.0],
+        "intake",
+    )
+
+    assert [(result.ingestion_id, result.page) for result in results] == [("current", 2)]
+    client.close()
+
+
+def test_read_retries_when_active_generation_changes_mid_query(tmp_path: Path) -> None:
+    store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=SimpleNamespace())
+    snapshots = iter(
+        [
+            {"254-2023": "old"},
+            {"254-2023": "new"},
+            {"254-2023": "new"},
+            {"254-2023": "new"},
+        ]
+    )
+    store.active_generations = lambda: next(snapshots)  # type: ignore[method-assign]
+    reads: list[dict[str, str]] = []
+
+    value, active = store._read_with_active_snapshot(lambda snapshot: reads.append(snapshot) or 1)
+
+    assert value == 1
+    assert active == {"254-2023": "new"}
+    assert reads == [{"254-2023": "old"}, {"254-2023": "new"}]
+
+
 def test_source_summaries_do_not_mix_versions() -> None:
     store = RagStore(Settings(), client=SimpleNamespace())
 
