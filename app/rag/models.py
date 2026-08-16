@@ -41,6 +41,7 @@ class RagDocument(BaseModel):
     year: int | None = None
     page: int
     modality: Modality
+    chunk_index: int | None = None
     text: str = ""
     artifact_path: str | None = None
     linked_artifacts: list[str] = Field(default_factory=list)

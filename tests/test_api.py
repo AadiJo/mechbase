@@ -185,3 +185,21 @@ def test_search_accepts_valid_key_and_records_usage(monkeypatch) -> None:
     }
     assert recorded["context"].api_key_id == "api_key_test"
     assert recorded["status_code"] == 200
+
+
+def test_similar_rejects_unbounded_result_windows(monkeypatch) -> None:
+    def fake_validate_mechbase_api_key(value, settings=None):
+        return ApiKeyContext(
+            api_key_id="api_key_test",
+            organization_id="workspace_test",
+            permissions=("search:read",),
+        )
+
+    monkeypatch.setattr(auth, "validate_mechbase_api_key", fake_validate_mechbase_api_key)
+    response = TestClient(app).get(
+        "/similar",
+        params={"result_id": "result", "top_k": 1_000_000},
+        headers={"Authorization": "Bearer sk_test"},
+    )
+
+    assert response.status_code == 422

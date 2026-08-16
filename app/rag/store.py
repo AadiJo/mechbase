@@ -1,6 +1,9 @@
+import json
+import os
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 from uuid import NAMESPACE_URL, uuid5
@@ -24,6 +27,9 @@ from app.rag.models import (
 
 TEXT_VECTOR = "text"
 IMAGE_VECTOR = "image"
+MAX_RETRIEVAL_PAGES = 20
+ACTIVE_GENERATIONS_FILE = "active-generations.json"
+LEGACY_GENERATION = "__legacy__"
 SOURCE_SUMMARY_FIELDS = [
     "source_id",
     "source_version",
@@ -112,24 +118,72 @@ class RagStore:
     def corpus_revision(self) -> str:
         self.client.get_collection(self.settings.collection_name)
         manifest_path = self.settings.artifact_dir / "ingestion-manifest.jsonl"
-        revision_path = self.settings.artifact_dir / "corpus-revision"
+        active_path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
         try:
             manifest = manifest_path.stat()
             manifest_revision = f"{manifest.st_mtime_ns}:{manifest.st_size}"
         except FileNotFoundError:
             manifest_revision = "missing"
         try:
-            ingestion_revision = revision_path.read_text(encoding="utf-8").strip()
+            active_revision = sha256(active_path.read_bytes()).hexdigest()[:16]
         except FileNotFoundError:
-            ingestion_revision = "missing"
-        return f"{manifest_revision}:{ingestion_revision}"
+            active_revision = "missing"
+        return f"{manifest_revision}:{active_revision}"
 
-    def mark_corpus_revision(self, ingestion_id: str) -> None:
-        revision_path = self.settings.artifact_dir / "corpus-revision"
-        revision_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = revision_path.with_name(f".{revision_path.name}.{ingestion_id}.tmp")
-        temporary_path.write_text(ingestion_id, encoding="utf-8")
-        temporary_path.replace(revision_path)
+    def active_generations(self) -> dict[str, str]:
+        path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(raw, dict) or not all(
+            isinstance(source_id, str) and isinstance(ingestion_id, str)
+            for source_id, ingestion_id in raw.items()
+        ):
+            raise ValueError(f"{path} must contain a string-to-string JSON object.")
+        return raw
+
+    def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
+        active = self.active_generations()
+        active[source_id] = ingestion_id
+        path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f".{path.name}.{ingestion_id}.tmp")
+        with temporary_path.open("w", encoding="utf-8") as output:
+            json.dump(active, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def initialize_active_generation(self, source_id: str) -> None:
+        active = self.active_generations()
+        if source_id in active:
+            return
+        payloads = self._scroll_payloads(
+            _active_filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    )
+                ]
+            ),
+            limit=None,
+        )
+        if payloads:
+            generation = _latest_generation(payloads)
+            current_payload = next(
+                payload for payload in payloads if _generation_key(payload) == generation
+            )
+            ingestion_id = current_payload.get("ingestion_id") or LEGACY_GENERATION
+        else:
+            ingestion_id = LEGACY_GENERATION
+        self.set_active_generation(source_id, str(ingestion_id))
 
     def upsert(
         self,
@@ -216,6 +270,31 @@ class RagStore:
             wait=True,
         )
 
+    def retire_superseded_source_generations(
+        self,
+        source_id: str,
+        ingestion_id: str,
+    ) -> None:
+        self.client.set_payload(
+            collection_name=self.settings.collection_name,
+            payload={"is_staged": True},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    )
+                ],
+                must_not=[
+                    models.FieldCondition(
+                        key="ingestion_id",
+                        match=models.MatchValue(value=ingestion_id),
+                    )
+                ],
+            ),
+            wait=True,
+        )
+
     def search(
         self,
         request: SearchRequest,
@@ -242,10 +321,13 @@ class RagStore:
             with_payload=True,
         ).points
         merged: dict[str, tuple[float, dict, dict]] = {}
+        active_generations = self.active_generations()
         for source, hits in [("text", text_hits), ("image", image_hits)]:
             for hit in hits:
                 point_id = str(hit.id)
                 payload = dict(hit.payload or {})
+                if not _is_current_generation(payload, active_generations):
+                    continue
                 lexical = _lexical_bonus(expanded_query, payload.get("text", ""))
                 vector_score = float(hit.score)
                 score = vector_score + lexical
@@ -347,6 +429,10 @@ class RagStore:
             _active_filter(must=conditions),
             limit=None,
         )
+        active_generations = self.active_generations()
+        payloads = [
+            payload for payload in payloads if _is_current_generation(payload, active_generations)
+        ]
         if not payloads:
             return None
         if ingestion_id is None:
@@ -404,15 +490,20 @@ class RagStore:
         source_ids: list[str] | None = None,
         source_query: str | None = None,
     ) -> SourceListResponse:
-        payloads = self._iter_source_payloads(
-            _metadata_filter(
-                team=team,
-                year=year,
-                source=source,
-                team_numbers=team_numbers,
-                years=years,
-                source_ids=source_ids,
+        active_generations = self.active_generations()
+        payloads = (
+            payload
+            for payload in self._iter_source_payloads(
+                _metadata_filter(
+                    team=team,
+                    year=year,
+                    source=source,
+                    team_numbers=team_numbers,
+                    years=years,
+                    source_ids=source_ids,
+                )
             )
+            if _is_current_generation(payload, active_generations)
         )
         summaries = _latest_source_summaries(self._summarize_sources(payloads))
         if source_query:
@@ -427,7 +518,12 @@ class RagStore:
         return SourceListResponse(sources=summaries)
 
     def source_summary(self, source_pdf: str) -> SourceSummary | None:
-        payloads = self._iter_source_payloads(_metadata_filter(source=source_pdf))
+        active_generations = self.active_generations()
+        payloads = (
+            payload
+            for payload in self._iter_source_payloads(_metadata_filter(source=source_pdf))
+            if _is_current_generation(payload, active_generations)
+        )
         summaries = self._summarize_sources(payloads)
         return (
             max(
@@ -499,9 +595,17 @@ class RagStore:
                     models.FieldCondition(key="modality", match=models.MatchValue(value="text")),
                 ]
             ),
-            limit=1,
+            limit=None,
             with_vectors=True,
         )
+        if not payloads:
+            return None
+        active_generations = self.active_generations()
+        payloads = [
+            (payload, vectors)
+            for payload, vectors in payloads
+            if _is_current_generation(payload, active_generations)
+        ]
         if not payloads:
             return None
         payload, vectors = payloads[0]
@@ -532,9 +636,17 @@ class RagStore:
                             ),
                         ]
                     ),
-                    limit=1,
+                    limit=None,
                 )
-                payload = payloads[0] if payloads else None
+                active_generations = self.active_generations()
+                payload = next(
+                    (
+                        candidate
+                        for candidate in payloads
+                        if _is_current_generation(candidate, active_generations)
+                    ),
+                    None,
+                )
         if payload is None:
             return None
         source_pdf = payload.get("source_pdf", "")
@@ -571,6 +683,7 @@ class RagStore:
         top_k: int,
         seed_payload: dict,
     ) -> SimilarPagesResponse:
+        top_k = min(max(top_k, 1), MAX_RETRIEVAL_PAGES)
         limit = max(top_k * 12, 60)
         hits = self.client.query_points(
             collection_name=self.settings.collection_name,
@@ -586,8 +699,11 @@ class RagStore:
         relevant_pages: set[tuple[str, int]] = set()
         seen_pages: set[tuple[str, int]] = set()
         seed_page = _page_key(seed_payload)
+        active_generations = self.active_generations()
         for hit in hits:
             payload = dict(hit.payload or {})
+            if not _is_current_generation(payload, active_generations):
+                continue
             page_key = _page_key(payload)
             if page_key == seed_page:
                 continue
@@ -687,6 +803,14 @@ class RagStore:
             limit=None,
             with_vectors=True,
         )
+        if not matches:
+            return None, None
+        active_generations = self.active_generations()
+        matches = [
+            (payload, vectors)
+            for payload, vectors in matches
+            if _is_current_generation(payload, active_generations)
+        ]
         if not matches:
             return None, None
         latest_generation = _latest_generation(payload for payload, _vectors in matches)
@@ -948,6 +1072,9 @@ def _score_band(score: float, minimum: float) -> ScoreBand:
 
 
 def _chunk_sort_key(payload: dict) -> tuple[int, str]:
+    chunk_index = payload.get("chunk_index")
+    if isinstance(chunk_index, int):
+        return chunk_index, str(payload.get("id", ""))
     match = re.search(r"_text_(\d+)$", str(payload.get("id", "")))
     return (int(match.group(1)) if match else 0, str(payload.get("id", "")))
 
@@ -962,6 +1089,16 @@ def _generation_key(payload: dict) -> str:
         or payload.get("source_version_id")
         or payload.get("source_pdf", "")
     )
+
+
+def _is_current_generation(payload: dict, active_generations: dict[str, str]) -> bool:
+    source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+    active_ingestion = active_generations.get(source_id)
+    if active_ingestion is None:
+        return True
+    if active_ingestion == LEGACY_GENERATION:
+        return payload.get("ingestion_id") is None
+    return payload.get("ingestion_id") == active_ingestion
 
 
 def _latest_generation(payloads: Iterable[dict]) -> str:

@@ -1,3 +1,5 @@
+import json
+from hashlib import sha256
 from pathlib import Path
 
 import fitz
@@ -10,8 +12,22 @@ from app.rag.config import Settings
 from app.rag.models import RagDocument, SourceDoc
 
 
-def _safe_id(*parts: object) -> str:
-    return "_".join(str(part).replace("/", "_").replace(" ", "_") for part in parts)
+def _document_id(
+    source_version_id: str,
+    page: int,
+    modality: str,
+    index: int | None = None,
+) -> str:
+    identity = json.dumps(
+        [source_version_id, page, modality, index],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return f"doc_{sha256(identity).hexdigest()}"
+
+
+def _storage_id(document_id: str, ingestion_id: str | None) -> str:
+    return f"{document_id}@{ingestion_id}" if ingestion_id else document_id
 
 
 def _render_page(page: fitz.Page, dpi: int, out_path: Path) -> Path:
@@ -61,7 +77,6 @@ def extract_documents(
                 source,
                 page_num,
                 page_text,
-                document_namespace,
                 ingestion_id,
             )
             linked_artifacts.extend(
@@ -70,10 +85,11 @@ def extract_documents(
             docs.extend(extracted_images)
 
             section = section_from_text(page_text)
+            page_document_id = _document_id(source.source_version_id, page_num, "page")
             docs.append(
                 RagDocument(
-                    id=_safe_id(source.source_version_id, page_num, "page"),
-                    storage_id=_safe_id(document_namespace, page_num, "page"),
+                    id=page_document_id,
+                    storage_id=_storage_id(page_document_id, ingestion_id),
                     source_id=source.source_id,
                     source_version=source.source_version,
                     source_version_id=source.source_version_id,
@@ -94,10 +110,16 @@ def extract_documents(
             for chunk_idx, chunk in enumerate(
                 split_text(page_text, settings.chunk_target_chars, settings.chunk_overlap_chars)
             ):
+                text_document_id = _document_id(
+                    source.source_version_id,
+                    page_num,
+                    "text",
+                    chunk_idx,
+                )
                 docs.append(
                     RagDocument(
-                        id=_safe_id(source.source_version_id, page_num, "text", chunk_idx),
-                        storage_id=_safe_id(document_namespace, page_num, "text", chunk_idx),
+                        id=text_document_id,
+                        storage_id=_storage_id(text_document_id, ingestion_id),
                         source_id=source.source_id,
                         source_version=source.source_version,
                         source_version_id=source.source_version_id,
@@ -108,6 +130,7 @@ def extract_documents(
                         year=source.year,
                         page=page_num,
                         modality="text",
+                        chunk_index=chunk_idx,
                         text=chunk,
                         linked_artifacts=linked_artifacts,
                         section=section,
@@ -126,7 +149,6 @@ def _extract_page_images(
     source: SourceDoc,
     page_num: int,
     page_text: str,
-    document_namespace: str,
     ingestion_id: str | None,
 ) -> list[RagDocument]:
     docs: list[RagDocument] = []
@@ -149,10 +171,16 @@ def _extract_page_images(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         if not out_path.exists():
             out_path.write_bytes(image["image"])
+        image_document_id = _document_id(
+            source.source_version_id,
+            page_num,
+            "image",
+            image_idx,
+        )
         docs.append(
             RagDocument(
-                id=_safe_id(source.source_version_id, page_num, "image", image_idx),
-                storage_id=_safe_id(document_namespace, page_num, "image", image_idx),
+                id=image_document_id,
+                storage_id=_storage_id(image_document_id, ingestion_id),
                 source_id=source.source_id,
                 source_version=source.source_version,
                 source_version_id=source.source_version_id,

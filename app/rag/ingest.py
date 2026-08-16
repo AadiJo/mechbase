@@ -1,6 +1,9 @@
 import argparse
+import fcntl
 import json
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from itertools import islice
@@ -113,31 +116,32 @@ def remove_artifact_generation(artifact_dir: Path, source_id: str, namespace: st
     shutil.rmtree(target)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest FRC binder PDFs into Qdrant.")
-    parser.add_argument("--data-dir", default=None)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument(
-        "--force", action="store_true", help="Reingest sources even if manifest says done."
-    )
-    args = parser.parse_args()
+@contextmanager
+def ingestion_lock(artifact_dir: Path) -> Iterator[None]:
+    lock_path = artifact_dir / "ingestion.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Another ingestion process is already running.") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    settings = get_settings()
-    data_dir = (
-        settings.data_dir if args.data_dir is None else settings.data_dir.__class__(args.data_dir)
-    )
-    sources = iter_pdfs(data_dir)
-    if args.limit:
-        sources = list(islice(sources, args.limit))
 
-    store = RagStore(settings)
-    store.ensure_collection()
-    embedder = VoyageEmbedder(settings)
-
-    settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+def ingest_sources(
+    sources: list[SourceDoc],
+    *,
+    batch_size: int,
+    force: bool,
+    settings: Settings,
+    store: RagStore,
+    embedder: VoyageEmbedder,
+) -> None:
     manifest_path = settings.artifact_dir / "ingestion-manifest.jsonl"
-    completed = {} if args.force else completed_sources(manifest_path)
+    completed = {} if force else completed_sources(manifest_path)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         for source in sources:
             fingerprint = ingestion_fingerprint(source, settings)
@@ -145,8 +149,10 @@ def main() -> None:
                 print(f"Skipping {source.path.name}; already in manifest.", flush=True)
                 continue
             print(f"Ingesting {source.path.name}...", flush=True)
+            store.initialize_active_generation(source.source_id)
             ingestion_id = uuid4().hex
             artifact_namespace = generation_namespace(source.source_version, ingestion_id)
+            committed = False
             try:
                 docs = extract_documents(source, settings, ingestion_id=ingestion_id)
                 if not docs:
@@ -159,7 +165,7 @@ def main() -> None:
                     f"Extracted {len(docs)} retrieval objects from {source.path.name}.",
                     flush=True,
                 )
-                for batch_idx, batch in enumerate(batched(docs, args.batch_size), start=1):
+                for batch_idx, batch in enumerate(batched(docs, batch_size), start=1):
                     print(f"  embedding text batch {batch_idx} ({len(batch)} objects)", flush=True)
                     text_vectors = embedder.embed_texts(
                         [doc.text or doc.source_pdf for doc in batch], "document"
@@ -168,21 +174,28 @@ def main() -> None:
                     store.upsert(batch, text_vectors, image_vectors)
                     print(f"  upserted batch {batch_idx}", flush=True)
                 store.publish_source_generation(source.source_id, ingestion_id)
+                store.set_active_generation(source.source_id, ingestion_id)
+                committed = True
             except BaseException:
-                try:
-                    store.delete_source_generation(source.source_id, ingestion_id)
-                except BaseException as cleanup_error:
-                    print(
-                        f"Could not remove failed generation {ingestion_id}: {cleanup_error}",
-                        flush=True,
+                if not committed:
+                    try:
+                        store.delete_source_generation(source.source_id, ingestion_id)
+                    except BaseException as cleanup_error:
+                        print(
+                            f"Could not remove failed generation {ingestion_id}: {cleanup_error}",
+                            flush=True,
+                        )
+                    remove_artifact_generation(
+                        settings.artifact_dir,
+                        source.source_id,
+                        artifact_namespace,
                     )
-                remove_artifact_generation(
-                    settings.artifact_dir,
-                    source.source_id,
-                    artifact_namespace,
-                )
                 raise
-            store.mark_corpus_revision(ingestion_id)
+
+            store.retire_superseded_source_generations(
+                source.source_id,
+                ingestion_id,
+            )
             store.delete_superseded_source_generations(
                 source.source_id,
                 ingestion_id,
@@ -207,6 +220,40 @@ def main() -> None:
             )
             manifest.flush()
             print(f"Indexed {len(docs)} documents from {source.path.name}.", flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingest FRC binder PDFs into Qdrant.")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--force", action="store_true", help="Reingest sources even if manifest says done."
+    )
+    args = parser.parse_args()
+
+    settings = get_settings()
+    data_dir = (
+        settings.data_dir if args.data_dir is None else settings.data_dir.__class__(args.data_dir)
+    )
+    sources = iter_pdfs(data_dir)
+    if args.limit:
+        sources = list(islice(sources, args.limit))
+
+    store = RagStore(settings)
+    store.ensure_collection()
+    embedder = VoyageEmbedder(settings)
+
+    settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+    with ingestion_lock(settings.artifact_dir):
+        ingest_sources(
+            sources,
+            batch_size=args.batch_size,
+            force=args.force,
+            settings=settings,
+            store=store,
+            embedder=embedder,
+        )
 
 
 if __name__ == "__main__":

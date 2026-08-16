@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlencode
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import RedirectResponse
 
@@ -201,7 +201,7 @@ def similar_pages(
     result_id: str | None = None,
     source_pdf: str | None = None,
     page: int | None = None,
-    top_k: int = 10,
+    top_k: int = Query(default=10, ge=1, le=20),
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> SimilarPagesResponse:
     store = RagStore(get_settings())

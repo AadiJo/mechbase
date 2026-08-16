@@ -10,6 +10,7 @@ from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SearchRequest
+from app.rag.pdf import _document_id
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
 
 
@@ -30,6 +31,14 @@ def test_build_filter_uses_exact_multi_value_metadata_filters() -> None:
     assert conditions["source_id"].match.any == ["254-2023", "4414-2024"]
     assert qfilter.must_not[0].key == "is_staged"
     assert qfilter.must_not[0].match.value is True
+
+
+def test_public_document_ids_preserve_exact_source_identity() -> None:
+    spaced = _document_id("foo bar@same-content", 1, "text", 0)
+    underscored = _document_id("foo_bar@same-content", 1, "text", 0)
+
+    assert spaced != underscored
+    assert spaced == _document_id("foo bar@same-content", 1, "text", 0)
 
 
 def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
@@ -132,7 +141,7 @@ def test_corpus_revision_ignores_optimizer_progress_and_tracks_generation_commit
 
     assert store.corpus_revision() == baseline
 
-    store.mark_corpus_revision("generation-new")
+    store.set_active_generation("254-2023", "generation-new")
 
     assert store.corpus_revision() != baseline
 
@@ -245,14 +254,14 @@ def test_generation_is_published_only_by_an_explicit_commit() -> None:
     assert published["is_staged"] is False
 
 
-def test_staged_generation_is_hidden_from_source_and_page_reads() -> None:
+def test_staged_generation_is_hidden_from_source_and_page_reads(tmp_path: Path) -> None:
     client = QdrantClient(":memory:")
     vector_params = models.VectorParams(size=1, distance=models.Distance.COSINE)
     client.create_collection(
         collection_name="frc_mechanisms",
         vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
     )
-    store = RagStore(Settings(EMBEDDING_DIM=1), client=client)
+    store = RagStore(Settings(EMBEDDING_DIM=1, ARTIFACT_DIR=tmp_path), client=client)
     active = _versioned_doc(
         "same",
         1,
@@ -266,11 +275,23 @@ def test_staged_generation_is_hidden_from_source_and_page_reads() -> None:
         ingested_at="2026-08-16T12:00:00+00:00",
     ).model_copy(update={"is_staged": True})
     store.upsert([active, staged], [[1.0], [1.0]], [[1.0], [1.0]])
+    store.initialize_active_generation("254-2023")
 
     summaries = store.list_sources().sources
 
+    assert store.active_generations()["254-2023"] == "active"
     assert [summary.pages for summary in summaries] == [[1]]
     assert store.page_context("254-2023.pdf", 2) is None
+
+    store.publish_source_generation("254-2023", "staged")
+
+    assert [summary.pages for summary in store.list_sources().sources] == [[1]]
+
+    store.set_active_generation("254-2023", "staged")
+
+    assert [summary.pages for summary in store.list_sources().sources] == [[2]]
+    assert store.page_context("254-2023.pdf", 1) is None
+    assert store.page_context("254-2023.pdf", 2) is not None
     client.close()
 
 

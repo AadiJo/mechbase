@@ -7,10 +7,13 @@ from app.rag.artifacts import source_artifact_root
 from app.rag.config import Settings
 from app.rag.ingest import (
     completed_sources,
+    ingest_sources,
     ingestion_fingerprint,
+    ingestion_lock,
     remove_artifact_generation,
     remove_superseded_artifacts,
 )
+from app.rag.models import RagDocument, SourceDoc
 from app.rag.sources import iter_pdfs, parse_source
 
 
@@ -130,6 +133,92 @@ def test_artifact_cleanup_cannot_cross_source_id_prefixes(tmp_path: Path) -> Non
     assert (first_root / "current").is_dir()
     assert not (first_root / "old").exists()
     assert (prefixed_root / "other-source").is_dir()
+
+
+def test_ingestion_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
+    with (
+        ingestion_lock(tmp_path),
+        pytest.raises(RuntimeError, match="already running"),
+        ingestion_lock(tmp_path),
+    ):
+        pass
+
+
+def test_committed_generation_stays_authoritative_when_retirement_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "254-2025.pdf"
+    source_path.write_bytes(b"binder")
+    source = SourceDoc(
+        path=source_path,
+        team="254",
+        year=2025,
+        source_id="254-2025",
+        source_version="content",
+        source_version_id="254-2025@content",
+    )
+    document = RagDocument(
+        id="result",
+        storage_id="result@new",
+        source_id=source.source_id,
+        source_version=source.source_version,
+        source_version_id=source.source_version_id,
+        source_pdf=source_path.name,
+        team="254",
+        year=2025,
+        page=1,
+        modality="text",
+        text="intake",
+        is_staged=True,
+    )
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.active: dict[str, str] = {}
+            self.failed_generation_deleted = False
+
+        def initialize_active_generation(self, source_id: str) -> None:
+            self.active[source_id] = "old"
+
+        def upsert(self, docs, text_vectors, image_vectors) -> None:
+            assert docs and text_vectors and image_vectors
+
+        def publish_source_generation(self, source_id: str, ingestion_id: str) -> None:
+            pass
+
+        def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
+            self.active[source_id] = ingestion_id
+
+        def delete_source_generation(self, source_id: str, ingestion_id: str) -> None:
+            self.failed_generation_deleted = True
+
+        def retire_superseded_source_generations(self, source_id: str, ingestion_id: str) -> None:
+            pass
+
+        def delete_superseded_source_generations(self, source_id: str, ingestion_id: str) -> None:
+            raise RuntimeError("retirement failed")
+
+    class FakeEmbedder:
+        def embed_texts(self, texts, input_type):
+            return [[1.0] for _text in texts]
+
+    store = FakeStore()
+    monkeypatch.setattr("app.rag.ingest.extract_documents", lambda *_args, **_kwargs: [document])
+
+    with pytest.raises(RuntimeError, match="retirement failed"):
+        ingest_sources(
+            [source],
+            batch_size=1,
+            force=True,
+            settings=Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1),
+            store=store,
+            embedder=FakeEmbedder(),
+        )
+
+    assert store.active[source.source_id] != "old"
+    assert store.failed_generation_deleted is False
+    assert completed_sources(tmp_path / "ingestion-manifest.jsonl") == {}
 
 
 def test_iter_pdfs_rejects_non_http_source_urls(tmp_path: Path) -> None:
