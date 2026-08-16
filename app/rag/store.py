@@ -862,7 +862,8 @@ class RagStore:
             if self.active_generations().get(source_id) == source_generation:
                 return response
         raise RuntimeError(
-            f"The active generation for source {source_id!r} changed repeatedly; retry the read."
+            f"The active source generation changed repeatedly while fetching result "
+            f"{result_id!r}; retry the read."
         )
 
     def browse_contexts(

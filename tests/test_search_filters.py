@@ -482,6 +482,25 @@ def test_fetch_contexts_retries_a_missing_id_when_the_active_map_changes() -> No
     assert store.context_snapshots == [new]
 
 
+def test_fetch_contexts_reports_repeated_activation_while_id_is_missing() -> None:
+    first = {"254-2023": "first"}
+    second = {"254-2023": "second"}
+    third = {"254-2023": "third"}
+    fourth = {"254-2023": "fourth"}
+    fifth = {"254-2023": "fifth"}
+    sixth = {"254-2023": "sixth"}
+    store = SnapshotBoundFetchStore(
+        [first, second, third, fourth, fifth, sixth],
+        missing_generations={"first", "third", "fifth"},
+    )
+
+    with pytest.raises(RuntimeError, match="while fetching result 'missing'"):
+        store.fetch_contexts("missing", adjacent_pages=0)
+
+    assert store.payload_snapshots == [first, third, fifth]
+    assert store.context_snapshots == []
+
+
 class SnapshotBoundBrowseStore(RagStore):
     def __init__(self, snapshots: list[dict[str, str]]) -> None:
         super().__init__(Settings(), client=SimpleNamespace())
