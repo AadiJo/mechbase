@@ -16,7 +16,7 @@ from PIL import Image
 
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
-from app.mcp.images import load_preview_image
+from app.mcp.images import candidate_asset_sources, load_preview_image
 from app.mcp.results import fetch_output, search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
@@ -60,6 +60,7 @@ class FakeRetrievalBackend:
         self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
         self.browse_context_calls: list[dict[str, object]] = []
+        self.asset_generation: str | None = None
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -80,9 +81,12 @@ class FakeRetrievalBackend:
         self.fetch_calls.append(result_id)
         if result_id == "missing":
             return None
+        page = 13 if result_id == "result_cross_page" else 12
+        generation = f"/{self.asset_generation}" if self.asset_generation and page == 12 else ""
+        asset_root = f"/images/254-2020{generation}/page-{page:03d}"
         return ImageContextResponse(
             result_id=result_id,
-            image_url="/images/254-2020/page-012/image-000.png",
+            image_url=f"{asset_root}/image-000.png",
             source_id="254-2020",
             source_version="version-a",
             source_version_id="254-2020@version-a",
@@ -90,12 +94,16 @@ class FakeRetrievalBackend:
             source_pdf="254-2020.pdf",
             team="254",
             year=2020,
-            page=12,
-            page_context_url="/pages/254-2020.pdf/12",
-            page_text_url="/pages/254-2020.pdf/12/text",
+            page=page,
+            page_context_url=f"/pages/254-2020.pdf/{page}",
+            page_text_url=f"/pages/254-2020.pdf/{page}/text",
             text="A compact two-stage elevator with a continuous belt rigging layout.",
-            page_image_url="/images/254-2020/page-012/page.png",
-            image_urls=["/images/254-2020/page-012/page.png"],
+            page_image_url=f"{asset_root}/page.png",
+            image_urls=[
+                f"{asset_root}/page.png",
+                f"{asset_root}/image-000.png",
+                f"{asset_root}/image-001.png",
+            ],
         )
 
     def fetch_contexts(
@@ -549,6 +557,17 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
     Image.new("RGB", (1800, 1200), "white").save(page_image)
     figure_image = page_image.parent / "image-000.png"
     Image.new("RGB", (640, 480), "blue").save(figure_image)
+    corrupt_figure = page_image.parent / "image-001.png"
+    corrupt_figure.write_bytes(b"not an image")
+    cross_page_image = tmp_path / "254-2020" / "page-013" / "page.png"
+    cross_page_image.parent.mkdir(parents=True)
+    Image.new("RGB", (1200, 800), "white").save(cross_page_image)
+    Image.new("RGB", (500, 400), "green").save(cross_page_image.parent / "image-000.png")
+    for generation in ("generation-old", "generation-new"):
+        generation_root = tmp_path / "254-2020" / generation / "page-012"
+        generation_root.mkdir(parents=True)
+        Image.new("RGB", (1800, 1200), "white").save(generation_root / "page.png")
+        Image.new("RGB", (640, 480), "blue").save(generation_root / "image-000.png")
 
     async def exercise_server() -> None:
         settings = _settings(tmp_path)
@@ -753,10 +772,14 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert inspected.structured_content["missing_ids"] == []
                         assert inspected.structured_content["candidates"][0]["id"] == "result_1"
                         assert inspected.structured_content["candidates"][0]["has_image"] is True
-                        assert [
+                        inspected_asset_ids = [
                             asset["asset_id"]
                             for asset in inspected.structured_content["candidates"][0]["assets"]
-                        ] == ["page", "image-000"]
+                        ]
+                        assert len(inspected_asset_ids) == 2
+                        assert inspected_asset_ids[0].startswith("page-")
+                        assert inspected_asset_ids[1].startswith("figure-")
+                        page_asset_id, figure_asset_id = inspected_asset_ids
                         assert (
                             inspected.structured_content["candidates"][0]["assets"][1]["kind"]
                             == "figure"
@@ -764,6 +787,22 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert (
                             inspected.structured_content["candidates"][0]["assets"][1]["width"]
                             == 640
+                        )
+                        assert (
+                            inspected.structured_content["candidates"][0]["assets"][1]["mime_type"]
+                            == "image/png"
+                        )
+                        assert (
+                            inspected.structured_content["candidates"][0]["assets"][1][
+                                "preview_mime_type"
+                            ]
+                            == "image/jpeg"
+                        )
+                        assert (
+                            inspected.structured_content["candidates"][0]["assets"][0][
+                                "preview_width"
+                            ]
+                            == 1400
                         )
                         assert backend.fetch_many_calls[-1] == ["result_1"]
                         image_blocks = [
@@ -895,7 +934,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert rendered.structured_content["results"] == [
                             {
                                 "id": "result_1",
-                                "asset_id": "page",
+                                "asset_id": page_asset_id,
+                                "asset_kind": "page",
                                 "title": "Team 254: 254-2020.pdf, page 12",
                                 "url": (
                                     "https://api.example.com/images/254-2020/page-012/page.png"
@@ -912,23 +952,82 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
 
                         rendered_figure = await session.call_tool(
                             "render_search_results",
-                            {"selections": [{"id": "result_1", "asset_id": "image-000"}]},
+                            {"selections": [{"id": "result_1", "asset_id": figure_asset_id}]},
                         )
                         assert rendered_figure.is_error is False
                         assert rendered_figure.structured_content["results"][0]["asset_id"] == (
-                            "image-000"
+                            figure_asset_id
+                        )
+                        assert (
+                            rendered_figure.structured_content["results"][0]["asset_kind"]
+                            == "figure"
                         )
                         assert rendered_figure.structured_content["results"][0][
                             "image_url"
                         ].endswith("/image-000.png")
                         assert (
-                            "figure image-000"
+                            f"figure {figure_asset_id}"
                             in rendered_figure.structured_content["results"][0]["title"]
                         )
 
+                        inspected_cross_page = await session.call_tool(
+                            "inspect_candidates", {"ids": ["result_cross_page"]}
+                        )
+                        assert inspected_cross_page.is_error is False
+                        cross_page_figure_id = inspected_cross_page.structured_content[
+                            "candidates"
+                        ][0]["assets"][1]["asset_id"]
+                        assert cross_page_figure_id != figure_asset_id
+                        cross_page_asset = await session.call_tool(
+                            "render_search_results",
+                            {
+                                "selections": [
+                                    {
+                                        "id": "result_cross_page",
+                                        "asset_id": figure_asset_id,
+                                    }
+                                ]
+                            },
+                        )
+                        assert cross_page_asset.is_error is True
+
+                        context_with_corrupt_figure = backend.fetch("result_1")
+                        assert context_with_corrupt_figure is not None
+                        corrupt_asset_id = candidate_asset_sources(
+                            context_with_corrupt_figure,
+                            include_assets=True,
+                        )[2].asset_id
+                        corrupt_asset = await session.call_tool(
+                            "render_search_results",
+                            {"selections": [{"id": "result_1", "asset_id": corrupt_asset_id}]},
+                        )
+                        assert corrupt_asset.is_error is True
+
+                        backend.asset_generation = "generation-old"
+                        inspected_old_generation = await session.call_tool(
+                            "inspect_candidates", {"ids": ["result_1"]}
+                        )
+                        old_generation_figure_id = inspected_old_generation.structured_content[
+                            "candidates"
+                        ][0]["assets"][1]["asset_id"]
+                        backend.asset_generation = "generation-new"
+                        stale_generation_asset = await session.call_tool(
+                            "render_search_results",
+                            {
+                                "selections": [
+                                    {
+                                        "id": "result_1",
+                                        "asset_id": old_generation_figure_id,
+                                    }
+                                ]
+                            },
+                        )
+                        assert stale_generation_asset.is_error is True
+                        backend.asset_generation = None
+
                         invalid_figure = await session.call_tool(
                             "render_search_results",
-                            {"selections": [{"id": "result_1", "asset_id": "image-999"}]},
+                            {"selections": [{"id": "result_1", "asset_id": "figure-unknown"}]},
                         )
                         assert invalid_figure.is_error is True
                         ambiguous_render = await session.call_tool(
@@ -951,7 +1050,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "https://api.example.com"
                         ]
                         resource_contents = await session.read_resource(widget.uri)
-                        assert "Selected mechanism pages" in resource_contents.contents[0].text
+                        assert "Selected mechanism images" in resource_contents.contents[0].text
+                        assert "item.asset_kind" in resource_contents.contents[0].text
                         assert resource_contents.contents[0].meta["ui"]["prefersBorder"] is False
 
                         sources = await session.call_tool("list_sources", {"team_numbers": [254]})

@@ -596,10 +596,14 @@ def create_mcp_server(
             if selected_asset is None:
                 missing_assets.append((selection.id, selection.asset_id))
                 continue
+            if load_preview_url(selected_asset.image_url, settings) is None:
+                missing_assets.append((selection.id, selection.asset_id))
+                continue
             resolved.append(
                 (
                     selection.id,
                     selected_asset.asset_id,
+                    selected_asset.kind,
                     context,
                     selected_asset.image_url,
                 )

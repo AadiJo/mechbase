@@ -178,6 +178,9 @@ class VisualAsset(BaseModel):
     mime_type: str
     width: int
     height: int
+    preview_mime_type: str
+    preview_width: int
+    preview_height: int
     text: str
 
 
@@ -194,6 +197,7 @@ class RenderSelection(BaseModel):
 class RenderItem(BaseModel):
     id: str
     asset_id: str
+    asset_kind: Literal["page", "figure"]
     title: str
     url: str
     image_url: str
@@ -499,27 +503,31 @@ def visual_asset(
         asset_id=source.asset_id,
         kind=source.kind,
         image_url=_absolute_url(public_base_url, source.image_url),
-        mime_type=preview.mime_type,
+        mime_type=preview.source_mime_type,
         width=preview.width,
         height=preview.height,
+        preview_mime_type=preview.mime_type,
+        preview_width=preview.preview_width,
+        preview_height=preview.preview_height,
         text=_truncate(context.text, 2000),
     )
 
 
 def render_output(
-    contexts: list[tuple[str, str, ImageContextResponse, str]],
+    contexts: list[tuple[str, str, Literal["page", "figure"], ImageContextResponse, str]],
     public_base_url: str,
 ) -> RenderOutput:
     results = []
-    for result_id, asset_id, context, relative_image_url in contexts:
+    for result_id, asset_id, asset_kind, context, relative_image_url in contexts:
         image_url = _absolute_url(public_base_url, relative_image_url)
         title = _result_title(context.source_pdf, context.page, context.team)
-        if asset_id != "page":
+        if asset_kind == "figure":
             title = f"{title}, figure {asset_id}"
         results.append(
             RenderItem(
                 id=result_id,
                 asset_id=asset_id,
+                asset_kind=asset_kind,
                 title=title,
                 url=image_url,
                 image_url=image_url,

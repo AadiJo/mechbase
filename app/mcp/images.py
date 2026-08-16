@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 from urllib.parse import unquote, urlparse
 
 from PIL import Image, UnidentifiedImageError
@@ -15,14 +17,17 @@ from app.rag.models import ImageContextResponse
 class PreviewImage:
     data: bytes
     mime_type: str
+    source_mime_type: str
     width: int
     height: int
+    preview_width: int
+    preview_height: int
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateAssetSource:
     asset_id: str
-    kind: str
+    kind: Literal["page", "figure"]
     image_url: str
 
 
@@ -56,19 +61,28 @@ def load_preview_url(
     try:
         with Image.open(source) as original:
             width, height = original.size
+            source_mime_type = Image.MIME.get(
+                original.format or "",
+                "application/octet-stream",
+            )
         cached = cached_resized_image(
             source,
             max_side,
             settings.artifact_dir / ".embedding-cache",
         )
         data = cached.read_bytes()
+        with Image.open(cached) as resized:
+            preview_width, preview_height = resized.size
     except (OSError, Image.DecompressionBombError, UnidentifiedImageError):
         return None
     return PreviewImage(
         data=data,
         mime_type="image/jpeg",
+        source_mime_type=source_mime_type,
         width=width,
         height=height,
+        preview_width=preview_width,
+        preview_height=preview_height,
     )
 
 
@@ -85,13 +99,13 @@ def candidate_asset_sources(
     if page_image_url:
         assets.append(
             CandidateAssetSource(
-                asset_id="page",
+                asset_id=_asset_id_from_url("page", page_image_url),
                 kind="page",
                 image_url=page_image_url,
             )
         )
         seen_urls.add(page_image_url)
-        seen_asset_ids.add("page")
+        seen_asset_ids.add(assets[0].asset_id)
 
     candidate_urls = [context.image_url, *context.image_urls]
     figures = []
@@ -99,7 +113,7 @@ def candidate_asset_sources(
         if image_url is None or image_url in seen_urls:
             continue
         seen_urls.add(image_url)
-        asset_id = _asset_id_from_url(image_url)
+        asset_id = _asset_id_from_url("figure", image_url)
         if asset_id in seen_asset_ids:
             continue
         seen_asset_ids.add(asset_id)
@@ -120,9 +134,10 @@ def candidate_asset_sources(
     return figures[:1]
 
 
-def _asset_id_from_url(image_url: str) -> str:
-    stem = Path(unquote(urlparse(image_url).path)).stem
-    return stem or "figure"
+def _asset_id_from_url(kind: Literal["page", "figure"], image_url: str) -> str:
+    artifact_path = unquote(urlparse(image_url).path)
+    digest = sha256(artifact_path.encode()).hexdigest()[:20]
+    return f"{kind}-{digest}"
 
 
 def _artifact_path_from_url(image_url: str, settings: Settings) -> Path | None:

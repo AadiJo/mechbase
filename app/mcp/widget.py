@@ -138,11 +138,11 @@ SELECTED_RESULTS_WIDGET_HTML = r"""
 <body>
   <section class="component" aria-labelledby="component-title">
     <header class="component-head">
-      <strong id="component-title">Selected mechanism pages</strong>
+      <strong id="component-title">Selected mechanism images</strong>
       <span id="result-count"></span>
     </header>
-    <div class="rail" id="results" aria-label="Selected FRC binder pages"></div>
-    <div class="empty" id="empty" hidden>No displayable pages were selected.</div>
+    <div class="rail" id="results" aria-label="Selected FRC binder pages and figures"></div>
+    <div class="empty" id="empty" hidden>No displayable images were selected.</div>
   </section>
 
   <script>
@@ -154,7 +154,11 @@ SELECTED_RESULTS_WIDGET_HTML = r"""
       const parts = [];
       if (item.team) parts.push(`Team ${item.team}`);
       if (item.year) parts.push(String(item.year));
-      parts.push(`page ${item.page}`);
+      if (item.asset_kind === "figure") {
+        parts.push(`figure ${item.asset_id}`);
+      } else {
+        parts.push(`page ${item.page}`);
+      }
       return parts.join(" · ");
     }
 
@@ -175,7 +179,9 @@ SELECTED_RESULTS_WIDGET_HTML = r"""
       const image = document.createElement("img");
       image.className = "page-image";
       image.src = item.image_url;
-      image.alt = `${item.title} technical binder page`;
+      image.alt = item.asset_kind === "figure"
+        ? `${item.title} extracted figure`
+        : `${item.title} technical binder page`;
       image.loading = index === 0 ? "eager" : "lazy";
 
       const copy = document.createElement("span");
@@ -183,7 +189,7 @@ SELECTED_RESULTS_WIDGET_HTML = r"""
 
       const labels = document.createElement("span");
       const title = document.createElement("strong");
-      title.textContent = item.source_pdf;
+      title.textContent = item.title;
       const detail = document.createElement("small");
       detail.textContent = metadata(item);
       labels.append(title, detail);
@@ -201,7 +207,12 @@ SELECTED_RESULTS_WIDGET_HTML = r"""
     function render(output) {
       const results = Array.isArray(output?.results) ? output.results : [];
       resultsElement.replaceChildren(...results.map(resultElement));
-      countElement.textContent = `${results.length} ${results.length === 1 ? "page" : "pages"}`;
+      const pageCount = results.filter((item) => item.asset_kind !== "figure").length;
+      const figureCount = results.length - pageCount;
+      const counts = [];
+      if (pageCount) counts.push(`${pageCount} ${pageCount === 1 ? "page" : "pages"}`);
+      if (figureCount) counts.push(`${figureCount} ${figureCount === 1 ? "figure" : "figures"}`);
+      countElement.textContent = counts.join(" · ");
       emptyElement.hidden = results.length > 0;
     }
 
