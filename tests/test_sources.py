@@ -113,6 +113,7 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     published = root / published_namespace
     assert not first_staging.exists()
     assert (published / "page.png").read_bytes() == b"canonical"
+    assert (published / ".complete.json").is_file()
     assert (historical / "page.png").read_bytes() == b"historical"
 
     duplicate_staging = root / "version-current~ingestion-two"
@@ -129,6 +130,117 @@ def test_artifact_publication_is_content_addressed_and_preserves_history(
     assert not duplicate_staging.exists()
     assert (published / "page.png").read_bytes() == b"canonical"
     assert (historical / "page.png").read_bytes() == b"historical"
+
+    (published / ".complete.json").write_text("{}", encoding="utf-8")
+    repair_staging = root / "version-current~ingestion-three"
+    repair_staging.mkdir()
+    (repair_staging / "page.png").write_bytes(b"repaired")
+
+    publish_artifact_generation(
+        tmp_path,
+        "254-2023",
+        repair_staging.name,
+        published_namespace,
+    )
+
+    assert not repair_staging.exists()
+    assert (published / "page.png").read_bytes() == b"repaired"
+    assert (published / ".complete.json").is_file()
+
+
+def test_missing_artifact_staging_is_fatal(tmp_path: Path) -> None:
+    root = source_artifact_root(tmp_path, "254-2023")
+    root.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="staging generation .* is missing"):
+        publish_artifact_generation(
+            tmp_path,
+            "254-2023",
+            "version~missing-ingestion",
+            "version~fingerprint",
+        )
+
+
+def test_missing_referenced_artifact_never_activates_qdrant_generation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "254-2025.pdf"
+    source_path.write_bytes(b"binder")
+    source = SourceDoc(
+        path=source_path,
+        team="254",
+        year=2025,
+        source_id="254-2025",
+        source_version="content",
+        source_version_id="254-2025@content",
+    )
+    document = RagDocument(
+        id="result",
+        storage_id="result@new",
+        source_id=source.source_id,
+        source_version=source.source_version,
+        source_version_id=source.source_version_id,
+        source_pdf=source_path.name,
+        team="254",
+        year=2025,
+        page=1,
+        modality="text",
+        text="intake",
+        is_staged=True,
+    )
+
+    class PublicationStore:
+        def __init__(self) -> None:
+            self.active = {source.source_id: "old"}
+            self.qdrant_published = False
+            self.pointer_activated = False
+            self.failed_generation_deleted = False
+
+        def initialize_active_generation(self, _source_id: str) -> None:
+            pass
+
+        def active_generations(self) -> dict[str, str]:
+            return self.active.copy()
+
+        def upsert(self, docs, text_vectors, image_vectors) -> None:
+            assert docs and text_vectors and image_vectors
+
+        def publish_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            self.qdrant_published = True
+
+        def set_active_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            self.pointer_activated = True
+
+        def delete_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            self.failed_generation_deleted = True
+
+    class FakeEmbedder:
+        def embed_texts(self, texts, input_type):
+            return [[1.0] for _text in texts]
+
+    def missing_artifact_documents(*_args, **kwargs):
+        staging = source_artifact_root(tmp_path, source.source_id) / kwargs["artifact_namespace"]
+        return [
+            document.model_copy(update={"linked_artifacts": [str(staging / "missing-page.png")]})
+        ]
+
+    store = PublicationStore()
+    monkeypatch.setattr("app.rag.ingest.extract_documents", missing_artifact_documents)
+
+    with pytest.raises(RuntimeError, match="referenced files missing"):
+        ingest_sources(
+            [source],
+            batch_size=1,
+            force=True,
+            settings=Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1),
+            store=store,
+            embedder=FakeEmbedder(),
+        )
+
+    assert store.qdrant_published is False
+    assert store.pointer_activated is False
+    assert store.failed_generation_deleted is True
 
 
 def test_artifact_fingerprint_is_stable_across_ingestions(tmp_path: Path) -> None:

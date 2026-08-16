@@ -1,6 +1,7 @@
 import argparse
 import fcntl
 import json
+import os
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from app.rag.store import RagStore
 from app.rag.voyage_client import VoyageEmbedder
 
 EXTRACTION_SCHEMA_VERSION = "2"
+ARTIFACT_COMPLETE_FILE = ".complete.json"
 
 
 def batched(items, size: int):
@@ -123,13 +125,83 @@ def publish_artifact_generation(
     if staging.parent != root or published.parent != root:
         raise RuntimeError("Artifact namespace escapes its source directory.")
     if not staging.is_dir():
-        return
+        raise RuntimeError(f"Artifact staging generation {staging_namespace} is missing.")
     if published.exists():
         if not published.is_dir():
             raise RuntimeError("Published artifact generation must be a directory.")
-        shutil.rmtree(staging)
-        return
+        if _artifact_tree_is_complete(published):
+            shutil.rmtree(staging)
+            _fsync_directory(root)
+            return
+        shutil.rmtree(published)
+    _write_artifact_completion_marker(staging)
+    _fsync_tree(staging)
     staging.replace(published)
+    for directory in [root, root.parent, artifact_root]:
+        _fsync_directory(directory)
+
+
+def _artifact_inventory(root: Path) -> list[dict[str, int | str]]:
+    marker = root / ARTIFACT_COMPLETE_FILE
+    inventory = []
+    for path in sorted(root.rglob("*")):
+        if path == marker:
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"Artifact tree cannot contain symlinks: {path}")
+        if path.is_file():
+            inventory.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "size": path.stat().st_size,
+                }
+            )
+    return inventory
+
+
+def _write_artifact_completion_marker(root: Path) -> None:
+    marker = root / ARTIFACT_COMPLETE_FILE
+    marker.write_text(
+        json.dumps(
+            {"files": _artifact_inventory(root)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def _artifact_tree_is_complete(root: Path) -> bool:
+    marker = root / ARTIFACT_COMPLETE_FILE
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        expected = json.loads(marker.read_text(encoding="utf-8"))
+        return expected == {"files": _artifact_inventory(root)}
+    except (OSError, json.JSONDecodeError, RuntimeError):
+        return False
+
+
+def _fsync_tree(root: Path) -> None:
+    directories = [root]
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError(f"Artifact tree cannot contain symlinks: {path}")
+        if path.is_dir():
+            directories.append(path)
+        elif path.is_file():
+            with path.open("rb") as artifact:
+                os.fsync(artifact.fileno())
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def with_published_artifacts(
@@ -250,12 +322,24 @@ def ingest_sources(
                     ]
                     store.upsert(published_batch, text_vectors, image_vectors)
                     print(f"  upserted batch {batch_idx}", flush=True)
-                publish_artifact_generation(
-                    settings.artifact_dir,
-                    source.source_id,
-                    staging_namespace,
-                    published_namespace,
-                )
+                artifact_paths = {
+                    path
+                    for document in docs
+                    for path in [document.artifact_path, *document.linked_artifacts]
+                    if path
+                }
+                missing_artifacts = [path for path in artifact_paths if not Path(path).is_file()]
+                if missing_artifacts:
+                    raise RuntimeError(
+                        f"Artifact extraction left {len(missing_artifacts)} referenced files missing."
+                    )
+                if artifact_paths:
+                    publish_artifact_generation(
+                        settings.artifact_dir,
+                        source.source_id,
+                        staging_namespace,
+                        published_namespace,
+                    )
                 store.publish_source_generation(source.source_id, ingestion_id)
                 store.set_active_generation(source.source_id, ingestion_id)
                 committed = True

@@ -97,10 +97,11 @@ In ChatGPT developer mode, refresh the plugin connection after changing tool nam
 descriptions, schemas, annotations, authentication, or UI resources. Then start a new chat.
 Backend-only changes that preserve the advertised MCP metadata do not require a refresh.
 
-Fetch a page image through the API/VPS:
+Fetch a page image through the API/VPS using an `artifact_url` returned by `search` or a
+`sample_image_url` returned by `list_sources`:
 
 ```bash
-curl -I http://localhost:8000/images/694-2020/page-019/page.png
+curl -I "$ARTIFACT_URL"
 ```
 
 Fetch all known context for a page:
