@@ -45,12 +45,20 @@ The API also exposes a stateless Streamable HTTP MCP server at `/mcp`. It is add
 frontend and all existing REST endpoints continue to use Mechbase API keys without changes.
 The MCP endpoint accepts Clerk OAuth access tokens only.
 
-The server provides four read-only tools:
+The server provides six read-only tools:
 
 - `search(query)` returns the standard ChatGPT company-knowledge result shape.
+- `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
+  model can check visual relevance before anything is displayed.
 - `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
 - `find_similar(id, top_k)` finds related mechanism pages.
+- `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
+  hosts that support MCP Apps. Other clients still receive its structured result.
 - `list_sources(...)` lists indexed technical binders.
+
+For visual requests, the intended flow is `search` -> `inspect_candidates` ->
+`render_search_results`. The render tool is separate from retrieval so irrelevant RAG results do
+not appear just because they ranked highly.
 
 Configure the resource server with:
 
