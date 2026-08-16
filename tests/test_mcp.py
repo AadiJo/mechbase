@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
+from io import BytesIO
+from pathlib import Path
 
 import anyio
 import httpx
@@ -9,6 +12,7 @@ from fastapi.testclient import TestClient
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.provider import AccessToken
+from PIL import Image
 
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
@@ -111,11 +115,16 @@ def _search_result(result_id: str, page: int) -> SearchResult:
     )
 
 
-def _settings() -> Settings:
+def _settings(artifact_dir: Path | None = None) -> Settings:
+    values = {
+        "MCP_PUBLIC_BASE_URL": "https://api.example.com",
+        "CLERK_OAUTH_ISSUER_URL": "https://clerk.example.com",
+        "CLERK_SECRET_KEY": "clerk_secret",
+    }
+    if artifact_dir is not None:
+        values["ARTIFACT_DIR"] = artifact_dir
     return Settings(
-        MCP_PUBLIC_BASE_URL="https://api.example.com",
-        CLERK_OAUTH_ISSUER_URL="https://clerk.example.com",
-        CLERK_SECRET_KEY="clerk_secret",
+        **values,
     )
 
 
@@ -209,9 +218,13 @@ def test_mcp_discovery_is_public_and_api_keys_are_rejected() -> None:
     assert "resource_metadata=" in response.headers["www-authenticate"]
 
 
-def test_mcp_protocol_lists_and_calls_read_only_tools() -> None:
+def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
+    page_image = tmp_path / "254-2020" / "page-012" / "page.png"
+    page_image.parent.mkdir(parents=True)
+    Image.new("RGB", (1800, 1200), "white").save(page_image)
+
     async def exercise_server() -> None:
-        settings = _settings()
+        settings = _settings(tmp_path)
         backend = FakeRetrievalBackend()
         server = create_mcp_server(
             settings,
@@ -256,10 +269,22 @@ def test_mcp_protocol_lists_and_calls_read_only_tools() -> None:
 
                         listed = await session.list_tools()
                         tools = {tool.name: tool for tool in listed.tools}
-                        assert set(tools) == {"search", "fetch", "find_similar", "list_sources"}
+                        assert set(tools) == {
+                            "search",
+                            "inspect_candidates",
+                            "fetch",
+                            "find_similar",
+                            "render_search_results",
+                            "list_sources",
+                        }
                         assert set(tools["search"].input_schema["properties"]) == {"query"}
                         assert tools["search"].output_schema is not None
                         assert set(tools["search"].output_schema["properties"]) == {"results"}
+                        assert tools["inspect_candidates"].output_schema is None
+                        assert (
+                            tools["render_search_results"].meta["ui"]["resourceUri"]
+                            == "ui://mechbase/selected-results.html"
+                        )
                         assert all(
                             tool.annotations.read_only_hint is True for tool in tools.values()
                         )
@@ -283,6 +308,22 @@ def test_mcp_protocol_lists_and_calls_read_only_tools() -> None:
                         assert json.loads(searched.content[0].text) == searched.structured_content
                         assert backend.search_calls == [("elevator", 10)]
 
+                        inspected = await session.call_tool(
+                            "inspect_candidates", {"ids": ["result_1"]}
+                        )
+                        assert inspected.is_error is False
+                        assert inspected.structured_content["missing_ids"] == []
+                        assert inspected.structured_content["candidates"][0]["id"] == "result_1"
+                        assert inspected.structured_content["candidates"][0]["has_image"] is True
+                        image_blocks = [
+                            block for block in inspected.content if block.type == "image"
+                        ]
+                        assert len(image_blocks) == 1
+                        assert image_blocks[0].mime_type == "image/jpeg"
+                        with Image.open(BytesIO(base64.b64decode(image_blocks[0].data))) as image:
+                            assert image.format == "JPEG"
+                            assert max(image.size) == 1400
+
                         fetched = await session.call_tool("fetch", {"id": "result_1"})
                         assert fetched.is_error is False
                         assert fetched.structured_content["url"] == (
@@ -296,6 +337,41 @@ def test_mcp_protocol_lists_and_calls_read_only_tools() -> None:
                         assert similar.is_error is False
                         assert similar.structured_content["results"][0]["id"] == "result_2"
 
+                        rendered = await session.call_tool(
+                            "render_search_results", {"ids": ["result_1"]}
+                        )
+                        assert rendered.is_error is False
+                        assert rendered.structured_content["results"] == [
+                            {
+                                "id": "result_1",
+                                "title": "Team 254: 254-2020.pdf, page 12",
+                                "url": (
+                                    "https://api.example.com/images/254-2020/page-012/page.png"
+                                ),
+                                "image_url": (
+                                    "https://api.example.com/images/254-2020/page-012/page.png"
+                                ),
+                                "source_pdf": "254-2020.pdf",
+                                "team": "254",
+                                "year": 2020,
+                                "page": 12,
+                            }
+                        ]
+
+                        resources = await session.list_resources()
+                        widget = next(
+                            resource
+                            for resource in resources.resources
+                            if str(resource.uri) == "ui://mechbase/selected-results.html"
+                        )
+                        assert widget.mime_type == "text/html;profile=mcp-app"
+                        assert widget.meta["ui"]["csp"]["resourceDomains"] == [
+                            "https://api.example.com"
+                        ]
+                        resource_contents = await session.read_resource(widget.uri)
+                        assert "Selected mechanism pages" in resource_contents.contents[0].text
+                        assert resource_contents.contents[0].meta["ui"]["prefersBorder"] is False
+
                         sources = await session.call_tool("list_sources", {"team": "254"})
                         assert sources.is_error is False
                         assert sources.structured_content["sources"][0]["team"] == "254"
@@ -308,7 +384,18 @@ def test_mcp_protocol_lists_and_calls_read_only_tools() -> None:
                         )
                         assert invalid.is_error is True
 
+                        too_many_images = await session.call_tool(
+                            "inspect_candidates",
+                            {"ids": [f"result_{index}" for index in range(7)]},
+                        )
+                        assert too_many_images.is_error is True
+
                         missing = await session.call_tool("fetch", {"id": "missing"})
                         assert missing.is_error is True
+
+                        missing_render = await session.call_tool(
+                            "render_search_results", {"ids": ["missing"]}
+                        )
+                        assert missing_render.is_error is True
 
     anyio.run(exercise_server)
