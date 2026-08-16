@@ -79,8 +79,9 @@ The server provides nine read-only tools:
   Blue Alliance pages for live performance research; the server does not scrape them and needs no
   TBA API key.
 
-Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
-`render_search_results`, even when the user does not explicitly ask to inspect or display images.
+Every non-empty mechanism search, including one nested in `get_team_context`, uses `search` ->
+`inspect_candidates` -> `render_search_results`, even when the user does not explicitly ask to
+inspect or display images.
 Inspection images are model-only inputs. The render tool is the only path for displaying images,
 so irrelevant RAG results do not appear just because they ranked highly.
 

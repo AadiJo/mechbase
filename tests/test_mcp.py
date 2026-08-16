@@ -68,6 +68,7 @@ class FakeRetrievalBackend:
         self.browse_context_calls: list[dict[str, object]] = []
         self.asset_generation: str | None = None
         self.extra_figure_names: list[str] = []
+        self.revision_sequence: list[str] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -82,6 +83,8 @@ class FakeRetrievalBackend:
         )
 
     def corpus_revision(self) -> str:
+        if self.revision_sequence:
+            return self.revision_sequence.pop(0)
         return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
@@ -1247,6 +1250,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             )
                             for fact in game.structured_content["facts"]
                         )
+                        assert [
+                            fact["evidence_kind"] for fact in game.structured_content["facts"]
+                        ] == [
+                            "official_summary",
+                            "official_summary",
+                            "engineering_interpretation",
+                        ]
                         assert game.structured_content["coverage"]["supported"] is True
                         assert len(backend.search_calls) == searches_before_game_context
 
@@ -1277,6 +1287,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert team_context.is_error is False
                         assert team_context.structured_content["team_number"] == 254
                         assert team_context.structured_content["performance_checked"] is False
+                        assert team_context.structured_content["visual_review_required"] is True
                         assert (
                             team_context.structured_content["indexed_sources"]["sources"][0][
                                 "source_id"
@@ -1291,6 +1302,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         ]["years"] == [2020]
                         assert backend.search_calls[-1].team_numbers == ["254"]
                         assert backend.search_calls[-1].years == [2020]
+                        assert backend.search_calls[-1].source_ids == ["254-2020"]
                         assert backend.search_calls[-1].top_k == 4
                         assert {
                             target["provider"]
@@ -1322,12 +1334,35 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             == []
                         )
                         assert (
+                            missing_team_context.structured_content["visual_review_required"]
+                            is False
+                        )
+                        assert (
                             "search was not run"
                             in missing_team_context.structured_content["mechanism_search"][
                                 "abstention_reason"
                             ]
                         )
                         assert len(backend.search_calls) == searches_before_missing_team
+
+                        searches_before_refresh = len(backend.search_calls)
+                        backend.revision_sequence = [
+                            "test-corpus-a",
+                            "test-corpus-b",
+                            "test-corpus-b",
+                            "test-corpus-b",
+                        ]
+                        refreshed_team_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 254,
+                                "year": 2020,
+                                "mechanism_query": "refresh intake",
+                            },
+                        )
+                        assert refreshed_team_context.is_error is False
+                        assert len(backend.search_calls) == searches_before_refresh + 2
+                        assert backend.revision_sequence == []
 
                         browsed = await session.call_tool(
                             "browse_source",
@@ -1529,7 +1564,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 3
+                        assert len(backend.list_source_calls) == 5
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -1543,7 +1578,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 4
+                        assert len(backend.list_source_calls) == 6
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],

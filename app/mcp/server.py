@@ -266,8 +266,9 @@ def create_mcp_server(
         title="Mechbase FRC Mechanism Search",
         description="Search and retrieve mechanism details from FRC technical binders.",
         instructions=(
-            "For every non-empty search or find_similar result, complete the visual selection "
-            "flow before answering, even when the user does not explicitly ask for images. Call "
+            "For every non-empty search, find_similar, or get_team_context mechanism_search "
+            "result, complete the visual selection flow before answering, even when the user does "
+            "not explicitly ask for images. Call "
             "inspect_candidates with promising result ids and judge the actual page images plus "
             "page text against the request. Never present inspection images directly or use them "
             "as final answer images. If at least one image is relevant, call "
@@ -933,7 +934,8 @@ def create_mcp_server(
         description=(
             "Get reviewed, structured season terminology and mechanism-relevant game context "
             "with citations to the official FIRST manual. Use this before interpreting historical "
-            "binder language or comparing mechanisms across games. Request only the topics needed. "
+            "binder language or comparing mechanisms across games. Official summaries and "
+            "engineering interpretations are labeled separately. Request only the topics needed. "
             "This summary is not a substitute for the official manual and explicitly reports "
             "unsupported seasons or missing topics."
         ),
@@ -954,7 +956,8 @@ def create_mcp_server(
             "tool does not fetch live competition performance. If the user asks about records, "
             "rankings, awards, matches, or performance, browse and cite the returned public FIRST "
             "Events and The Blue Alliance targets before answering. Do not infer performance from "
-            "binder content or infer mechanism causality from event results."
+            "binder content or infer mechanism causality from event results. When mechanism_search "
+            "returns results, call inspect_candidates and render_search_results before answering."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -967,49 +970,54 @@ def create_mcp_server(
     ) -> TeamContextOutput:
         team = str(team_number)
         years = [year] if year is not None else []
-        corpus_revision = retrieval.corpus_revision()
-        cache_key = repr((corpus_revision, [team], years, []))
-        catalog = source_cache.get_or_compute(
-            cache_key,
-            lambda: retrieval.list_sources(
-                team_numbers=[team],
-                years=years,
-                source_ids=[],
-            ),
-        )
-        matching_sources = catalog.sources
-        indexed_sources = source_output(
-            matching_sources,
-            public_base_url,
-            total_matching_sources=len(matching_sources),
-        )
-        mechanism_search = None
+        query = None
         if mechanism_query is not None:
             query = mechanism_query.strip()
             if not query:
                 raise ValueError("mechanism_query must contain non-whitespace text.")
+
+        for _attempt in range(3):
+            corpus_revision = retrieval.corpus_revision()
+            source_cache_key = repr((corpus_revision, [team], years, []))
+            catalog = source_cache.get_or_compute(
+                source_cache_key,
+                lambda: retrieval.list_sources(
+                    team_numbers=[team],
+                    years=years,
+                    source_ids=[],
+                ),
+            )
+            matching_sources = catalog.sources
+            indexed_sources = source_output(
+                matching_sources,
+                public_base_url,
+                total_matching_sources=len(matching_sources),
+            )
+            mechanism_search = None
             filters = AppliedSearchFilters(
                 team_numbers=[team],
-                years=[year] if year is not None else [],
+                years=years,
+                source_ids=list(dict.fromkeys(source.source_id for source in matching_sources)),
             )
-            if matching_sources:
+            if query is not None and matching_sources:
                 request = SearchRequest(
                     query=query,
                     top_k=top_k,
                     team_numbers=filters.team_numbers,
                     years=filters.years,
+                    source_ids=filters.source_ids,
                 )
                 cache_key = f"{corpus_revision}:{request.model_dump_json()}"
                 response = search_cache.get_or_compute(
                     cache_key,
-                    lambda: retrieval.search(request),
+                    lambda current_request=request: retrieval.search(current_request),
                 )
                 mechanism_search = search_output(
                     response,
                     public_base_url,
                     applied_filters=filters,
                 )
-            else:
+            elif query is not None:
                 mechanism_search = SearchOutput(
                     results=[],
                     applied_filters=filters,
@@ -1019,13 +1027,22 @@ def create_mcp_server(
                     ),
                 )
 
-        return TeamContextOutput(
-            team_number=team_number,
-            year=year,
-            indexed_sources=indexed_sources,
-            mechanism_search=mechanism_search,
-            live_research_targets=team_research_targets(team_number, year),
-            suggested_web_queries=team_web_queries(team_number, year),
+            output = TeamContextOutput(
+                team_number=team_number,
+                year=year,
+                indexed_sources=indexed_sources,
+                mechanism_search=mechanism_search,
+                visual_review_required=bool(
+                    mechanism_search is not None and mechanism_search.results
+                ),
+                live_research_targets=team_research_targets(team_number, year),
+                suggested_web_queries=team_web_queries(team_number, year),
+            )
+            if retrieval.corpus_revision() == corpus_revision:
+                return output
+
+        raise ValueError(
+            "The indexed corpus changed repeatedly during this team lookup; retry the request."
         )
 
     return server

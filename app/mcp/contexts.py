@@ -14,22 +14,43 @@ GameTopic = Literal[
     "robot_constraints",
     "terminology",
 ]
+GameEvidenceKind = Literal["official_summary", "engineering_interpretation"]
 
-GAME_CONTEXT_RECORD_VERSION = "2026-08-16.1"
+ALL_GAME_TOPICS: tuple[GameTopic, ...] = (
+    "game_pieces",
+    "scoring",
+    "endgame",
+    "field_elements",
+    "robot_constraints",
+    "terminology",
+)
+GAME_CONTEXT_RECORD_VERSION = "2026-08-16.2"
 
 
 class GameCitation(BaseModel):
     title: str
     url: str
     section: str
-    pages: str
+    pages: str = Field(description="One-based pages shown by a PDF viewer.")
 
 
 class GameFact(BaseModel):
     topic: GameTopic
+    evidence_kind: GameEvidenceKind
     summary: str
-    aliases: list[str] = Field(default_factory=list)
-    citation: GameCitation
+    aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Common retrieval terms, including community binder language; not quotations from "
+            "the official manual."
+        ),
+    )
+    citation: GameCitation = Field(
+        description=(
+            "Official source for a summarized fact, or supporting game context for a clearly "
+            "labeled engineering interpretation."
+        )
+    )
 
 
 class GameContextCoverage(BaseModel):
@@ -49,7 +70,8 @@ class GameContextOutput(BaseModel):
     facts: list[GameFact] = Field(default_factory=list)
     coverage: GameContextCoverage
     evidence_limit: str = (
-        "This is a reviewed mechanism-research summary, not a substitute for the official manual."
+        "Facts label official summaries separately from engineering interpretations; neither is "
+        "a substitute for the official manual."
     )
 
 
@@ -65,6 +87,7 @@ class TeamContextOutput(BaseModel):
     year: int | None = None
     indexed_sources: SourceOutput
     mechanism_search: SearchOutput | None = None
+    visual_review_required: bool = False
     performance_checked: Literal[False] = False
     performance_fields_requiring_live_research: list[str] = Field(
         default_factory=lambda: [
@@ -118,8 +141,12 @@ def _fact(
     section: str,
     pages: str,
 ) -> GameFact:
+    is_interpretation = topic == "terminology"
     return GameFact(
         topic=topic,
+        evidence_kind=(
+            "engineering_interpretation" if is_interpretation else "official_summary"
+        ),
         summary=summary,
         aliases=aliases,
         citation=_citation(year, game_name, manual_url, section, pages),
@@ -161,8 +188,8 @@ _GAME_CONTEXTS = {
                 "game_pieces",
                 "Robots manipulated POWER CUBES, rigid cube-shaped crates used throughout the game.",
                 ["power cube", "cube", "milk crate"],
-                "Section 3, ARCADE",
-                "15-16",
+                "Section 3.8, POWER CUBE",
+                "33",
             ),
             (
                 "scoring",
@@ -211,7 +238,7 @@ _GAME_CONTEXTS = {
                 "Robots handled flexible spherical CARGO and rigid ring-shaped HATCH PANELS.",
                 ["cargo", "cargo ball", "hatch", "hatch panel"],
                 "Section 4, ARENA, GAME PIECES",
-                "32-34",
+                "33-34",
             ),
             (
                 "scoring",
@@ -259,8 +286,8 @@ _GAME_CONTEXTS = {
                 "game_pieces",
                 "Robots collected and shot foam POWER CELLS.",
                 ["power cell", "ball"],
-                "Sections 2-3, Game Overview and ARENA",
-                "13-14",
+                "Section 3.6, POWER CELL",
+                "33",
             ),
             (
                 "scoring",
@@ -308,15 +335,15 @@ _GAME_CONTEXTS = {
                 "game_pieces",
                 "Robots collected alliance-colored spherical CARGO.",
                 ["cargo", "cargo ball", "ball"],
-                "Sections 4-5, Game Overview and ARENA",
-                "17-40",
+                "Section 5.7, CARGO",
+                "38",
             ),
             (
                 "scoring",
                 "Alliances scored their CARGO into the central HUB's upper or lower goal.",
                 ["hub", "upper hub", "lower hub", "shooter"],
                 "Sections 4 and 6, Game Overview and MATCH Play",
-                "17, 42-44",
+                "17, 44",
             ),
             (
                 "endgame",
@@ -358,21 +385,21 @@ _GAME_CONTEXTS = {
                 "Robots handled two geometrically different GAME PIECES: cones and inflatable cubes.",
                 ["cone", "cube", "game piece"],
                 "Section 5.8, GAME PIECES",
-                "36-37",
+                "37",
             ),
             (
                 "scoring",
                 "Alliances placed cones and cubes on GRID nodes; completed rows of nodes formed LINKS for additional scoring value.",
                 ["grid", "node", "link", "hybrid node"],
                 "Section 6.4, Scoring",
-                "49-52",
+                "45-47",
             ),
             (
                 "endgame",
                 "Robots could DOCK on the tilting CHARGE STATION and earn more by leaving it level, called ENGAGED.",
                 ["charge station", "dock", "engage", "balance"],
                 "Section 6.4, CHARGE STATION Scoring",
-                "50-52",
+                "45-47",
             ),
             (
                 "field_elements",
@@ -383,17 +410,17 @@ _GAME_CONTEXTS = {
             ),
             (
                 "robot_constraints",
-                "The two piece geometries and floor-to-high-node scoring locations created distinct intake, orientation, and vertical-reach requirements.",
-                ["cone orientation", "cube compression", "high node", "elevator"],
-                "Sections 5.8 and 6.4",
-                "36-37, 49-52",
+                "Rule G403 limited robots completely outside their LOADING ZONE or COMMUNITY to controlling one GAME PIECE at a time.",
+                ["one game piece", "control limit", "G403"],
+                "Section 7.4, GAME PIECES, G403",
+                "61",
             ),
             (
                 "terminology",
                 "A cone/cube intake acquires either piece, a superstructure reaches GRID nodes, and an auto-balance routine engages the CHARGE STATION.",
                 ["ground intake", "double-jointed arm", "elevator", "auto balance"],
                 "Sections 5-6",
-                "18-52",
+                "18-47",
             ),
         ],
     ),
@@ -406,8 +433,8 @@ _GAME_CONTEXTS = {
                 "game_pieces",
                 "Robots collected and launched ring-shaped foam NOTES.",
                 ["note", "ring", "foam ring"],
-                "Section 5.8, GAME PIECES",
-                "39-40",
+                "Section 5.7, GAME PIECES",
+                "34",
             ),
             (
                 "scoring",
@@ -456,7 +483,7 @@ _GAME_CONTEXTS = {
                 "REEFSCAPE used tube-shaped CORAL and spherical ALGAE as separate scoring elements.",
                 ["coral", "algae", "PVC", "ball"],
                 "Section 5.7, SCORING ELEMENTS",
-                "33-35",
+                "32-34",
             ),
             (
                 "scoring",
@@ -505,14 +532,14 @@ _GAME_CONTEXTS = {
                 "Robots collect and shoot FUEL, small high-density foam balls.",
                 ["fuel", "fuel ball", "foam ball"],
                 "Section 5.10.1, FUEL",
-                "33",
+                "32",
             ),
             (
                 "scoring",
                 "Robots score FUEL into their HUB while it is active; alliance HUBS alternate active shifts before both become active in the END GAME.",
                 ["hub", "active hub", "shift", "end game"],
                 "Sections 4 and 6.4-6.5, Game Overview and Scoring",
-                "15, 45-47",
+                "15, 44-47",
             ),
             (
                 "endgame",
@@ -530,8 +557,8 @@ _GAME_CONTEXTS = {
             ),
             (
                 "robot_constraints",
-                "Robots may control any amount of FUEL, so storage and indexing capacity can be traded against obstacle crossing and tower-climb packaging.",
-                ["unlimited fuel", "hopper", "indexer", "obstacle crossing"],
+                "Robots may control any amount of FUEL at a time.",
+                ["unlimited fuel", "fuel control limit"],
                 "Section 4, Game Overview",
                 "15",
             ),
@@ -549,6 +576,7 @@ _GAME_CONTEXTS = {
 
 def game_context(year: int, topics: list[GameTopic]) -> GameContextOutput:
     supported_years = sorted(_GAME_CONTEXTS)
+    requested_topics = topics or list(ALL_GAME_TOPICS)
     record = _GAME_CONTEXTS.get(year)
     if record is None:
         note = (
@@ -559,17 +587,16 @@ def game_context(year: int, topics: list[GameTopic]) -> GameContextOutput:
         )
         return GameContextOutput(
             year=year,
-            requested_topics=topics,
+            requested_topics=requested_topics,
             coverage=GameContextCoverage(
                 supported=False,
                 supported_years=supported_years,
-                missing_topics=topics,
+                missing_topics=requested_topics,
                 note=note,
             ),
         )
 
     available_topics = list(dict.fromkeys(fact.topic for fact in record.facts))
-    requested_topics = topics or available_topics
     selected_topics = set(requested_topics)
     return GameContextOutput(
         year=year,
@@ -595,7 +622,7 @@ def team_research_targets(team_number: int, year: int | None) -> list[LiveResear
             purpose="Public team history, events, match results, awards, and record summaries.",
         )
     ]
-    if year is not None:
+    if year is not None and year >= 2015:
         targets.append(
             LiveResearchTarget(
                 provider="first_events",
