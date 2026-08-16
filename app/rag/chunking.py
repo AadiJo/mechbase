@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 MECHANISM_TERMS = {
     "shooter": ["launcher", "flywheel", "hood", "turret", "drum shooter", "multi lane"],
@@ -65,7 +66,10 @@ def section_candidates(text: str) -> list[str]:
 
 
 def normalize_token_phrase(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in normalized).split()
+    )
 
 
 def contains_token_phrase(text: str, phrase: str) -> bool:
