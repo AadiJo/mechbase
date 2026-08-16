@@ -66,7 +66,8 @@ The server provides seven read-only tools:
   image coverage counts.
 - `browse_source(...)` navigates one exact binder by page range or section and returns page-scoped
   text, immutable preview citations, and primary result IDs without leaving that source. Long
-  section scans return `next_cursor_page` so follow-up calls stay bounded.
+  section scans return a generation-pinned `next_cursor` so follow-up calls stay bounded and
+  cannot silently cross a source refresh.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.

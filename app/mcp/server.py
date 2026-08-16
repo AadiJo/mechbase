@@ -20,6 +20,7 @@ from app.mcp.cache import TTLCache
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
     AppliedSearchFilters,
+    BrowseCursor,
     BrowseSourceOutput,
     FetchOutput,
     InspectOutput,
@@ -555,8 +556,8 @@ def create_mcp_server(
             "Navigate one exact binder by page range or section without leaving that source. "
             "Use this for subsystem connections and designs that span several pages. Returned "
             "result ids can be passed to fetch, inspect_candidates, or render_search_results. "
-            "When next_cursor_page is present, repeat the same section request with that value "
-            "as cursor_page to continue the bounded scan."
+            "When next_cursor is present, repeat the same section request with that complete "
+            "cursor object to continue the bounded, generation-pinned scan."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -566,7 +567,7 @@ def create_mcp_server(
         start_page: Annotated[int | None, Field(ge=1)] = None,
         end_page: Annotated[int | None, Field(ge=1)] = None,
         section: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
-        cursor_page: Annotated[int | None, Field(ge=1)] = None,
+        cursor: BrowseCursor | None = None,
         include_previews: bool = True,
     ) -> BrowseSourceOutput:
         if (start_page is None) != (end_page is None):
@@ -576,8 +577,8 @@ def create_mcp_server(
                 raise ValueError("end_page must be greater than or equal to start_page.")
             if end_page - start_page + 1 > 10:
                 raise ValueError("browse_source can return at most 10 pages per call.")
-        if cursor_page is not None and start_page is not None:
-            raise ValueError("cursor_page cannot be combined with an explicit page range.")
+        if cursor is not None and start_page is not None:
+            raise ValueError("cursor cannot be combined with an explicit page range.")
 
         catalog = source_cache.get_or_compute(
             retrieval.corpus_revision(),
@@ -586,6 +587,14 @@ def create_mcp_server(
         source = next((item for item in catalog.sources if item.source_id == source_id), None)
         if source is None:
             raise ValueError(f"No indexed source found for source_id {source_id!r}.")
+        if cursor is not None and (
+            cursor.source_version_id != source.source_version_id
+            or cursor.ingestion_id != source.ingestion_id
+        ):
+            raise ValueError(
+                "The source generation changed after this browse cursor was issued; restart "
+                "browse_source without a cursor."
+            )
 
         available_pages = sorted(source.pages)
         has_range = start_page is not None and end_page is not None
@@ -593,7 +602,7 @@ def create_mcp_server(
             requested_pages = list(range(start_page, end_page + 1))
         else:
             eligible_pages = [
-                page for page in available_pages if cursor_page is None or page >= cursor_page
+                page for page in available_pages if cursor is None or page >= cursor.page
             ]
             scan_limit = BROWSE_SECTION_SCAN_PAGES if section else 10
             requested_pages = eligible_pages[:scan_limit]
@@ -612,21 +621,26 @@ def create_mcp_server(
         matching_contexts = [
             context
             for context in contexts
-            if section_needle is None
-            or section_needle in (context.section or "").casefold()
+            if section_needle is None or section_needle in (context.section or "").casefold()
         ]
         total_matches = len(matching_contexts)
         matching_contexts = matching_contexts[:10]
-        next_cursor_page = None
+        next_cursor = None
         if not has_range and pages_to_load:
             if total_matches > len(matching_contexts):
                 resume_after = matching_contexts[-1].page
             else:
                 resume_after = pages_to_load[-1]
-            next_cursor_page = next(
+            next_page = next(
                 (page for page in available_pages if page > resume_after),
                 None,
             )
+            if next_page is not None:
+                next_cursor = BrowseCursor(
+                    page=next_page,
+                    source_version_id=source.source_version_id,
+                    ingestion_id=source.ingestion_id,
+                )
 
         return browse_source_output(
             source,
@@ -635,8 +649,8 @@ def create_mcp_server(
             include_previews=include_previews,
             missing_pages=sorted(set(missing_pages)),
             scanned_pages=len(pages_to_load),
-            next_cursor_page=next_cursor_page,
-            truncated=next_cursor_page is not None,
+            next_cursor=next_cursor,
+            truncated=next_cursor is not None,
         )
 
     return server

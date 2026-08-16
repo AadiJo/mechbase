@@ -81,6 +81,16 @@ def inherited_section_from_text(
     return section_from_text(text, ignored) or previous
 
 
+def resolve_page_section(
+    text: str,
+    previous: str | None,
+    ignored: set[str] | None = None,
+    *,
+    outline_heading: str | None = None,
+) -> str | None:
+    return outline_heading or section_from_text(text, ignored) or previous
+
+
 def split_text(text: str, target_chars: int, overlap_chars: int) -> list[str]:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:

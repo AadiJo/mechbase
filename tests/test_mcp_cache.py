@@ -33,3 +33,16 @@ def test_get_or_compute_coalesces_concurrent_cache_misses() -> None:
 
     assert results == ["catalog"] * callers
     assert call_count == 1
+
+
+def test_get_or_compute_caches_none_values() -> None:
+    cache: TTLCache[str, str | None] = TTLCache(ttl_seconds=60)
+    call_count = 0
+
+    def compute() -> None:
+        nonlocal call_count
+        call_count += 1
+
+    assert cache.get_or_compute("missing", compute) is None
+    assert cache.get_or_compute("missing", compute) is None
+    assert call_count == 1

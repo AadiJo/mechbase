@@ -106,16 +106,23 @@ class BrowsePage(BaseModel):
     image_url: str | None = None
 
 
+class BrowseCursor(BaseModel):
+    page: int = Field(ge=1)
+    source_version_id: str = Field(min_length=1, max_length=200)
+    ingestion_id: str | None = Field(default=None, max_length=200)
+
+
 class BrowseSourceOutput(BaseModel):
     source_id: str
     source_version_id: str
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
     pages: list[BrowsePage]
     missing_pages: list[int] = Field(default_factory=list)
     scanned_pages: int = 0
-    next_cursor_page: int | None = None
+    next_cursor: BrowseCursor | None = None
     truncated: bool = False
 
 
@@ -301,7 +308,7 @@ def browse_source_output(
     include_previews: bool,
     missing_pages: list[int],
     scanned_pages: int,
-    next_cursor_page: int | None,
+    next_cursor: BrowseCursor | None,
     truncated: bool,
 ) -> BrowseSourceOutput:
     pages = []
@@ -332,13 +339,14 @@ def browse_source_output(
     return BrowseSourceOutput(
         source_id=source.source_id,
         source_version_id=source.source_version_id,
+        ingestion_id=source.ingestion_id,
         source_pdf=source.source_pdf,
         team=source.team,
         year=source.year,
         pages=pages,
         missing_pages=missing_pages,
         scanned_pages=scanned_pages,
-        next_cursor_page=next_cursor_page,
+        next_cursor=next_cursor,
         truncated=truncated,
     )
 

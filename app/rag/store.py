@@ -649,24 +649,29 @@ class RagStore:
         years: list[int] | None = None,
         source_ids: list[str] | None = None,
     ) -> SimilarPagesResponse | None:
-        payload, vectors = self._similarity_seed_for_result_id(result_id)
-        if payload is None or vectors is None:
-            return None
-        available_vectors = {
-            name: vector
-            for name in (TEXT_VECTOR, IMAGE_VECTOR)
-            if (vector := vectors.get(name)) is not None and _vector_has_signal(vector)
-        }
-        if not available_vectors:
-            return None
-        return self._similar_from_vectors(
-            available_vectors,
-            top_k,
-            payload,
-            team_numbers=team_numbers,
-            years=years,
-            source_ids=source_ids,
-        )
+        def read(active: dict[str, str]) -> SimilarPagesResponse | None:
+            payload, vectors = self._similarity_seed_for_result_id(result_id, active)
+            if payload is None or vectors is None:
+                return None
+            available_vectors = {
+                name: vector
+                for name in (TEXT_VECTOR, IMAGE_VECTOR)
+                if (vector := vectors.get(name)) is not None and _vector_has_signal(vector)
+            }
+            if not available_vectors:
+                return None
+            return self._similar_from_vectors(
+                available_vectors,
+                top_k,
+                payload,
+                team_numbers=team_numbers,
+                years=years,
+                source_ids=source_ids,
+                active_generations=active,
+            )
+
+        response, _active_generations = self._read_with_active_snapshot(read)
+        return response
 
     def similar_from_page(
         self, source_pdf: str, page: int, top_k: int
@@ -701,6 +706,7 @@ class RagStore:
     def _similarity_seed_for_result_id(
         self,
         result_id: str,
+        active_generations: dict[str, str],
     ) -> tuple[dict | None, dict | None]:
         conditions = [
             models.FieldCondition(
@@ -709,72 +715,68 @@ class RagStore:
             )
         ]
 
-        def read(active: dict[str, str]) -> tuple[dict | None, dict | None]:
-            matches = self._scroll_payloads(
-                _active_filter(must=conditions, active_generations=active),
+        matches = self._scroll_payloads(
+            _active_filter(must=conditions, active_generations=active_generations),
+            limit=None,
+            with_vectors=True,
+        )
+        matches = [
+            (payload, vectors)
+            for payload, vectors in matches
+            if _is_current_generation(payload, active_generations)
+        ]
+        if not matches:
+            return None, None
+        latest_generation = _latest_generation(payload for payload, _vectors in matches)
+        payload, raw_vectors = next(
+            (candidate, vectors)
+            for candidate, vectors in matches
+            if _generation_key(candidate) == latest_generation
+        )
+        vectors = dict(raw_vectors or {})
+
+        if payload.get("modality") == "text":
+            vectors.pop(IMAGE_VECTOR, None)
+            page_conditions: list[models.Condition] = [
+                models.FieldCondition(
+                    key="source_pdf",
+                    match=models.MatchValue(value=str(payload.get("source_pdf") or "")),
+                ),
+                models.FieldCondition(
+                    key="page",
+                    match=models.MatchValue(value=int(payload.get("page", 0))),
+                ),
+                models.FieldCondition(
+                    key="modality",
+                    match=models.MatchValue(value="page_image"),
+                ),
+            ]
+            for key in ("source_version_id", "ingestion_id"):
+                if value := payload.get(key):
+                    page_conditions.append(
+                        models.FieldCondition(
+                            key=key,
+                            match=models.MatchValue(value=value),
+                        )
+                    )
+            page_images = self._scroll_payloads(
+                _active_filter(must=page_conditions, active_generations=active_generations),
                 limit=None,
                 with_vectors=True,
             )
-            matches = [
-                (payload, vectors)
-                for payload, vectors in matches
-                if _is_current_generation(payload, active)
-            ]
-            if not matches:
-                return None, None
-            latest_generation = _latest_generation(payload for payload, _vectors in matches)
-            payload, raw_vectors = next(
-                (candidate, vectors)
-                for candidate, vectors in matches
-                if _generation_key(candidate) == latest_generation
+            page_image_vector = next(
+                (
+                    candidate_vectors.get(IMAGE_VECTOR)
+                    for candidate, candidate_vectors in page_images
+                    if _is_current_generation(candidate, active_generations)
+                    and candidate_vectors.get(IMAGE_VECTOR) is not None
+                    and _vector_has_signal(candidate_vectors[IMAGE_VECTOR])
+                ),
+                None,
             )
-            vectors = dict(raw_vectors or {})
-
-            if payload.get("modality") == "text":
-                vectors.pop(IMAGE_VECTOR, None)
-                page_conditions: list[models.Condition] = [
-                    models.FieldCondition(
-                        key="source_pdf",
-                        match=models.MatchValue(value=str(payload.get("source_pdf") or "")),
-                    ),
-                    models.FieldCondition(
-                        key="page",
-                        match=models.MatchValue(value=int(payload.get("page", 0))),
-                    ),
-                    models.FieldCondition(
-                        key="modality",
-                        match=models.MatchValue(value="page_image"),
-                    ),
-                ]
-                for key in ("source_version_id", "ingestion_id"):
-                    if value := payload.get(key):
-                        page_conditions.append(
-                            models.FieldCondition(
-                                key=key,
-                                match=models.MatchValue(value=value),
-                            )
-                        )
-                page_images = self._scroll_payloads(
-                    _active_filter(must=page_conditions, active_generations=active),
-                    limit=None,
-                    with_vectors=True,
-                )
-                page_image_vector = next(
-                    (
-                        candidate_vectors.get(IMAGE_VECTOR)
-                        for candidate, candidate_vectors in page_images
-                        if _is_current_generation(candidate, active)
-                        and candidate_vectors.get(IMAGE_VECTOR) is not None
-                        and _vector_has_signal(candidate_vectors[IMAGE_VECTOR])
-                    ),
-                    None,
-                )
-                if page_image_vector is not None:
-                    vectors[IMAGE_VECTOR] = page_image_vector
-            return payload, vectors
-
-        value, _active_generations = self._read_with_active_snapshot(read)
-        return value
+            if page_image_vector is not None:
+                vectors[IMAGE_VECTOR] = page_image_vector
+        return payload, vectors
 
     def image_context(
         self,
@@ -869,11 +871,13 @@ class RagStore:
         team_numbers: list[str] | None = None,
         years: list[int] | None = None,
         source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
     ) -> SimilarPagesResponse:
         top_k = min(max(top_k, 1), MAX_RETRIEVAL_PAGES)
         limit = max(top_k * 12, 60)
-        hits_by_vector, active_generations = self._read_with_active_snapshot(
-            lambda active: {
+
+        def query(active: dict[str, str]):
+            return {
                 vector_name: self.client.query_points(
                     collection_name=self.settings.collection_name,
                     query=vector,
@@ -889,7 +893,11 @@ class RagStore:
                 ).points
                 for vector_name, vector in vectors.items()
             }
-        )
+
+        if active_generations is None:
+            hits_by_vector, active_generations = self._read_with_active_snapshot(query)
+        else:
+            hits_by_vector = query(active_generations)
         page_hits: dict[tuple[str, int], dict[str, tuple[float, dict]]] = {}
         candidate_pages: set[tuple[str, int]] = set()
         candidate_sources: set[str] = set()
@@ -900,7 +908,7 @@ class RagStore:
                 if not _is_current_generation(payload, active_generations):
                     continue
                 page_key = _page_key(payload)
-                if page_key == seed_page:
+                if page_key == seed_page or payload.get("id") == seed_payload.get("id"):
                     continue
                 candidate_pages.add(page_key)
                 candidate_sources.add(
@@ -953,9 +961,7 @@ class RagStore:
             )
             for score, payload, reason, vector_scores in ranked_pages[:top_k]
         ]
-        relevant_pages = {
-            _page_key(payload) for _score, payload, _reason, _scores in ranked_pages
-        }
+        relevant_pages = {_page_key(payload) for _score, payload, _reason, _scores in ranked_pages}
         return SimilarPagesResponse(
             seed={
                 "id": seed_payload.get("id"),

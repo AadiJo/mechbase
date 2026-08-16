@@ -9,7 +9,7 @@ import pytesseract
 from PIL import Image
 
 from app.rag.artifacts import generation_namespace, source_artifact_root
-from app.rag.chunking import inherited_section_from_text, section_candidates, split_text
+from app.rag.chunking import resolve_page_section, section_candidates, split_text
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SourceDoc
 
@@ -60,7 +60,7 @@ def extract_documents(
     docs: list[RagDocument] = []
     pdf = fitz.open(source.path)
     try:
-        outline_sections = _outline_sections(pdf)
+        outline_sections = _outline_section_starts(pdf)
         repeated_headers = _repeated_headers(pdf)
         inherited_section = None
         for page_index, page in enumerate(pdf):
@@ -77,13 +77,12 @@ def extract_documents(
                 if not page_image_path.exists():
                     _render_page(page, settings.render_dpi, page_image_path)
 
-            section = outline_sections.get(page_num)
-            if section is None:
-                section = inherited_section_from_text(
-                    page_text,
-                    inherited_section,
-                    repeated_headers,
-                )
+            section = resolve_page_section(
+                page_text,
+                inherited_section,
+                repeated_headers,
+                outline_heading=outline_sections.get(page_num),
+            )
             inherited_section = section
             linked_artifacts = [str(page_image_path)]
             extracted_images = _extract_page_images(
@@ -218,7 +217,7 @@ def _extract_page_images(
     return docs
 
 
-def _outline_sections(pdf: fitz.Document) -> dict[int, str]:
+def _outline_section_starts(pdf: fitz.Document) -> dict[int, str]:
     try:
         outline = pdf.get_toc(simple=True)
     except (RuntimeError, ValueError):
@@ -231,30 +230,18 @@ def _outline_sections(pdf: fitz.Document) -> dict[int, str]:
     if not starts:
         return {}
 
-    sections = {}
-    active = None
     starts_by_page: dict[int, list[str]] = {}
     for page, title in starts:
         starts_by_page.setdefault(page, []).append(title)
-    for page in range(1, len(pdf) + 1):
-        if page in starts_by_page:
-            active = starts_by_page[page][-1]
-        if active is not None:
-            sections[page] = active
-    return sections
+    return {page: titles[-1] for page, titles in starts_by_page.items()}
 
 
 def _repeated_headers(pdf: fitz.Document) -> set[str]:
     candidate_counts: Counter[str] = Counter()
     for page in pdf:
         candidates = {
-            candidate.casefold()
-            for candidate in section_candidates(page.get_text("text"))[:2]
+            candidate.casefold() for candidate in section_candidates(page.get_text("text"))[:2]
         }
         candidate_counts.update(candidates)
     minimum_repeats = max(2, math.ceil(len(pdf) * 0.6))
-    return {
-        candidate
-        for candidate, count in candidate_counts.items()
-        if count >= minimum_repeats
-    }
+    return {candidate for candidate, count in candidate_counts.items() if count >= minimum_repeats}

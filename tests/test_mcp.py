@@ -51,6 +51,7 @@ class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
         self.similar_calls: list[dict[str, object]] = []
+        self.similar_attempts: list[str] = []
         self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
 
@@ -99,6 +100,7 @@ class FakeRetrievalBackend:
         years: list[int],
         source_ids: list[str],
     ) -> SimilarPagesResponse | None:
+        self.similar_attempts.append(result_id)
         if result_id == "missing":
             return None
         self.similar_calls.append(
@@ -733,6 +735,14 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert cached_similar.is_error is False
                         assert len(backend.similar_calls) == 1
 
+                        missing_similar = await session.call_tool("find_similar", {"id": "missing"})
+                        assert missing_similar.is_error is True
+                        repeated_missing_similar = await session.call_tool(
+                            "find_similar", {"id": "missing"}
+                        )
+                        assert repeated_missing_similar.is_error is True
+                        assert backend.similar_attempts.count("missing") == 1
+
                         rendered = await session.call_tool(
                             "render_search_results", {"ids": ["result_1"]}
                         )
@@ -816,7 +826,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "https://api.example.com/images/"
                         )
                         assert browsed.structured_content["scanned_pages"] == 1
-                        assert browsed.structured_content["next_cursor_page"] is None
+                        assert browsed.structured_content["next_cursor"] is None
                         assert backend.page_context_calls[-1]["pages"] == [1]
 
                         browsed_section = await session.call_tool(
@@ -843,9 +853,37 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert bounded_section_browse.is_error is False
                         assert bounded_section_browse.structured_content["scanned_pages"] == 50
-                        assert bounded_section_browse.structured_content["next_cursor_page"] == 51
+                        assert bounded_section_browse.structured_content["next_cursor"] == {
+                            "page": 51,
+                            "source_version_id": "999-2024@version-c",
+                            "ingestion_id": "ingestion-c",
+                        }
                         assert bounded_section_browse.structured_content["truncated"] is True
                         assert backend.page_context_calls[-1]["pages"] == list(range(1, 51))
+                        stale_cursor_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                                "cursor": {
+                                    "page": 51,
+                                    "source_version_id": "999-2024@old",
+                                    "ingestion_id": "ingestion-old",
+                                },
+                            },
+                        )
+                        assert stale_cursor_browse.is_error is True
+                        continued_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert continued_section_browse.is_error is False
+                        assert continued_section_browse.structured_content["next_cursor"] is None
+                        assert backend.page_context_calls[-1]["pages"] == list(range(51, 101))
 
                         oversized_browse = await session.call_tool(
                             "browse_source",

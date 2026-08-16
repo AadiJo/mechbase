@@ -1,5 +1,10 @@
-from app.rag.chunking import expand_query, inherited_section_from_text, split_text
-from app.rag.pdf import _outline_sections
+from app.rag.chunking import (
+    expand_query,
+    inherited_section_from_text,
+    resolve_page_section,
+    split_text,
+)
+from app.rag.pdf import _outline_section_starts
 
 
 def test_expand_multi_ball_query() -> None:
@@ -95,13 +100,31 @@ class FakeOutlinePdf:
         return [[1, "Overview", 1], [1, "Elevator", 3]]
 
 
-def test_pdf_outline_sections_continue_until_the_next_heading() -> None:
-    sections = _outline_sections(FakeOutlinePdf())
+def test_pdf_outline_exposes_only_explicit_heading_starts() -> None:
+    sections = _outline_section_starts(FakeOutlinePdf())
 
-    assert sections == {
-        1: "Overview",
-        2: "Overview",
-        3: "Elevator",
-        4: "Elevator",
-        5: "Elevator",
-    }
+    assert sections == {1: "Overview", 3: "Elevator"}
+
+
+def test_sparse_outline_does_not_suppress_later_text_sections() -> None:
+    ignored_headers = {"team 254 technical binder"}
+    document = resolve_page_section(
+        "Team 254 Technical Binder",
+        None,
+        ignored_headers,
+        outline_heading="Robot Technical Binder",
+    )
+    subsystem = resolve_page_section(
+        "Team 254 Technical Binder\nElevator\nThe carriage uses two stages.",
+        document,
+        ignored_headers,
+    )
+    continuation = resolve_page_section(
+        "Team 254 Technical Binder\nThe second stage is belt driven.",
+        subsystem,
+        ignored_headers,
+    )
+
+    assert document == "Robot Technical Binder"
+    assert subsystem == "Elevator"
+    assert continuation == "Elevator"

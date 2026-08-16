@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
-from app.rag.models import RagDocument, SearchRequest
+from app.rag.models import RagDocument, SearchRequest, SimilarPagesResponse
 from app.rag.pdf import _document_id
 from app.rag.search import _expansion_years
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
@@ -801,6 +801,75 @@ def test_result_similarity_skips_placeholder_image_vectors_without_a_page_image(
 
     assert response is not None
     assert client.queried_vectors == [TEXT_VECTOR]
+
+
+class SnapshotBoundSimilarityStore(RagStore):
+    def __init__(self) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(
+            [
+                {"254-2023": "generation-old"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+            ]
+        )
+        self.seed_snapshots: list[dict[str, str]] = []
+        self.query_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        return next(self._snapshots)
+
+    def _similarity_seed_for_result_id(
+        self,
+        result_id: str,
+        active_generations: dict[str, str],
+    ) -> tuple[dict, dict]:
+        self.seed_snapshots.append(active_generations)
+        return (
+            {
+                "id": result_id,
+                "source_id": "254-2023",
+                "source_pdf": "254-2023.pdf",
+                "page": 1,
+                "modality": "text",
+            },
+            {TEXT_VECTOR: [0.1]},
+        )
+
+    def _similar_from_vectors(
+        self,
+        vectors: dict[str, list[float]],
+        top_k: int,
+        seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
+    ) -> SimilarPagesResponse:
+        assert vectors == {TEXT_VECTOR: [0.1]}
+        assert top_k == 10
+        assert seed_payload["id"] == "seed"
+        assert team_numbers is None
+        assert years is None
+        assert source_ids is None
+        assert active_generations is not None
+        self.query_snapshots.append(active_generations)
+        return SimilarPagesResponse(seed=seed_payload, results=[])
+
+
+def test_result_similarity_retries_seed_and_candidates_under_one_snapshot() -> None:
+    store = SnapshotBoundSimilarityStore()
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert store.seed_snapshots == [
+        {"254-2023": "generation-old"},
+        {"254-2023": "generation-new"},
+    ]
+    assert store.query_snapshots == store.seed_snapshots
 
 
 def test_find_similar_reports_text_shape_and_combined_matches() -> None:
