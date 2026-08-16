@@ -39,6 +39,43 @@ so the service can validate keys and record usage through Convex.
 Search results include `artifact_url`, `linked_artifact_urls`, `page_context_url`, and
 `page_text_url`. Use them when the agent needs to display images or fetch more page context.
 
+## Hosted MCP
+
+The API also exposes a stateless Streamable HTTP MCP server at `/mcp`. It is additive: the
+frontend and all existing REST endpoints continue to use Mechbase API keys without changes.
+The MCP endpoint accepts Clerk OAuth access tokens only.
+
+The server provides four read-only tools:
+
+- `search(query)` returns the standard ChatGPT company-knowledge result shape.
+- `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
+- `find_similar(id, top_k)` finds related mechanism pages.
+- `list_sources(...)` lists indexed technical binders.
+
+Configure the resource server with:
+
+```dotenv
+MCP_PUBLIC_BASE_URL=https://api.example.com
+MCP_OAUTH_SCOPES=openid
+MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://claude.ai
+CLERK_OAUTH_ISSUER_URL=https://clerk.example.com
+CLERK_SECRET_KEY=sk_live_...
+```
+
+In the same Clerk instance, enable Dynamic client registration and set its default scope to
+`openid`. Some MCP clients, including ChatGPT and Claude, omit scopes when they register. The
+protected-resource discovery document is served at
+`/.well-known/oauth-protected-resource/mcp`.
+
+Inspect a running endpoint with the official MCP Inspector:
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+Select Streamable HTTP, enter the `/mcp` URL, and complete the Clerk login flow. Verify
+initialization, tool schemas, authorization failures, representative calls, and invalid inputs.
+
 Fetch a page image through the API/VPS:
 
 ```bash

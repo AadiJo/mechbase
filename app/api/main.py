@@ -1,10 +1,14 @@
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from urllib.parse import quote
+from starlette.responses import RedirectResponse
 
 from app.api.auth import ApiKeyContext, record_usage, require_api_key
+from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import get_settings
 from app.rag.models import (
     ImageContextResponse,
@@ -22,8 +26,18 @@ from app.rag.search import search
 from app.rag.store import RagStore
 from app.rag.voyage_client import MissingVoyageApiKey
 
-app = FastAPI(title="FRC Mechanism RAG", version="0.1.0")
 settings = get_settings()
+mcp_server = create_mcp_server(settings)
+mcp_http_app = create_mcp_http_app(mcp_server, settings)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async with mcp_server.session_manager.run():
+        yield
+
+
+app = FastAPI(title="FRC Mechanism RAG", version="0.1.0", lifespan=lifespan)
 app.mount(
     settings.artifact_url_base,
     StaticFiles(directory=settings.artifact_dir, check_dir=False),
@@ -113,7 +127,9 @@ def search_sources(
             year=request.year,
             source=request.source,
         )
-        matches = RagStore(get_settings()).source_search_from_results(request.query, search_response.results)
+        matches = RagStore(get_settings()).source_search_from_results(
+            request.query, search_response.results
+        )
         return SourceSearchResponse(query=request.query, matches=matches[: request.top_k])
 
     sources = RagStore(get_settings()).list_sources(
@@ -133,8 +149,12 @@ def search_sources(
                 "score": 1.0,
                 "best_snippets": [],
                 "image_urls": source_item.sample_image_urls,
-                "page_context_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}" if page else "",
-                "page_text_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}/text" if page else "",
+                "page_context_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}"
+                if page
+                else "",
+                "page_text_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}/text"
+                if page
+                else "",
             }
         )
     return SourceSearchResponse(query=None, matches=source_matches)
@@ -213,3 +233,17 @@ def page_text(
 def init_collection(_api_key: ApiKeyContext = Depends(require_api_key)) -> dict:
     RagStore(get_settings()).ensure_collection()
     return {"ok": True}
+
+
+@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
+def legacy_oauth_metadata() -> RedirectResponse:
+    """Support clients that still discover OAuth metadata from the resource origin."""
+    issuer = str(settings.clerk_oauth_issuer_url).rstrip("/")
+    return RedirectResponse(
+        f"{issuer}/.well-known/oauth-authorization-server",
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+# This catch-all mount must remain last so the existing REST and artifact routes win.
+app.mount("/", mcp_http_app, name="mcp")
