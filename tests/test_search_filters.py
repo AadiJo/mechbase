@@ -872,6 +872,87 @@ def test_result_similarity_retries_seed_and_candidates_under_one_snapshot() -> N
     assert store.query_snapshots == store.seed_snapshots
 
 
+class SnapshotBoundPageSimilarityStore(RagStore):
+    def __init__(self) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(
+            [
+                {"254-2023": "generation-old"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+            ]
+        )
+        self.current_snapshot: dict[str, str] = {}
+        self.seed_snapshots: list[dict[str, str]] = []
+        self.query_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        self.current_snapshot = next(self._snapshots)
+        return self.current_snapshot
+
+    def _scroll_payloads(
+        self,
+        qfilter: models.Filter | None,
+        limit: int | None,
+        with_vectors: bool = False,
+    ):
+        assert qfilter is not None
+        assert limit is None
+        assert with_vectors is True
+        snapshot = dict(self.current_snapshot)
+        self.seed_snapshots.append(snapshot)
+        return [
+            (
+                {
+                    "id": "seed",
+                    "source_id": "254-2023",
+                    "source_pdf": "254-2023.pdf",
+                    "ingestion_id": snapshot["254-2023"],
+                    "page": 1,
+                    "modality": "text",
+                },
+                {TEXT_VECTOR: [0.1]},
+            )
+        ]
+
+    def _similar_from_vector(
+        self,
+        vector_name: str,
+        vector: list[float],
+        top_k: int,
+        seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
+    ) -> SimilarPagesResponse:
+        assert vector_name == TEXT_VECTOR
+        assert vector == [0.1]
+        assert top_k == 10
+        assert seed_payload["id"] == "seed"
+        assert team_numbers is None
+        assert years is None
+        assert source_ids is None
+        assert active_generations is not None
+        self.query_snapshots.append(active_generations)
+        return SimilarPagesResponse(seed=seed_payload, results=[])
+
+
+def test_page_similarity_retries_seed_and_candidates_under_one_snapshot() -> None:
+    store = SnapshotBoundPageSimilarityStore()
+
+    response = store.similar_from_page("254-2023.pdf", 1, 10)
+
+    assert response is not None
+    assert store.seed_snapshots == [
+        {"254-2023": "generation-old"},
+        {"254-2023": "generation-new"},
+    ]
+    assert store.query_snapshots == store.seed_snapshots
+
+
 def test_find_similar_reports_text_shape_and_combined_matches() -> None:
     client = DualVectorSimilarityClient()
     store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)

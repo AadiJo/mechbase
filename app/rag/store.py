@@ -681,27 +681,34 @@ class RagStore:
             models.FieldCondition(key="page", match=models.MatchValue(value=page)),
             models.FieldCondition(key="modality", match=models.MatchValue(value="text")),
         ]
-        payloads, active_generations = self._read_with_active_snapshot(
-            lambda active: self._scroll_payloads(
+
+        def read(active: dict[str, str]) -> SimilarPagesResponse | None:
+            payloads = self._scroll_payloads(
                 _active_filter(must=conditions, active_generations=active),
                 limit=None,
                 with_vectors=True,
             )
-        )
-        if not payloads:
-            return None
-        payloads = [
-            (payload, vectors)
-            for payload, vectors in payloads
-            if _is_current_generation(payload, active_generations)
-        ]
-        if not payloads:
-            return None
-        payload, vectors = payloads[0]
-        vector = vectors.get(TEXT_VECTOR) if vectors else None
-        if vector is None:
-            return None
-        return self._similar_from_vector(TEXT_VECTOR, vector, top_k, payload)
+            payloads = [
+                (payload, vectors)
+                for payload, vectors in payloads
+                if _is_current_generation(payload, active)
+            ]
+            if not payloads:
+                return None
+            payload, vectors = payloads[0]
+            vector = vectors.get(TEXT_VECTOR) if vectors else None
+            if vector is None:
+                return None
+            return self._similar_from_vector(
+                TEXT_VECTOR,
+                vector,
+                top_k,
+                payload,
+                active_generations=active,
+            )
+
+        response, _active_generations = self._read_with_active_snapshot(read)
+        return response
 
     def _similarity_seed_for_result_id(
         self,
@@ -852,6 +859,7 @@ class RagStore:
         team_numbers: list[str] | None = None,
         years: list[int] | None = None,
         source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
     ) -> SimilarPagesResponse:
         return self._similar_from_vectors(
             {vector_name: vector},
@@ -860,6 +868,7 @@ class RagStore:
             team_numbers=team_numbers,
             years=years,
             source_ids=source_ids,
+            active_generations=active_generations,
         )
 
     def _similar_from_vectors(

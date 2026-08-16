@@ -50,10 +50,12 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
+        self.fetch_calls: list[str] = []
         self.similar_calls: list[dict[str, object]] = []
         self.similar_attempts: list[str] = []
         self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
+        self.revision_sequence: list[str] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -68,9 +70,12 @@ class FakeRetrievalBackend:
         )
 
     def corpus_revision(self) -> str:
+        if self.revision_sequence:
+            return self.revision_sequence.pop(0)
         return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
+        self.fetch_calls.append(result_id)
         if result_id == "missing":
             return None
         return ImageContextResponse(
@@ -698,6 +703,27 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert backend.page_context_calls[-1]["pages"] == [11, 13]
 
+                        page_context_calls_before_refresh = len(backend.page_context_calls)
+                        fetch_calls_before_refresh = len(backend.fetch_calls)
+                        backend.revision_sequence = [
+                            "fetch-old",
+                            "fetch-new",
+                            "fetch-new",
+                            "fetch-new",
+                        ]
+                        refreshed_fetch = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 1}
+                        )
+                        assert refreshed_fetch.is_error is False
+                        assert [
+                            page["page"] for page in refreshed_fetch.structured_content["pages"]
+                        ] == [11, 12, 13]
+                        assert len(backend.fetch_calls) == fetch_calls_before_refresh + 2
+                        assert (
+                            len(backend.page_context_calls) == page_context_calls_before_refresh + 2
+                        )
+                        assert backend.revision_sequence == []
+
                         similar = await session.call_tool(
                             "find_similar",
                             {
@@ -828,6 +854,12 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert browsed.structured_content["scanned_pages"] == 1
                         assert browsed.structured_content["next_cursor"] is None
                         assert backend.page_context_calls[-1]["pages"] == [1]
+                        assert backend.list_source_calls[-1] == {
+                            "team_numbers": [],
+                            "years": [],
+                            "source_ids": ["254-2020"],
+                            "source_query": None,
+                        }
 
                         browsed_section = await session.call_tool(
                             "browse_source",
@@ -855,11 +887,30 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert bounded_section_browse.structured_content["scanned_pages"] == 50
                         assert bounded_section_browse.structured_content["next_cursor"] == {
                             "page": 51,
+                            "source_id": "999-2024",
+                            "section": "elevator",
                             "source_version_id": "999-2024@version-c",
                             "ingestion_id": "ingestion-c",
                         }
                         assert bounded_section_browse.structured_content["truncated"] is True
                         assert backend.page_context_calls[-1]["pages"] == list(range(1, 51))
+                        omitted_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert omitted_section_browse.is_error is True
+                        changed_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "intake",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert changed_section_browse.is_error is True
                         stale_cursor_browse = await session.call_tool(
                             "browse_source",
                             {
@@ -867,6 +918,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "section": "elevator",
                                 "cursor": {
                                     "page": 51,
+                                    "source_id": "999-2024",
+                                    "section": "elevator",
                                     "source_version_id": "999-2024@old",
                                     "ingestion_id": "ingestion-old",
                                 },
@@ -909,7 +962,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 2
+                        assert len(backend.list_source_calls) == 3
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -923,7 +976,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 3
+                        assert len(backend.list_source_calls) == 4
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],
@@ -931,10 +984,42 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "source_query": None,
                         }
 
+                        list_source_calls_before_refresh = len(backend.list_source_calls)
+                        page_context_calls_before_browse_refresh = len(backend.page_context_calls)
+                        backend.revision_sequence = [
+                            "browse-old",
+                            "browse-new",
+                            "browse-new",
+                            "browse-new",
+                        ]
+                        refreshed_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 2,
+                            },
+                        )
+                        assert refreshed_browse.is_error is False
+                        assert refreshed_browse.structured_content["missing_pages"] == [2]
+                        assert (
+                            len(backend.list_source_calls) == list_source_calls_before_refresh + 2
+                        )
+                        assert (
+                            len(backend.page_context_calls)
+                            == page_context_calls_before_browse_refresh + 2
+                        )
+                        assert backend.revision_sequence == []
+
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}
                         )
                         assert invalid.is_error is True
+
+                        oversized_id = "x" * 257
+                        invalid_id = await session.call_tool("find_similar", {"id": oversized_id})
+                        assert invalid_id.is_error is True
+                        assert oversized_id not in backend.similar_attempts
 
                         too_many_images = await session.call_tool(
                             "inspect_candidates",
