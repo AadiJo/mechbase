@@ -18,7 +18,12 @@ from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.images import candidate_asset_sources, load_preview_image
 from app.mcp.results import fetch_output, search_output
-from app.mcp.server import create_mcp_http_app, create_mcp_server
+from app.mcp.server import (
+    MAX_INSPECTION_ENCODED_BYTES,
+    MAX_INSPECTION_IMAGES,
+    create_mcp_http_app,
+    create_mcp_server,
+)
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
     FetchContextResponse,
@@ -82,7 +87,10 @@ class FakeRetrievalBackend:
         self.fetch_calls.append(result_id)
         if result_id == "missing":
             return None
-        page = 13 if result_id == "result_cross_page" else 12
+        if result_id.startswith("result_budget_"):
+            page = 20 + int(result_id.rsplit("_", 1)[1])
+        else:
+            page = 13 if result_id == "result_cross_page" else 12
         generation = f"/{self.asset_generation}" if self.asset_generation and page == 12 else ""
         asset_root = f"/images/254-2020{generation}/page-{page:03d}"
         return ImageContextResponse(
@@ -569,6 +577,14 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
     cross_page_image.parent.mkdir(parents=True)
     Image.new("RGB", (1200, 800), "white").save(cross_page_image)
     Image.new("RGB", (500, 400), "green").save(cross_page_image.parent / "image-000.png")
+    noise_page = Image.effect_noise((1800, 1200), 100).convert("RGB")
+    noise_figure = Image.effect_noise((1200, 900), 100).convert("RGB")
+    for page in range(20, 26):
+        budget_root = tmp_path / "254-2020" / f"page-{page:03d}"
+        budget_root.mkdir(parents=True)
+        noise_page.save(budget_root / "page.png")
+        noise_figure.save(budget_root / "image-000.png")
+        noise_figure.save(budget_root / "image-001.png")
     for generation in ("generation-old", "generation-new"):
         generation_root = tmp_path / "254-2020" / generation / "page-012"
         generation_root.mkdir(parents=True)
@@ -843,6 +859,24 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             )
                             == 1
                         )
+
+                        budgeted_inspection = await session.call_tool(
+                            "inspect_candidates",
+                            {"ids": [f"result_budget_{index}" for index in range(6)]},
+                        )
+                        assert budgeted_inspection.is_error is False
+                        budgeted_images = [
+                            block for block in budgeted_inspection.content if block.type == "image"
+                        ]
+                        assert 0 < len(budgeted_images) <= MAX_INSPECTION_IMAGES
+                        assert sum(len(block.data) for block in budgeted_images) <= (
+                            MAX_INSPECTION_ENCODED_BYTES
+                        )
+                        assert sum(
+                            len(candidate["assets"])
+                            for candidate in budgeted_inspection.structured_content["candidates"]
+                        ) == len(budgeted_images)
+                        assert len(budgeted_images) < 18
 
                         fetched = await session.call_tool("fetch", {"id": "result_1"})
                         assert fetched.is_error is False

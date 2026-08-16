@@ -17,7 +17,12 @@ from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.cache import TTLCache
-from app.mcp.images import candidate_asset_sources, load_preview_url
+from app.mcp.images import (
+    CandidateAssetSource,
+    PreviewImage,
+    candidate_asset_sources,
+    load_preview_url,
+)
 from app.mcp.results import (
     MAX_NORMALIZED_SECTION_LENGTH,
     AppliedSearchFilters,
@@ -74,6 +79,8 @@ MechanismType = MechanismTypeFilter
 ResultId = Annotated[str, Field(min_length=1, max_length=256)]
 BROWSE_SECTION_SCAN_PAGES = 50
 MAX_INSPECTED_FIGURES = 4
+MAX_INSPECTION_IMAGES = 12
+MAX_INSPECTION_ENCODED_BYTES = 8 * 1024 * 1024
 
 
 class RetrievalBackend(Protocol):
@@ -398,14 +405,19 @@ def create_mcp_server(
                 annotations=MODEL_ONLY,
             )
         ]
+        contexts_by_id: dict[str, ImageContextResponse] = {}
+        valid_assets_by_id: dict[
+            str,
+            list[tuple[CandidateAssetSource, PreviewImage]],
+        ] = {}
         for result_id in unique_ids:
             context = contexts.get(result_id)
             if context is None:
                 missing_ids.append(result_id)
                 continue
 
-            loaded_assets = []
-            previews = []
+            contexts_by_id[result_id] = context
+            valid_assets = []
             loaded_figures = 0
             for asset_source in candidate_asset_sources(
                 context,
@@ -420,15 +432,61 @@ def create_mcp_server(
                     continue
                 if asset_source.kind == "figure":
                     loaded_figures += 1
-                loaded_assets.append(
-                    visual_asset(
-                        context,
-                        asset_source,
-                        preview,
-                        public_base_url,
-                    )
-                )
-                previews.append((asset_source, preview))
+                valid_assets.append((asset_source, preview))
+            valid_assets_by_id[result_id] = valid_assets
+
+        selected_by_id: dict[str, list[tuple[CandidateAssetSource, PreviewImage]]] = {
+            result_id: [] for result_id in contexts_by_id
+        }
+        selected_asset_ids: set[str] = set()
+        selected_image_count = 0
+        selected_encoded_bytes = 0
+
+        def select_asset(
+            result_id: str,
+            asset: tuple[CandidateAssetSource, PreviewImage],
+        ) -> bool:
+            nonlocal selected_encoded_bytes, selected_image_count
+            asset_source, preview = asset
+            if asset_source.asset_id in selected_asset_ids:
+                return False
+            encoded_bytes = 4 * ((len(preview.data) + 2) // 3)
+            if (
+                selected_image_count == MAX_INSPECTION_IMAGES
+                or selected_encoded_bytes + encoded_bytes > MAX_INSPECTION_ENCODED_BYTES
+            ):
+                return False
+            selected_by_id[result_id].append(asset)
+            selected_asset_ids.add(asset_source.asset_id)
+            selected_image_count += 1
+            selected_encoded_bytes += encoded_bytes
+            return True
+
+        # Give every candidate's full page first priority, then fall back to its first figure.
+        for result_id, valid_assets in valid_assets_by_id.items():
+            page_asset = next(
+                (asset for asset in valid_assets if asset[0].kind == "page"),
+                None,
+            )
+            if page_asset is not None:
+                select_asset(result_id, page_asset)
+        for result_id, valid_assets in valid_assets_by_id.items():
+            if not selected_by_id[result_id] and valid_assets:
+                select_asset(result_id, valid_assets[0])
+
+        # Add figures round-robin so one candidate cannot consume the call-wide budget.
+        for figure_index in range(MAX_INSPECTED_FIGURES):
+            for result_id, valid_assets in valid_assets_by_id.items():
+                figures = [asset for asset in valid_assets if asset[0].kind == "figure"]
+                if figure_index < len(figures):
+                    select_asset(result_id, figures[figure_index])
+
+        for result_id, context in contexts_by_id.items():
+            selected_assets = selected_by_id[result_id]
+            loaded_assets = [
+                visual_asset(context, asset_source, preview, public_base_url)
+                for asset_source, preview in selected_assets
+            ]
             candidate = visual_candidate(
                 context,
                 result_id,
@@ -448,7 +506,7 @@ def create_mcp_server(
                     annotations=MODEL_ONLY,
                 )
             )
-            for asset_source, preview in previews:
+            for asset_source, preview in selected_assets:
                 content.append(
                     TextContent(
                         type="text",
