@@ -56,9 +56,10 @@ The server provides six read-only tools:
   hosts that support MCP Apps. Other clients still receive its structured result.
 - `list_sources(...)` lists indexed technical binders.
 
-For visual requests, the intended flow is `search` -> `inspect_candidates` ->
-`render_search_results`. The render tool is separate from retrieval so irrelevant RAG results do
-not appear just because they ranked highly.
+Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
+`render_search_results`, even when the user does not explicitly ask to inspect or display images.
+Inspection images are model-only inputs. The render tool is the only path for displaying images,
+so irrelevant RAG results do not appear just because they ranked highly.
 
 Configure the resource server with:
 
@@ -83,6 +84,10 @@ npx @modelcontextprotocol/inspector
 
 Select Streamable HTTP, enter the `/mcp` URL, and complete the Clerk login flow. Verify
 initialization, tool schemas, authorization failures, representative calls, and invalid inputs.
+
+In ChatGPT developer mode, refresh the plugin connection after changing tool names,
+descriptions, schemas, annotations, authentication, or UI resources. Then start a new chat.
+Backend-only changes that preserve the advertised MCP metadata do not require a refresh.
 
 Fetch a page image through the API/VPS:
 
