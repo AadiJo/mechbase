@@ -53,14 +53,16 @@ The server provides seven read-only tools:
 - `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
   result-count controls. Results include stable source IDs, evidence classification, calibrated
   score bands, coverage, and an abstention reason when no page is relevant enough.
-- `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
-  model can check visual relevance before anything is displayed.
+- `inspect_candidates(ids, include_assets)` returns labeled MCP page previews, up to four
+  extracted figures per page, stable asset IDs, dimensions, and page text so the model can check
+  visual relevance before anything is displayed.
 - `fetch(id, adjacent_pages)` returns full page text, source metadata, and absolute citation URLs,
   optionally including one neighboring page on each side.
 - `find_similar(id, ...)` finds related mechanism pages by text and shape, supports exact team,
   year, and source filters, and explains which form of similarity matched each result.
-- `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
-  hosts that support MCP Apps. Other clients still receive its structured result.
+- `render_search_results(ids, selections)` displays only model-selected pages or extracted figures
+  in an inline image rail on MCP hosts that support MCP Apps. `ids` remains the legacy full-page
+  alias; new clients can use `selections` with asset IDs. Other clients receive structured output.
 - `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
   search, stable logical IDs plus content versions, provenance when known, and complete text and
   image coverage counts.

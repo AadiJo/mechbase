@@ -17,7 +17,7 @@ from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.cache import TTLCache
-from app.mcp.images import load_preview_image
+from app.mcp.images import candidate_asset_sources, load_preview_url
 from app.mcp.results import (
     MAX_NORMALIZED_SECTION_LENGTH,
     AppliedSearchFilters,
@@ -26,6 +26,7 @@ from app.mcp.results import (
     FetchOutput,
     InspectOutput,
     RenderOutput,
+    RenderSelection,
     SearchOutput,
     SimilarOutput,
     SourceOutput,
@@ -35,6 +36,7 @@ from app.mcp.results import (
     search_output,
     similar_output,
     source_output,
+    visual_asset,
     visual_candidate,
 )
 from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET_URI
@@ -83,6 +85,8 @@ class RetrievalBackend(Protocol):
         result_id: str,
         adjacent_pages: int,
     ) -> FetchContextResponse | None: ...
+
+    def fetch_many(self, result_ids: list[str]) -> dict[str, ImageContextResponse]: ...
 
     def find_similar(
         self,
@@ -162,6 +166,9 @@ class RagRetrievalBackend:
         adjacent_pages: int,
     ) -> FetchContextResponse | None:
         return self._store.fetch_contexts(result_id, adjacent_pages)
+
+    def fetch_many(self, result_ids: list[str]) -> dict[str, ImageContextResponse]:
+        return self._store.image_contexts(result_ids)
 
     def find_similar(
         self,
@@ -248,12 +255,13 @@ def create_mcp_server(
             "inspect_candidates with promising result ids and judge the actual page images plus "
             "page text against the request. Never present inspection images directly or use them "
             "as final answer images. If at least one image is relevant, call "
-            "render_search_results with only those ids. If none are relevant, do not call the "
-            "render tool and say that no useful image was found. Use fetch only when complete page "
-            "text is needed. Use browse_source for multi-page evidence from the same binder; "
-            "find_similar can return pages from other binders. All tools are read-only."
+            "render_search_results with only those page ids or figure asset selections. If none "
+            "are relevant, do not call the render tool and say that no useful image was found. "
+            "Use fetch only when complete page text is needed. Use browse_source for multi-page "
+            "evidence from the same binder; find_similar can return pages from other binders. All "
+            "tools are read-only."
         ),
-        version="0.3.0",
+        version="0.4.0",
         auth=AuthSettings(
             issuer_url=settings.clerk_oauth_issuer_url,
             required_scopes=settings.mcp_required_scopes,
@@ -354,12 +362,13 @@ def create_mcp_server(
     @server.tool(
         title="Inspect FRC mechanism candidate images",
         description=(
-            "Inspect actual binder page images and extracted page text for result ids returned "
-            "by search or find_similar. Compare every candidate against the user's request and "
-            "discard irrelevant pages. Always follow visual review with render_search_results "
-            "when at least one image is relevant. Never use inspection images as final answer "
-            "images, cite them as displayed images, or describe them as shown to the user. They "
-            "are model-only evaluation inputs. Render nothing when none are useful."
+            "Inspect actual binder page images, up to four extracted figures per page, and page "
+            "text for result ids returned by search or find_similar. Stable asset ids identify "
+            "figures for render_search_results. Compare every candidate against the user's "
+            "request and discard irrelevant images. Always follow visual review with "
+            "render_search_results when at least one image is relevant. Never use inspection "
+            "images as final answer images, cite them, or describe them as shown to the user. They "
+            "are model-only inputs. Render nothing when none are useful."
         ),
         annotations=READ_ONLY,
         meta={
@@ -369,7 +378,10 @@ def create_mcp_server(
     )
     def inspect_candidates(
         ids: Annotated[list[ResultId], Field(min_length=1, max_length=6)],
+        include_assets: bool = True,
     ) -> CallToolResult:
+        unique_ids = list(dict.fromkeys(ids))
+        contexts = retrieval.fetch_many(unique_ids)
         candidates = []
         missing_ids = []
         content = [
@@ -379,23 +391,41 @@ def create_mcp_server(
                     "These candidate images are model-only evaluation inputs for visual review, not "
                     "answer images. Never show or cite them directly. Use each labeled page image "
                     "and its extracted text together. If any are relevant, you must call "
-                    "render_search_results with only those ids before answering."
+                    "render_search_results with only those ids and optional asset ids before "
+                    "answering."
                 ),
                 annotations=MODEL_ONLY,
             )
         ]
-        for result_id in dict.fromkeys(ids):
-            context = retrieval.fetch(result_id)
+        for result_id in unique_ids:
+            context = contexts.get(result_id)
             if context is None:
                 missing_ids.append(result_id)
                 continue
 
-            preview = load_preview_image(context, settings)
+            loaded_assets = []
+            previews = []
+            for asset_source in candidate_asset_sources(
+                context,
+                include_assets=include_assets,
+            ):
+                preview = load_preview_url(asset_source.image_url, settings)
+                if preview is None:
+                    continue
+                loaded_assets.append(
+                    visual_asset(
+                        context,
+                        asset_source,
+                        preview,
+                        public_base_url,
+                    )
+                )
+                previews.append((asset_source, preview))
             candidate = visual_candidate(
                 context,
                 result_id,
                 public_base_url,
-                has_image=preview is not None,
+                assets=loaded_assets,
             )
             candidates.append(candidate)
             content.append(
@@ -410,7 +440,20 @@ def create_mcp_server(
                     annotations=MODEL_ONLY,
                 )
             )
-            if preview is not None:
+            for asset_source, preview in previews:
+                content.append(
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Candidate id: {candidate.id}\n"
+                            f"Asset id: {asset_source.asset_id}\n"
+                            f"Asset kind: {asset_source.kind}\n"
+                            f"Original dimensions: {preview.width}x{preview.height}\n"
+                            "Use this asset only if it visually helps answer the request."
+                        ),
+                        annotations=MODEL_ONLY,
+                    )
+                )
                 content.append(
                     ImageContent(
                         type="image",
@@ -499,9 +542,10 @@ def create_mcp_server(
     @server.tool(
         title="Display selected FRC mechanism pages",
         description=(
-            "Display only visually relevant binder pages in an inline image rail. Always call "
-            "inspect_candidates first, then pass only the ids whose images help answer the "
-            "user's request. Do not use raw search ranking as the display decision."
+            "Display only visually relevant binder pages or extracted figures in an inline image "
+            "rail. Always call inspect_candidates first. Prefer selections with asset_id when an "
+            "extracted figure answers better than the full page. The legacy ids input remains an "
+            "alias for full-page selections. Provide ids or selections, never both."
         ),
         annotations=READ_ONLY,
         meta={
@@ -513,22 +557,64 @@ def create_mcp_server(
         structured_output=True,
     )
     def render_search_results(
-        ids: Annotated[list[ResultId], Field(min_length=1, max_length=8)],
+        ids: Annotated[list[ResultId] | None, Field(min_length=1, max_length=8)] = None,
+        selections: Annotated[
+            list[RenderSelection] | None,
+            Field(min_length=1, max_length=8),
+        ] = None,
     ) -> RenderOutput:
-        contexts = []
+        if (ids is None) == (selections is None):
+            raise ValueError("Provide either ids or selections, but not both.")
+        requested = (
+            [RenderSelection(id=result_id) for result_id in ids]
+            if ids is not None
+            else list(selections or [])
+        )
+        requested = list(
+            {(selection.id, selection.asset_id): selection for selection in requested}.values()
+        )
+        contexts_by_id = retrieval.fetch_many(
+            list(dict.fromkeys(selection.id for selection in requested))
+        )
         missing_ids = []
-        for result_id in dict.fromkeys(ids):
-            context = retrieval.fetch(result_id)
+        resolved = []
+        missing_assets = []
+        for selection in requested:
+            context = contexts_by_id.get(selection.id)
             if context is None:
-                missing_ids.append(result_id)
-            else:
-                contexts.append((result_id, context))
+                missing_ids.append(selection.id)
+                continue
+            available_assets = candidate_asset_sources(context, include_assets=True)
+            selected_asset = (
+                next(
+                    (asset for asset in available_assets if asset.asset_id == selection.asset_id),
+                    None,
+                )
+                if selection.asset_id is not None
+                else next(iter(available_assets), None)
+            )
+            if selected_asset is None:
+                missing_assets.append((selection.id, selection.asset_id))
+                continue
+            resolved.append(
+                (
+                    selection.id,
+                    selected_asset.asset_id,
+                    context,
+                    selected_asset.image_url,
+                )
+            )
 
         if missing_ids:
-            missing = ", ".join(repr(result_id) for result_id in missing_ids)
+            missing = ", ".join(repr(result_id) for result_id in dict.fromkeys(missing_ids))
             raise ValueError(f"No result found for id(s): {missing}.")
+        if missing_assets:
+            missing = ", ".join(
+                f"{asset_id!r} for {result_id!r}" for result_id, asset_id in missing_assets
+            )
+            raise ValueError(f"No inspected asset found for selection(s): {missing}.")
 
-        output = render_output(contexts, public_base_url)
+        output = render_output(resolved, public_base_url)
         if not output.results:
             raise ValueError("The selected results do not contain displayable images.")
         return output

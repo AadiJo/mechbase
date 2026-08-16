@@ -719,6 +719,78 @@ def test_page_contexts_loads_multiple_pages_in_one_snapshot_read() -> None:
     assert conditions["page"].match.any == [2, 1]
 
 
+class BatchImageContextClient:
+    def __init__(self, artifact_dir: Path) -> None:
+        self.artifact_dir = artifact_dir
+        self.calls = 0
+        self.filters = []
+
+    def scroll(self, **kwargs):
+        self.calls += 1
+        scroll_filter = kwargs["scroll_filter"]
+        self.filters.append(scroll_filter)
+        if any(getattr(condition, "key", None) == "id" for condition in scroll_filter.must):
+            return (
+                [
+                    SimpleNamespace(
+                        payload={
+                            **_versioned_doc(
+                                "new",
+                                page,
+                                ingestion_id="generation-new",
+                                text=f"page {page}",
+                            ).model_dump(),
+                            "id": f"result-{page}",
+                        }
+                    )
+                    for page in (1, 2)
+                ],
+                None,
+            )
+
+        payloads = []
+        for page in (1, 2):
+            text_payload = {
+                **_versioned_doc(
+                    "new",
+                    page,
+                    ingestion_id="generation-new",
+                    text=f"page {page}",
+                ).model_dump(),
+                "id": f"result-{page}",
+            }
+            page_payload = {
+                **text_payload,
+                "id": f"page-result-{page}",
+                "modality": "page_image",
+                "artifact_path": str(
+                    self.artifact_dir / f"generation-new/page-{page:03d}/page.png"
+                ),
+            }
+            payloads.extend(
+                [
+                    SimpleNamespace(payload=text_payload),
+                    SimpleNamespace(payload=page_payload),
+                ]
+            )
+        return payloads, None
+
+
+def test_image_contexts_batches_result_and_page_lookups(tmp_path: Path) -> None:
+    client = BatchImageContextClient(tmp_path)
+    store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=client)
+
+    contexts = store.image_contexts(["result-1", "result-2"])
+
+    assert client.calls == 2
+    assert len(client.filters[1].should) == 2
+    assert list(contexts) == ["result-1", "result-2"]
+    assert contexts["result-1"].page_image_url == (
+        "/images/generation-new/page-001/page.png"
+    )
+    assert contexts["result-2"].text == "page 2"
+
+
 class MixedGenerationPageClient:
     def scroll(self, **_kwargs):
         old = _versioned_doc(

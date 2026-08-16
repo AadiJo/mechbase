@@ -56,6 +56,7 @@ class FakeRetrievalBackend:
         self.fetch_context_calls: list[dict[str, object]] = []
         self.similar_calls: list[dict[str, object]] = []
         self.similar_attempts: list[str] = []
+        self.fetch_many_calls: list[list[str]] = []
         self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
         self.browse_context_calls: list[dict[str, object]] = []
@@ -118,6 +119,14 @@ class FakeRetrievalBackend:
             context=context,
             adjacent_contexts=adjacent_contexts,
         )
+
+    def fetch_many(self, result_ids: list[str]) -> dict[str, ImageContextResponse]:
+        self.fetch_many_calls.append(result_ids)
+        return {
+            result_id: context
+            for result_id in result_ids
+            if (context := self.fetch(result_id)) is not None
+        }
 
     def find_similar(
         self,
@@ -538,6 +547,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
     page_image = tmp_path / "254-2020" / "page-012" / "page.png"
     page_image.parent.mkdir(parents=True)
     Image.new("RGB", (1800, 1200), "white").save(page_image)
+    figure_image = page_image.parent / "image-000.png"
+    Image.new("RGB", (640, 480), "blue").save(figure_image)
 
     async def exercise_server() -> None:
         settings = _settings(tmp_path)
@@ -635,6 +646,10 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert "Never use inspection images as final answer images" in (
                             tools["inspect_candidates"].description or ""
                         )
+                        assert set(tools["render_search_results"].input_schema["properties"]) == {
+                            "ids",
+                            "selections",
+                        }
                         assert (
                             tools["render_search_results"].meta["ui"]["resourceUri"]
                             == "ui://mechbase/selected-results.html"
@@ -738,16 +753,51 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert inspected.structured_content["missing_ids"] == []
                         assert inspected.structured_content["candidates"][0]["id"] == "result_1"
                         assert inspected.structured_content["candidates"][0]["has_image"] is True
+                        assert [
+                            asset["asset_id"]
+                            for asset in inspected.structured_content["candidates"][0]["assets"]
+                        ] == ["page", "image-000"]
+                        assert (
+                            inspected.structured_content["candidates"][0]["assets"][1]["kind"]
+                            == "figure"
+                        )
+                        assert (
+                            inspected.structured_content["candidates"][0]["assets"][1]["width"]
+                            == 640
+                        )
+                        assert backend.fetch_many_calls[-1] == ["result_1"]
                         image_blocks = [
                             block for block in inspected.content if block.type == "image"
                         ]
-                        assert len(image_blocks) == 1
-                        assert image_blocks[0].mime_type == "image/jpeg"
-                        assert image_blocks[0].annotations is not None
-                        assert image_blocks[0].annotations.audience == ["assistant"]
-                        with Image.open(BytesIO(base64.b64decode(image_blocks[0].data))) as image:
-                            assert image.format == "JPEG"
-                            assert max(image.size) == 1400
+                        assert len(image_blocks) == 2
+                        assert all(block.mime_type == "image/jpeg" for block in image_blocks)
+                        assert all(
+                            block.annotations is not None
+                            and block.annotations.audience == ["assistant"]
+                            for block in image_blocks
+                        )
+                        preview_sizes = []
+                        for block in image_blocks:
+                            with Image.open(BytesIO(base64.b64decode(block.data))) as preview_image:
+                                assert preview_image.format == "JPEG"
+                                preview_sizes.append(preview_image.size)
+                        assert preview_sizes == [(1400, 933), (640, 480)]
+
+                        inspected_page_only = await session.call_tool(
+                            "inspect_candidates",
+                            {"ids": ["result_1"], "include_assets": False},
+                        )
+                        assert inspected_page_only.is_error is False
+                        assert (
+                            len(
+                                [
+                                    block
+                                    for block in inspected_page_only.content
+                                    if block.type == "image"
+                                ]
+                            )
+                            == 1
+                        )
 
                         fetched = await session.call_tool("fetch", {"id": "result_1"})
                         assert fetched.is_error is False
@@ -845,6 +895,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert rendered.structured_content["results"] == [
                             {
                                 "id": "result_1",
+                                "asset_id": "page",
                                 "title": "Team 254: 254-2020.pdf, page 12",
                                 "url": (
                                     "https://api.example.com/images/254-2020/page-012/page.png"
@@ -858,6 +909,36 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "page": 12,
                             }
                         ]
+
+                        rendered_figure = await session.call_tool(
+                            "render_search_results",
+                            {"selections": [{"id": "result_1", "asset_id": "image-000"}]},
+                        )
+                        assert rendered_figure.is_error is False
+                        assert rendered_figure.structured_content["results"][0]["asset_id"] == (
+                            "image-000"
+                        )
+                        assert rendered_figure.structured_content["results"][0][
+                            "image_url"
+                        ].endswith("/image-000.png")
+                        assert (
+                            "figure image-000"
+                            in rendered_figure.structured_content["results"][0]["title"]
+                        )
+
+                        invalid_figure = await session.call_tool(
+                            "render_search_results",
+                            {"selections": [{"id": "result_1", "asset_id": "image-999"}]},
+                        )
+                        assert invalid_figure.is_error is True
+                        ambiguous_render = await session.call_tool(
+                            "render_search_results",
+                            {
+                                "ids": ["result_1"],
+                                "selections": [{"id": "result_1"}],
+                            },
+                        )
+                        assert ambiguous_render.is_error is True
 
                         resources = await session.list_resources()
                         widget = next(
