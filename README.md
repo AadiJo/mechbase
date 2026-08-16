@@ -72,7 +72,7 @@ MCP_OAUTH_SCOPES=openid
 MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://claude.ai
 CLERK_OAUTH_ISSUER_URL=https://clerk.example.com
 CLERK_SECRET_KEY=sk_live_...
-SEARCH_MIN_SCORE=0.25
+SEARCH_MIN_SCORE=0.35
 ```
 
 In the same Clerk instance, enable Dynamic client registration and set its default scope to
@@ -133,3 +133,7 @@ Run the starter retrieval eval:
 docker compose run --rm ingest python -m app.rag.eval \
   --eval-file /app/evals/frc_mechanism_eval.json --top-k 5
 ```
+
+The eval includes positive recall cases and unrelated-query abstention cases. Tune
+`SEARCH_MIN_SCORE` against the indexed corpus; the floor applies to the raw vector score before
+the lexical ranking bonus.

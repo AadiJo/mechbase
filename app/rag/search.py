@@ -19,6 +19,7 @@ def search(
     mechanism_types: list[str] | None = None,
     sort: SearchSort = "relevance",
     modality: str | None = None,
+    store: RagStore | None = None,
 ) -> SearchResponse:
     request = SearchRequest(
         query=query,
@@ -41,7 +42,9 @@ def search(
     embedder = VoyageEmbedder(settings)
     text_vector = embedder.embed_texts([expanded], "query")[0]
     image_vector = embedder.embed_multimodal([expanded], [None], "query")[0]
-    results, coverage = RagStore(settings).search(request, text_vector, image_vector, expanded)
+    results, coverage = (store or RagStore(settings)).search(
+        request, text_vector, image_vector, expanded
+    )
     abstention_reason = None
     if not results:
         abstention_reason = (

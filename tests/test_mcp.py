@@ -98,7 +98,6 @@ class FakeRetrievalBackend:
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
-        source_query: str | None,
     ) -> SourceListResponse:
         self.list_source_calls.append(
             {
@@ -108,7 +107,6 @@ class FakeRetrievalBackend:
                 "team_numbers": team_numbers,
                 "years": years,
                 "source_ids": source_ids,
-                "source_query": source_query,
             }
         )
         resolved_team = team or next(iter(team_numbers), None) or "254"
@@ -341,6 +339,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "applied_filters",
                             "coverage",
                             "abstention_reason",
+                            "evidence_limits",
                         }
                         assert "source_query" in tools["list_sources"].input_schema["properties"]
                         assert tools["inspect_candidates"].output_schema is None
@@ -380,12 +379,9 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "score_band": "strong",
                                     "evidence": {
                                         "direct_source_text": True,
-                                        "visible_image": True,
+                                        "visible_image": False,
                                         "model_inference": False,
-                                        "missing": [
-                                            "independent competition performance verification",
-                                            "comparative design quality evidence",
-                                        ],
+                                        "missing": ["visible image evidence"],
                                     },
                                 }
                             ],
@@ -403,6 +399,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "returned_pages": 1,
                             },
                             "abstention_reason": None,
+                            "evidence_limits": [
+                                (
+                                    "Binder evidence does not independently verify competition "
+                                    "performance."
+                                ),
+                                ("Vector relevance does not establish comparative design quality."),
+                            ],
                         }
                         assert json.loads(searched.content[0].text) == searched.structured_content
                         assert len(backend.search_calls) == 1
@@ -469,6 +472,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert similar.is_error is False
                         assert similar.structured_content["results"][0]["id"] == "result_2"
+                        assert similar.structured_content["coverage"]["candidate_pages"] == 1
+                        assert similar.structured_content["coverage"]["returned_pages"] == 1
 
                         rendered = await session.call_tool(
                             "render_search_results", {"ids": ["result_1"]}
@@ -521,6 +526,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         cached_sources = await session.call_tool("list_sources", {"team": "254"})
                         assert cached_sources.is_error is False
                         assert len(backend.list_source_calls) == 1
+                        queried_sources = await session.call_tool(
+                            "list_sources",
+                            {"team": "254", "source_query": "2020"},
+                        )
+                        assert queried_sources.is_error is False
+                        assert queried_sources.structured_content["coverage_found"] is True
+                        assert len(backend.list_source_calls) == 1
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -541,7 +553,6 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "team_numbers": ["4414"],
                             "years": [2024],
                             "source_ids": ["4414-2024"],
-                            "source_query": "4414",
                         }
 
                         invalid = await session.call_tool(

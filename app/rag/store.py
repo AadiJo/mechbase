@@ -1,4 +1,6 @@
 import re
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid5
@@ -22,6 +24,32 @@ from app.rag.models import (
 
 TEXT_VECTOR = "text"
 IMAGE_VECTOR = "image"
+SOURCE_SUMMARY_FIELDS = [
+    "source_id",
+    "source_pdf",
+    "team",
+    "year",
+    "page",
+    "modality",
+    "artifact_path",
+    "ingested_at",
+    "source_url",
+]
+
+
+@dataclass
+class _SourceAccumulator:
+    source_id: str
+    source_pdf: str
+    team: str | None
+    year: int | None
+    ingested_at: str | None
+    source_url: str | None
+    pages: set[int] = field(default_factory=set)
+    text_count: int = 0
+    page_image_count: int = 0
+    extracted_image_count: int = 0
+    sample_image_urls: list[str] = field(default_factory=list)
 
 
 class RagStore:
@@ -120,30 +148,36 @@ class RagStore:
                         },
                     )
         ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
-        candidates: list[SearchResult] = []
+        candidates: list[tuple[SearchResult, float]] = []
         seen_pages: set[tuple[str, int]] = set()
         for _point_id, (score, payload, debug) in ranked:
             page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
             if page_key in seen_pages:
                 continue
             seen_pages.add(page_key)
+            vector_score = float(debug["vector_score"])
             candidates.append(
-                self._search_result_from_payload(
-                    payload,
-                    score,
-                    debug if request.debug else {},
+                (
+                    self._search_result_from_payload(
+                        payload,
+                        score,
+                        debug if request.debug else {},
+                        band_score=vector_score,
+                    ),
+                    vector_score,
                 )
             )
 
         candidate_pages = len(candidates)
-        candidate_sources = len({result.source_id for result in candidates})
+        candidate_sources = len({result.source_id for result, _score in candidates})
         candidates = [
-            result for result in candidates if result.score >= self.settings.search_min_score
+            candidate for candidate in candidates if candidate[1] >= self.settings.search_min_score
         ]
         weak_pages_dropped = candidate_pages - len(candidates)
+        ranked_results = [result for result, _score in candidates]
 
         if request.sort == "newest":
-            candidates.sort(
+            ranked_results.sort(
                 key=lambda result: (
                     result.year is not None,
                     result.year or 0,
@@ -152,14 +186,14 @@ class RagStore:
                 reverse=True,
             )
         elif request.sort == "oldest":
-            candidates.sort(
+            ranked_results.sort(
                 key=lambda result: (
                     result.year is None,
                     result.year or 0,
                     -result.score,
                 )
             )
-        results = candidates[: request.top_k]
+        results = ranked_results[: request.top_k]
         return results, SearchCoverage(
             candidate_pages=candidate_pages,
             candidate_sources=candidate_sources,
@@ -230,7 +264,7 @@ class RagStore:
         source_ids: list[str] | None = None,
         source_query: str | None = None,
     ) -> SourceListResponse:
-        payloads = self._scroll_payloads(
+        payloads = self._iter_source_payloads(
             _metadata_filter(
                 team=team,
                 year=year,
@@ -238,8 +272,7 @@ class RagStore:
                 team_numbers=team_numbers,
                 years=years,
                 source_ids=source_ids,
-            ),
-            limit=None,
+            )
         )
         summaries = self._summarize_sources(payloads)
         if source_query:
@@ -252,7 +285,7 @@ class RagStore:
         return SourceListResponse(sources=summaries)
 
     def source_summary(self, source_pdf: str) -> SourceSummary | None:
-        payloads = self._scroll_payloads(_metadata_filter(source=source_pdf), limit=None)
+        payloads = self._iter_source_payloads(_metadata_filter(source=source_pdf))
         summaries = self._summarize_sources(payloads)
         return summaries[0] if summaries else None
 
@@ -413,12 +446,20 @@ class RagStore:
         )
 
     def _search_result_from_payload(
-        self, payload: dict, score: float, debug: dict | None = None
+        self,
+        payload: dict,
+        score: float,
+        debug: dict | None = None,
+        *,
+        band_score: float | None = None,
     ) -> SearchResult:
         return SearchResult(
             id=str(payload.get("id") or ""),
             score=score,
-            score_band=_score_band(score, self.settings.search_min_score),
+            score_band=_score_band(
+                score if band_score is None else band_score,
+                self.settings.search_min_score,
+            ),
             source_id=str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem),
             source_pdf=payload.get("source_pdf", ""),
             team=payload.get("team"),
@@ -455,6 +496,25 @@ class RagStore:
         point = points[0]
         return dict(point.payload or {}), dict(point.vector or {})
 
+    def _iter_source_payloads(
+        self,
+        qfilter: models.Filter | None,
+    ) -> Iterator[dict]:
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.settings.collection_name,
+                scroll_filter=qfilter,
+                limit=256,
+                offset=offset,
+                with_payload=SOURCE_SUMMARY_FIELDS,
+                with_vectors=False,
+            )
+            for point in points:
+                yield dict(point.payload or {})
+            if offset is None:
+                return
+
     def _scroll_payloads(
         self,
         qfilter: models.Filter | None,
@@ -481,38 +541,56 @@ class RagStore:
             if offset is None or (limit is not None and len(output) >= limit):
                 return output
 
-    def _summarize_sources(self, payloads: list[dict]) -> list[SourceSummary]:
-        grouped: dict[str, list[dict]] = {}
+    def _summarize_sources(self, payloads: Iterable[dict]) -> list[SourceSummary]:
+        grouped: dict[str, _SourceAccumulator] = {}
         for payload in payloads:
             source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
-            grouped.setdefault(source_id, []).append(payload)
+            accumulator = grouped.get(source_id)
+            if accumulator is None:
+                accumulator = _SourceAccumulator(
+                    source_id=source_id,
+                    source_pdf=payload.get("source_pdf", ""),
+                    team=payload.get("team"),
+                    year=payload.get("year"),
+                    ingested_at=payload.get("ingested_at"),
+                    source_url=payload.get("source_url"),
+                )
+                grouped[source_id] = accumulator
+            page = int(payload.get("page", 0))
+            if page:
+                accumulator.pages.add(page)
+            modality = payload.get("modality")
+            if modality == "text":
+                accumulator.text_count += 1
+            elif modality == "page_image":
+                accumulator.page_image_count += 1
+            elif modality == "extracted_image":
+                accumulator.extracted_image_count += 1
+            url = self._artifact_url(payload.get("artifact_path"))
+            if (
+                url
+                and url not in accumulator.sample_image_urls
+                and len(accumulator.sample_image_urls) < 5
+            ):
+                accumulator.sample_image_urls.append(url)
+
         summaries = []
-        for source_id, items in grouped.items():
-            pages = sorted({int(item.get("page", 0)) for item in items if item.get("page")})
-            modality_counts = {"text": 0, "page_image": 0, "extracted_image": 0}
-            sample_image_urls = []
-            for item in items:
-                modality = item.get("modality")
-                if modality in modality_counts:
-                    modality_counts[modality] += 1
-                url = self._artifact_url(item.get("artifact_path"))
-                if url and url not in sample_image_urls and len(sample_image_urls) < 5:
-                    sample_image_urls.append(url)
-            first = items[0]
+        for accumulator in grouped.values():
+            pages = sorted(accumulator.pages)
             summaries.append(
                 SourceSummary(
-                    source_id=source_id,
-                    source_pdf=first.get("source_pdf", ""),
-                    team=first.get("team"),
-                    year=first.get("year"),
+                    source_id=accumulator.source_id,
+                    source_pdf=accumulator.source_pdf,
+                    team=accumulator.team,
+                    year=accumulator.year,
                     pages=pages,
                     page_count=len(pages),
-                    text_count=modality_counts["text"],
-                    page_image_count=modality_counts["page_image"],
-                    extracted_image_count=modality_counts["extracted_image"],
-                    sample_image_urls=sample_image_urls,
-                    ingested_at=first.get("ingested_at"),
-                    source_url=first.get("source_url"),
+                    text_count=accumulator.text_count,
+                    page_image_count=accumulator.page_image_count,
+                    extracted_image_count=accumulator.extracted_image_count,
+                    sample_image_urls=accumulator.sample_image_urls,
+                    ingested_at=accumulator.ingested_at,
+                    source_url=accumulator.source_url,
                 )
             )
         return sorted(
@@ -552,12 +630,14 @@ def _metadata_filter(
     source_ids: list[str] | None = None,
 ) -> models.Filter | None:
     conditions = []
-    all_teams = list(dict.fromkeys([*([team] if team else []), *(team_numbers or [])]))
-    all_years = list(dict.fromkeys([*([year] if year else []), *(years or [])]))
-    if all_teams:
-        conditions.append(_match_values("team", all_teams))
-    if all_years:
-        conditions.append(_match_values("year", all_years))
+    if team:
+        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=team)))
+    if team_numbers:
+        conditions.append(_match_values("team", list(dict.fromkeys(team_numbers))))
+    if year:
+        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=year)))
+    if years:
+        conditions.append(_match_values("year", list(dict.fromkeys(years))))
     if source:
         conditions.append(
             models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source))

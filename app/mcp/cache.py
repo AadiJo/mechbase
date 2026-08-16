@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from collections.abc import Hashable
 from dataclasses import dataclass
+from threading import Lock
 from time import monotonic
 from typing import Generic, TypeVar
 
@@ -21,19 +22,22 @@ class TTLCache(Generic[Key, Value]):
         self._ttl_seconds = ttl_seconds
         self._max_entries = max_entries
         self._entries: OrderedDict[Key, _Entry[Value]] = OrderedDict()
+        self._lock = Lock()
 
     def get(self, key: Key) -> Value | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        if entry.expires_at <= monotonic():
-            del self._entries[key]
-            return None
-        self._entries.move_to_end(key)
-        return entry.value
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= monotonic():
+                self._entries.pop(key, None)
+                return None
+            self._entries.move_to_end(key)
+            return entry.value
 
     def put(self, key: Key, value: Value) -> None:
-        self._entries[key] = _Entry(monotonic() + self._ttl_seconds, value)
-        self._entries.move_to_end(key)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[key] = _Entry(monotonic() + self._ttl_seconds, value)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)

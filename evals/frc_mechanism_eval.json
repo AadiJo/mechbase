@@ -56,5 +56,15 @@
       {"source_pdf": "2910-2025.pdf", "page": 8},
       {"source_pdf": "1323-2025.pdf", "page": 8}
     ]
+  },
+  {
+    "query": "how do I temper chocolate for a mirror glaze",
+    "expected": [],
+    "expect_empty": true
+  },
+  {
+    "query": "compare Roman trireme hull construction methods",
+    "expected": [],
+    "expect_empty": true
   }
 ]

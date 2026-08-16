@@ -19,7 +19,12 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
     lowered = query.lower()
     extra: list[str] = []
     for key, synonyms in MECHANISM_TERMS.items():
-        if key in lowered or any(s in lowered for s in synonyms):
+        season_synonyms = {
+            term
+            for season_terms in SEASON_MECHANISM_TERMS.values()
+            for term in season_terms.get(key, [])
+        }
+        if key in lowered or any(term in lowered for term in [*synonyms, *season_synonyms]):
             extra.extend([key, *synonyms])
             for year in years or []:
                 extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))

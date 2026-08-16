@@ -15,6 +15,7 @@ MechanismTypeFilter = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
 ]
+LegacyFilter = Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]
 
 
 class SourceDoc(BaseModel):
@@ -42,14 +43,11 @@ class RagDocument(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(max_length=500)
+    query: str = Field(max_length=8000)
     top_k: int = Field(default=10, ge=1, le=100)
-    team: TeamFilter | None = None
-    year: SeasonFilter | None = None
-    source: (
-        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
-        | None
-    ) = None
+    team: LegacyFilter | None = None
+    year: int | None = None
+    source: LegacyFilter | None = None
     team_numbers: Annotated[list[TeamFilter], Field(max_length=20)] = Field(default_factory=list)
     years: Annotated[list[SeasonFilter], Field(max_length=20)] = Field(default_factory=list)
     source_ids: Annotated[list[SourceIdFilter], Field(max_length=20)] = Field(default_factory=list)

@@ -5,7 +5,6 @@ from pathlib import Path
 from app.rag.config import get_settings
 from app.rag.search import search
 
-
 DEFAULT_QUERIES = [
     {"query": "multi ball shooter", "expected": []},
     {"query": "drum shooter", "expected": []},
@@ -20,7 +19,9 @@ DEFAULT_QUERIES = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run recall-oriented search evals.")
-    parser.add_argument("--eval-file", default=None, help="JSON file with [{query, expected:[{source_pdf,page}]}].")
+    parser.add_argument(
+        "--eval-file", default=None, help="JSON file with [{query, expected:[{source_pdf,page}]}]."
+    )
     parser.add_argument("--top-k", type=int, default=10)
     args = parser.parse_args()
 
@@ -31,9 +32,15 @@ def main() -> None:
         expected = {(item["source_pdf"], item["page"]) for item in case.get("expected", [])}
         found = len(got & expected)
         total = len(expected)
-        print(f"{case['query']}: recall@{args.top_k}={found}/{total}")
+        if case.get("expect_empty"):
+            status = "pass" if not response.results else "fail"
+            print(f"{case['query']}: abstention={status}")
+        else:
+            print(f"{case['query']}: recall@{args.top_k}={found}/{total}")
         for idx, result in enumerate(response.results[:5], start=1):
-            print(f"  {idx}. {result.source_pdf} p{result.page} {result.modality} score={result.score:.3f}")
+            print(
+                f"  {idx}. {result.source_pdf} p{result.page} {result.modality} score={result.score:.3f}"
+            )
 
 
 if __name__ == "__main__":

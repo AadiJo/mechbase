@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Annotated, Protocol
 from urllib.parse import urlparse
 
@@ -10,6 +11,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Annotations, CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
+from qdrant_client.http.exceptions import ApiException, ResponseHandlingException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp
 
@@ -34,6 +36,7 @@ from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
     MechanismTypeFilter,
+    SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchSort,
@@ -51,6 +54,7 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,
 )
 MODEL_ONLY = Annotations(audience=["assistant"], priority=1.0)
+LOGGER = logging.getLogger(__name__)
 TeamNumber = Annotated[int, Field(ge=1, le=99999)]
 SeasonYear = Annotated[int, Field(ge=1992, le=2100)]
 SourceId = SourceIdFilter
@@ -73,7 +77,6 @@ class RetrievalBackend(Protocol):
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
-        source_query: str | None,
     ) -> SourceListResponse: ...
 
     def corpus_revision(self) -> str: ...
@@ -82,6 +85,9 @@ class RetrievalBackend(Protocol):
 class RagRetrievalBackend:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._store = RagStore(settings)
+        self._revision_cache: TTLCache[str, str] = TTLCache(ttl_seconds=10, max_entries=1)
+        self._last_revision = "unknown"
 
     def search(self, request: SearchRequest) -> SearchResponse:
         return rag_search(
@@ -94,16 +100,28 @@ class RagRetrievalBackend:
             source_ids=request.source_ids,
             mechanism_types=request.mechanism_types,
             sort=request.sort,
+            store=self._store,
         )
 
     def corpus_revision(self) -> str:
-        return RagStore(self._settings).corpus_revision()
+        cached = self._revision_cache.get("corpus")
+        if cached is not None:
+            return cached
+        try:
+            revision = self._store.corpus_revision()
+        except (ApiException, ResponseHandlingException):
+            LOGGER.warning("Could not refresh the Qdrant corpus revision; using the last value.")
+            self._revision_cache.put("corpus", self._last_revision)
+            return self._last_revision
+        self._last_revision = revision
+        self._revision_cache.put("corpus", revision)
+        return revision
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
-        return RagStore(self._settings).image_context(result_id=result_id)
+        return self._store.image_context(result_id=result_id)
 
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
-        return RagStore(self._settings).similar_from_result_id(result_id, top_k)
+        return self._store.similar_from_result_id(result_id, top_k)
 
     def list_sources(
         self,
@@ -114,16 +132,14 @@ class RagRetrievalBackend:
         team_numbers: list[str],
         years: list[int],
         source_ids: list[str],
-        source_query: str | None,
     ) -> SourceListResponse:
-        return RagStore(self._settings).list_sources(
+        return self._store.list_sources(
             team=team,
             year=year,
             source=source,
             team_numbers=team_numbers,
             years=years,
             source_ids=source_ids,
-            source_query=source_query,
         )
 
 
@@ -365,7 +381,15 @@ def create_mcp_server(
         if response is None:
             raise ValueError(f"No result found for id {id!r}.")
         return search_output(
-            SearchResponse(query="", results=response.results),
+            SearchResponse(
+                query="",
+                results=response.results,
+                coverage=SearchCoverage(
+                    candidate_pages=len(response.results),
+                    candidate_sources=len({result.source_id for result in response.results}),
+                    returned_pages=len(response.results),
+                ),
+            ),
             public_base_url,
         )
 
@@ -440,7 +464,6 @@ def create_mcp_server(
                 teams,
                 normalized_years,
                 normalized_source_ids,
-                normalized_source_query,
             )
         )
         response = source_cache.get(cache_key)
@@ -452,10 +475,17 @@ def create_mcp_server(
                 team_numbers=teams,
                 years=normalized_years,
                 source_ids=normalized_source_ids,
-                source_query=normalized_source_query,
             )
             source_cache.put(cache_key, response)
-        return source_output(response.sources[:limit], public_base_url)
+        sources = response.sources
+        if normalized_source_query:
+            needle = normalized_source_query.casefold()
+            sources = [
+                item
+                for item in sources
+                if needle in item.source_id.casefold() or needle in item.source_pdf.casefold()
+            ]
+        return source_output(sources[:limit], public_base_url)
 
     return server
 

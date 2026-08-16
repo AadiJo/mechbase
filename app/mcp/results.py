@@ -48,6 +48,12 @@ class SearchOutput(BaseModel):
     applied_filters: AppliedSearchFilters = Field(default_factory=AppliedSearchFilters)
     coverage: SearchCoverage = Field(default_factory=SearchCoverage)
     abstention_reason: str | None = None
+    evidence_limits: list[str] = Field(
+        default_factory=lambda: [
+            "Binder evidence does not independently verify competition performance.",
+            "Vector relevance does not establish comparative design quality.",
+        ]
+    )
 
 
 class FetchOutput(BaseModel):
@@ -132,10 +138,19 @@ def search_output(
                 score_band=result.score_band,
                 evidence=EvidenceClassification(
                     direct_source_text=bool(result.text.strip()),
-                    visible_image=bool(result.artifact_url or result.linked_artifact_urls),
+                    visible_image=result.modality in {"page_image", "extracted_image"}
+                    and bool(result.artifact_url),
                     missing=[
-                        "independent competition performance verification",
-                        "comparative design quality evidence",
+                        label
+                        for missing, label in (
+                            (not result.text.strip(), "direct source text"),
+                            (
+                                result.modality not in {"page_image", "extracted_image"}
+                                or not result.artifact_url,
+                                "visible image evidence",
+                            ),
+                        )
+                        if missing
                     ],
                 ),
             )

@@ -20,6 +20,10 @@ def test_expansion_only_adds_game_specific_terms_for_matching_season() -> None:
     assert "deep cage" in reefscape
     assert "trap" not in reefscape
 
+    trap_query = expand_query("trap mechanism", years=[2024])
+    assert "climber" in trap_query
+    assert "winch" in trap_query
+
 
 def test_split_text_keeps_content() -> None:
     text = "A" * 400 + "\n\n" + "B" * 400 + "\n\n" + "C" * 400

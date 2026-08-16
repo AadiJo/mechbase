@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     text_model: str = Field(default="voyage-4", alias="TEXT_MODEL")
     multimodal_model: str = Field(default="voyage-multimodal-3.5", alias="MULTIMODAL_MODEL")
     embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
-    search_min_score: float = Field(default=0.25, ge=-1.0, le=1.2, alias="SEARCH_MIN_SCORE")
+    search_min_score: float = Field(default=0.35, ge=-1.0, le=1.0, alias="SEARCH_MIN_SCORE")
     ocr_min_chars_per_page: int = Field(default=40, alias="OCR_MIN_CHARS_PER_PAGE")
     render_dpi: int = Field(default=144, alias="RENDER_DPI")
     chunk_target_chars: int = Field(default=1300, alias="CHUNK_TARGET_CHARS")

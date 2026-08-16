@@ -38,10 +38,13 @@ def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
     )
 
     assert qfilter is not None
-    conditions = {condition.key: condition for condition in qfilter.must or []}
-    assert conditions["team"].match.any == ["254", "4414"]
-    assert conditions["year"].match.any == [2023, 2024]
-    assert conditions["source_pdf"].match.value == "254-2023.pdf"
+    conditions = qfilter.must or []
+    team_conditions = [condition for condition in conditions if condition.key == "team"]
+    year_conditions = [condition for condition in conditions if condition.key == "year"]
+    source_condition = next(condition for condition in conditions if condition.key == "source_pdf")
+    assert [condition.match.value for condition in team_conditions] == ["254", "4414"]
+    assert [condition.match.value for condition in year_conditions] == [2023, 2024]
+    assert source_condition.match.value == "254-2023.pdf"
 
 
 class FakeQdrantClient:
@@ -99,12 +102,13 @@ def test_search_can_sort_candidates_by_year() -> None:
 
 
 def test_search_drops_uniformly_weak_candidates() -> None:
-    store = RagStore(Settings(SEARCH_MIN_SCORE=0.25))
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35))
     client = FakeQdrantClient()
     client.hits = [
         _hit("weak-one", "111-2018.pdf", "111", 2018, 0.10),
-        _hit("weak-two", "222-2025.pdf", "222", 2025, 0.15),
+        _hit("weak-two", "222-2025.pdf", "222", 2025, 0.34),
     ]
+    client.hits[1].payload["text"] = "swerve azimuth backlash"
     store.client = client
 
     results, coverage = store.search(
@@ -132,9 +136,11 @@ def test_search_request_bounds_filter_cost() -> None:
 class PagingQdrantClient:
     def __init__(self) -> None:
         self.calls = 0
+        self.payload_fields: list[str] = []
 
     def scroll(self, **kwargs):
         self.calls += 1
+        self.payload_fields = kwargs["with_payload"]
         if kwargs.get("offset") is None:
             return (
                 [
@@ -178,6 +184,8 @@ def test_list_sources_paginates_and_filters_by_source_query() -> None:
     response = store.list_sources(source_query="4414")
 
     assert client.calls == 2
+    assert "text" not in client.payload_fields
+    assert "source_id" in client.payload_fields
     assert len(response.sources) == 1
     assert response.sources[0].source_id == "4414-2024"
     assert response.sources[0].page_image_count == 1
