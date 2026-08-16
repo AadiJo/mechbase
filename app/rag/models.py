@@ -111,6 +111,7 @@ class PageContextResponse(BaseModel):
     source_version_id: str | None = None
     ingestion_id: str | None = None
     source_pdf: str
+    source_url: str | None = None
     team: str | None = None
     year: int | None = None
     page: int
@@ -192,6 +193,7 @@ class ImageContextResponse(BaseModel):
     source_version_id: str | None = None
     ingestion_id: str | None = None
     source_pdf: str
+    source_url: str | None = None
     team: str | None = None
     year: int | None = None
     page: int

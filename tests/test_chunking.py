@@ -1,4 +1,5 @@
-from app.rag.chunking import expand_query, split_text
+from app.rag.chunking import expand_query, inherited_section_from_text, split_text
+from app.rag.pdf import _outline_sections
 
 
 def test_expand_multi_ball_query() -> None:
@@ -66,3 +67,41 @@ def test_split_text_keeps_content() -> None:
     assert len(chunks) >= 2
     assert "A" in chunks[0]
     assert "C" in chunks[-1]
+
+
+def test_section_heading_is_inherited_by_continuation_pages() -> None:
+    ignored_headers = {"team 254 technical binder"}
+    first = inherited_section_from_text(
+        "Team 254 Technical Binder\nElevator\nThe carriage uses two stages.",
+        None,
+        ignored_headers,
+    )
+    continuation = inherited_section_from_text(
+        "Team 254 Technical Binder\nThe second stage is belt driven.",
+        first,
+        ignored_headers,
+    )
+
+    assert first == "Elevator"
+    assert continuation == "Elevator"
+
+
+class FakeOutlinePdf:
+    def __len__(self) -> int:
+        return 5
+
+    def get_toc(self, *, simple: bool):
+        assert simple is True
+        return [[1, "Overview", 1], [1, "Elevator", 3]]
+
+
+def test_pdf_outline_sections_continue_until_the_next_heading() -> None:
+    sections = _outline_sections(FakeOutlinePdf())
+
+    assert sections == {
+        1: "Overview",
+        2: "Overview",
+        3: "Elevator",
+        4: "Elevator",
+        5: "Elevator",
+    }

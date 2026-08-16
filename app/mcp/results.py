@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urllib.parse import quote
+from urllib.parse import quote, urldefrag
 
 from pydantic import BaseModel, Field, JsonValue
 
@@ -99,7 +99,6 @@ class SimilarOutput(BaseModel):
 
 class BrowsePage(BaseModel):
     result_id: str
-    result_ids: list[str] = Field(default_factory=list)
     page: int
     section: str | None = None
     snippet: str = ""
@@ -115,6 +114,8 @@ class BrowseSourceOutput(BaseModel):
     year: int | None = None
     pages: list[BrowsePage]
     missing_pages: list[int] = Field(default_factory=list)
+    scanned_pages: int = 0
+    next_cursor_page: int | None = None
     truncated: bool = False
 
 
@@ -231,10 +232,7 @@ def fetch_output(
     adjacent_contexts: list[PageContextResponse] | None = None,
 ) -> FetchOutput:
     image_urls = [_absolute_url(public_base_url, url) for url in context.image_urls]
-    canonical_url = _absolute_url(
-        public_base_url,
-        context.page_image_url or context.image_url or context.page_context_url,
-    )
+    canonical_url = _page_citation_url(context, public_base_url)
     all_pages: list[ImageContextResponse | PageContextResponse] = [
         *(adjacent_contexts or []),
         context,
@@ -302,6 +300,8 @@ def browse_source_output(
     *,
     include_previews: bool,
     missing_pages: list[int],
+    scanned_pages: int,
+    next_cursor_page: int | None,
     truncated: bool,
 ) -> BrowseSourceOutput:
     pages = []
@@ -316,13 +316,15 @@ def browse_source_output(
         pages.append(
             BrowsePage(
                 result_id=context.primary_result_id,
-                result_ids=context.result_ids,
                 page=context.page,
                 section=context.section,
                 snippet=_truncate(context.text.strip(), 500),
                 url=_absolute_url(
                     public_base_url,
-                    f"/pages/{quote(source.source_pdf, safe='')}/{context.page}",
+                    context.page_image_url
+                    or next(iter(context.image_urls), None)
+                    or _source_page_url(source.source_url, context.page)
+                    or f"/pages/{quote(source.source_pdf, safe='')}/{context.page}",
                 ),
                 image_url=image_url,
             )
@@ -335,6 +337,8 @@ def browse_source_output(
         year=source.year,
         pages=pages,
         missing_pages=missing_pages,
+        scanned_pages=scanned_pages,
+        next_cursor_page=next_cursor_page,
         truncated=truncated,
     )
 
@@ -347,14 +351,7 @@ def _fetched_page(
     page_image_url = (
         _absolute_url(public_base_url, context.page_image_url) if context.page_image_url else None
     )
-    page_url = _absolute_url(
-        public_base_url,
-        getattr(
-            context,
-            "page_context_url",
-            f"/pages/{quote(context.source_pdf, safe='')}/{context.page}",
-        ),
-    )
+    page_url = _page_citation_url(context, public_base_url)
     has_visible_image = bool(image_urls or page_image_url)
     return FetchedPage(
         page=context.page,
@@ -375,6 +372,30 @@ def _fetched_page(
             ],
         ),
     )
+
+
+def _page_citation_url(
+    context: ImageContextResponse | PageContextResponse,
+    public_base_url: str,
+) -> str:
+    citation = (
+        context.page_image_url
+        or next(iter(context.image_urls), None)
+        or _source_page_url(context.source_url, context.page)
+        or getattr(
+            context,
+            "page_context_url",
+            f"/pages/{quote(context.source_pdf, safe='')}/{context.page}",
+        )
+    )
+    return _absolute_url(public_base_url, citation)
+
+
+def _source_page_url(source_url: str | None, page: int) -> str | None:
+    if source_url is None:
+        return None
+    base_url, _fragment = urldefrag(source_url)
+    return f"{base_url}#page={page}"
 
 
 def source_output(

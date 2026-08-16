@@ -17,7 +17,7 @@ from PIL import Image
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.images import load_preview_image
-from app.mcp.results import search_output
+from app.mcp.results import fetch_output, search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
@@ -207,6 +207,20 @@ class FakeRetrievalBackend:
                 page_image_count=1,
                 extracted_image_count=0,
             ),
+            SourceSummary(
+                source_id="999-2024",
+                source_version="version-c",
+                source_version_id="999-2024@version-c",
+                ingestion_id="ingestion-c",
+                source_pdf="999-2024.pdf",
+                team="999",
+                year=2024,
+                pages=list(range(1, 101)),
+                page_count=100,
+                text_count=100,
+                page_image_count=100,
+                extracted_image_count=0,
+            ),
         ]
         needle = source_query.casefold() if source_query else None
         return SourceListResponse(
@@ -275,6 +289,31 @@ def test_search_output_preserves_weak_result_abstention() -> None:
     assert output.results == []
     assert output.coverage.weak_pages_dropped == 3
     assert output.abstention_reason == ("No indexed pages met the calibrated relevance threshold.")
+
+
+def test_fetch_citation_stays_on_the_exact_generation_artifact() -> None:
+    def context(generation: str) -> ImageContextResponse:
+        image_url = f"/images/254-2020/{generation}/page-001/page.png"
+        return ImageContextResponse(
+            result_id="result_1",
+            source_id="254-2020",
+            source_version_id=f"254-2020@{generation}",
+            ingestion_id=generation,
+            source_pdf="254-2020.pdf",
+            page=1,
+            page_context_url="/pages/254-2020.pdf/1",
+            page_text_url="/pages/254-2020.pdf/1/text",
+            text="elevator",
+            page_image_url=image_url,
+            image_urls=[image_url],
+        )
+
+    old_output = fetch_output(context("generation-old"), "result_1", "https://api.example.com")
+    new_output = fetch_output(context("generation-new"), "result_1", "https://api.example.com")
+
+    assert old_output.pages[0].url.endswith("/generation-old/page-001/page.png")
+    assert new_output.pages[0].url.endswith("/generation-new/page-001/page.png")
+    assert old_output.pages[0].url != new_output.pages[0].url
 
 
 def test_candidate_preview_uses_shared_external_image_cache(tmp_path: Path) -> None:
@@ -651,6 +690,10 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             page["evidence"]["direct_source_text"]
                             for page in fetched_with_neighbors.structured_content["pages"]
                         )
+                        assert all(
+                            "/images/254-2020/" in page["url"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        )
                         assert backend.page_context_calls[-1]["pages"] == [11, 13]
 
                         similar = await session.call_tool(
@@ -764,10 +807,16 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert browsed.structured_content["pages"][0]["result_id"] == (
                             "result_page_1"
                         )
+                        assert "result_ids" not in browsed.structured_content["pages"][0]
                         assert browsed.structured_content["missing_pages"] == [2]
                         assert browsed.structured_content["pages"][0]["image_url"].startswith(
                             "https://api.example.com/images/"
                         )
+                        assert browsed.structured_content["pages"][0]["url"].startswith(
+                            "https://api.example.com/images/"
+                        )
+                        assert browsed.structured_content["scanned_pages"] == 1
+                        assert browsed.structured_content["next_cursor_page"] is None
                         assert backend.page_context_calls[-1]["pages"] == [1]
 
                         browsed_section = await session.call_tool(
@@ -783,7 +832,20 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             page["page"] for page in browsed_section.structured_content["pages"]
                         ] == [12]
                         assert browsed_section.structured_content["pages"][0]["image_url"] is None
-                        assert backend.page_context_calls[-1]["pages"] is None
+                        assert backend.page_context_calls[-1]["pages"] == [1, 12]
+
+                        bounded_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                            },
+                        )
+                        assert bounded_section_browse.is_error is False
+                        assert bounded_section_browse.structured_content["scanned_pages"] == 50
+                        assert bounded_section_browse.structured_content["next_cursor_page"] == 51
+                        assert bounded_section_browse.structured_content["truncated"] is True
+                        assert backend.page_context_calls[-1]["pages"] == list(range(1, 51))
 
                         oversized_browse = await session.call_tool(
                             "browse_source",

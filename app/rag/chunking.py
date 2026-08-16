@@ -52,12 +52,33 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
     return " ".join([query, *dict.fromkeys(extra)])
 
 
-def section_from_text(text: str) -> str | None:
+def section_candidates(text: str) -> list[str]:
+    candidates = []
     for line in text.splitlines()[:8]:
         stripped = line.strip()
         if 3 <= len(stripped) <= 80 and re.match(r"^[A-Z0-9][A-Za-z0-9 /&+-]+$", stripped):
-            return stripped
-    return None
+            candidates.append(stripped)
+    return list(dict.fromkeys(candidates))
+
+
+def section_from_text(text: str, ignored: set[str] | None = None) -> str | None:
+    ignored_keys = {value.casefold() for value in ignored or set()}
+    return next(
+        (
+            candidate
+            for candidate in section_candidates(text)
+            if candidate.casefold() not in ignored_keys
+        ),
+        None,
+    )
+
+
+def inherited_section_from_text(
+    text: str,
+    previous: str | None,
+    ignored: set[str] | None = None,
+) -> str | None:
+    return section_from_text(text, ignored) or previous
 
 
 def split_text(text: str, target_chars: int, overlap_chars: int) -> list[str]:

@@ -20,7 +20,7 @@ from app.rag.sources import iter_pdfs
 from app.rag.store import ACTIVE_GENERATIONS_FILE, RagStore
 from app.rag.voyage_client import VoyageEmbedder
 
-EXTRACTION_SCHEMA_VERSION = "2"
+EXTRACTION_SCHEMA_VERSION = "3"
 ARTIFACT_COMPLETE_FILE = ".complete.json"
 STAGING_NAMESPACE_PATTERN = re.compile(r"~[0-9a-f]{32}$")
 

@@ -64,6 +64,7 @@ TeamNumber = Annotated[int, Field(ge=1, le=99999)]
 SeasonYear = Annotated[int, Field(ge=1992, le=2100)]
 SourceId = SourceIdFilter
 MechanismType = MechanismTypeFilter
+BROWSE_SECTION_SCAN_PAGES = 50
 
 
 class RetrievalBackend(Protocol):
@@ -553,7 +554,9 @@ def create_mcp_server(
         description=(
             "Navigate one exact binder by page range or section without leaving that source. "
             "Use this for subsystem connections and designs that span several pages. Returned "
-            "result ids can be passed to fetch, inspect_candidates, or render_search_results."
+            "result ids can be passed to fetch, inspect_candidates, or render_search_results. "
+            "When next_cursor_page is present, repeat the same section request with that value "
+            "as cursor_page to continue the bounded scan."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -563,6 +566,7 @@ def create_mcp_server(
         start_page: Annotated[int | None, Field(ge=1)] = None,
         end_page: Annotated[int | None, Field(ge=1)] = None,
         section: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
+        cursor_page: Annotated[int | None, Field(ge=1)] = None,
         include_previews: bool = True,
     ) -> BrowseSourceOutput:
         if (start_page is None) != (end_page is None):
@@ -572,6 +576,8 @@ def create_mcp_server(
                 raise ValueError("end_page must be greater than or equal to start_page.")
             if end_page - start_page + 1 > 10:
                 raise ValueError("browse_source can return at most 10 pages per call.")
+        if cursor_page is not None and start_page is not None:
+            raise ValueError("cursor_page cannot be combined with an explicit page range.")
 
         catalog = source_cache.get_or_compute(
             retrieval.corpus_revision(),
@@ -581,16 +587,22 @@ def create_mcp_server(
         if source is None:
             raise ValueError(f"No indexed source found for source_id {source_id!r}.")
 
+        available_pages = sorted(source.pages)
         has_range = start_page is not None and end_page is not None
-        requested_pages = list(range(start_page, end_page + 1)) if has_range else source.pages
+        if has_range:
+            requested_pages = list(range(start_page, end_page + 1))
+        else:
+            eligible_pages = [
+                page for page in available_pages if cursor_page is None or page >= cursor_page
+            ]
+            scan_limit = BROWSE_SECTION_SCAN_PAGES if section else 10
+            requested_pages = eligible_pages[:scan_limit]
         missing_pages = [page for page in requested_pages if page not in source.pages]
         section_needle = section.strip().casefold() if section else None
         pages_to_load = [page for page in requested_pages if page in source.pages]
-        if not has_range and section_needle is None:
-            pages_to_load = pages_to_load[:10]
         contexts = retrieval.page_contexts(
             source.source_pdf,
-            None if not has_range and section_needle else pages_to_load,
+            pages_to_load,
             source.source_version_id,
             source.ingestion_id,
         )
@@ -605,6 +617,16 @@ def create_mcp_server(
         ]
         total_matches = len(matching_contexts)
         matching_contexts = matching_contexts[:10]
+        next_cursor_page = None
+        if not has_range and pages_to_load:
+            if total_matches > len(matching_contexts):
+                resume_after = matching_contexts[-1].page
+            else:
+                resume_after = pages_to_load[-1]
+            next_cursor_page = next(
+                (page for page in available_pages if page > resume_after),
+                None,
+            )
 
         return browse_source_output(
             source,
@@ -612,10 +634,9 @@ def create_mcp_server(
             public_base_url,
             include_previews=include_previews,
             missing_pages=sorted(set(missing_pages)),
-            truncated=(
-                total_matches > len(matching_contexts)
-                or (not has_range and section_needle is None and len(source.pages) > 10)
-            ),
+            scanned_pages=len(pages_to_load),
+            next_cursor_page=next_cursor_page,
+            truncated=next_cursor_page is not None,
         )
 
     return server

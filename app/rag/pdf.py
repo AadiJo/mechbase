@@ -1,4 +1,6 @@
 import json
+import math
+from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 
@@ -7,7 +9,7 @@ import pytesseract
 from PIL import Image
 
 from app.rag.artifacts import generation_namespace, source_artifact_root
-from app.rag.chunking import section_from_text, split_text
+from app.rag.chunking import inherited_section_from_text, section_candidates, split_text
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SourceDoc
 
@@ -58,6 +60,9 @@ def extract_documents(
     docs: list[RagDocument] = []
     pdf = fitz.open(source.path)
     try:
+        outline_sections = _outline_sections(pdf)
+        repeated_headers = _repeated_headers(pdf)
+        inherited_section = None
         for page_index, page in enumerate(pdf):
             page_num = page_index + 1
             page_dir = artifact_root / f"page-{page_num:03d}"
@@ -72,6 +77,14 @@ def extract_documents(
                 if not page_image_path.exists():
                     _render_page(page, settings.render_dpi, page_image_path)
 
+            section = outline_sections.get(page_num)
+            if section is None:
+                section = inherited_section_from_text(
+                    page_text,
+                    inherited_section,
+                    repeated_headers,
+                )
+            inherited_section = section
             linked_artifacts = [str(page_image_path)]
             extracted_images = _extract_page_images(
                 pdf,
@@ -80,6 +93,7 @@ def extract_documents(
                 source,
                 page_num,
                 page_text,
+                section,
                 ingestion_id,
             )
             linked_artifacts.extend(
@@ -87,7 +101,6 @@ def extract_documents(
             )
             docs.extend(extracted_images)
 
-            section = section_from_text(page_text)
             page_document_id = _document_id(source.source_version_id, page_num, "page")
             docs.append(
                 RagDocument(
@@ -152,6 +165,7 @@ def _extract_page_images(
     source: SourceDoc,
     page_num: int,
     page_text: str,
+    section: str | None,
     ingestion_id: str | None,
 ) -> list[RagDocument]:
     docs: list[RagDocument] = []
@@ -197,8 +211,50 @@ def _extract_page_images(
                 text=page_text[:1500],
                 artifact_path=str(out_path),
                 linked_artifacts=[str(out_path)],
-                section=section_from_text(page_text),
+                section=section,
                 source_url=source.source_url,
             )
         )
     return docs
+
+
+def _outline_sections(pdf: fitz.Document) -> dict[int, str]:
+    try:
+        outline = pdf.get_toc(simple=True)
+    except (RuntimeError, ValueError):
+        return {}
+    starts = [
+        (int(page), " ".join(str(title).split()))
+        for _level, title, page in outline
+        if str(title).strip() and 1 <= int(page) <= len(pdf)
+    ]
+    if not starts:
+        return {}
+
+    sections = {}
+    active = None
+    starts_by_page: dict[int, list[str]] = {}
+    for page, title in starts:
+        starts_by_page.setdefault(page, []).append(title)
+    for page in range(1, len(pdf) + 1):
+        if page in starts_by_page:
+            active = starts_by_page[page][-1]
+        if active is not None:
+            sections[page] = active
+    return sections
+
+
+def _repeated_headers(pdf: fitz.Document) -> set[str]:
+    candidate_counts: Counter[str] = Counter()
+    for page in pdf:
+        candidates = {
+            candidate.casefold()
+            for candidate in section_candidates(page.get_text("text"))[:2]
+        }
+        candidate_counts.update(candidates)
+    minimum_repeats = max(2, math.ceil(len(pdf) * 0.6))
+    return {
+        candidate
+        for candidate, count in candidate_counts.items()
+        if count >= minimum_repeats
+    }

@@ -65,7 +65,8 @@ The server provides seven read-only tools:
   search, stable logical IDs plus content versions, provenance when known, and complete text and
   image coverage counts.
 - `browse_source(...)` navigates one exact binder by page range or section and returns page-scoped
-  text, preview URLs, and result IDs without leaving that source.
+  text, immutable preview citations, and primary result IDs without leaving that source. Long
+  section scans return `next_cursor_page` so follow-up calls stay bounded.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.

@@ -748,15 +748,22 @@ class DualVectorSimilarityClient:
 
 
 class ResultSimilarityClient(DualVectorSimilarityClient):
-    def scroll(self, **_kwargs):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scroll_calls = 0
+
+    def scroll(self, **kwargs):
+        self.scroll_calls += 1
+        conditions = {condition.key: condition for condition in kwargs["scroll_filter"].must}
         seed = _hit("seed", "seed.pdf", "254", 2023, 1.0)
+        if "id" in conditions:
+            seed.vector = {TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.0]}
+            return ([seed], None)
+        seed.payload["id"] = "seed-page-image"
+        seed.payload["modality"] = "page_image"
+        seed.vector = {TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.2]}
         return (
-            [
-                SimpleNamespace(
-                    payload=seed.payload,
-                    vector={TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.2]},
-                )
-            ],
+            [seed],
             None,
         )
 
@@ -768,12 +775,32 @@ def test_result_similarity_queries_both_seed_vectors() -> None:
     response = store.similar_from_result_id("seed", 10)
 
     assert response is not None
+    assert client.scroll_calls == 2
     assert client.queried_vectors == [TEXT_VECTOR, IMAGE_VECTOR]
     assert [result.debug["similarity_reason"] for result in response.results] == [
         "both",
         "shape",
         "text",
     ]
+
+
+class TextOnlyResultSimilarityClient(ResultSimilarityClient):
+    def scroll(self, **kwargs):
+        conditions = {condition.key: condition for condition in kwargs["scroll_filter"].must}
+        if "id" not in conditions:
+            self.scroll_calls += 1
+            return [], None
+        return super().scroll(**kwargs)
+
+
+def test_result_similarity_skips_placeholder_image_vectors_without_a_page_image() -> None:
+    client = TextOnlyResultSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert client.queried_vectors == [TEXT_VECTOR]
 
 
 def test_find_similar_reports_text_shape_and_combined_matches() -> None:
