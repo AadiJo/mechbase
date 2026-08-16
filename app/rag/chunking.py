@@ -73,13 +73,30 @@ def normalize_token_phrase(value: str) -> str:
 
 
 def contains_token_phrase(text: str, phrase: str) -> bool:
-    haystack = normalize_token_phrase(text).split()
-    needle = normalize_token_phrase(phrase).split()
+    normalized_haystack = normalize_token_phrase(text)
+    normalized_needle = normalize_token_phrase(phrase)
+    if _uses_unsegmented_script(normalized_needle):
+        return normalized_needle.replace(" ", "") in normalized_haystack.replace(" ", "")
+
+    haystack = normalized_haystack.split()
+    needle = normalized_needle.split()
     if not needle or len(needle) > len(haystack):
         return False
     return any(
         haystack[index : index + len(needle)] == needle
         for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def _uses_unsegmented_script(value: str) -> bool:
+    script_names = ("CJK", "HIRAGANA", "KATAKANA", "HANGUL", "THAI", "LAO", "KHMER", "MYANMAR")
+    return any(
+        character.isalnum()
+        and (
+            unicodedata.east_asian_width(character) in {"W", "F"}
+            or any(script in unicodedata.name(character, "") for script in script_names)
+        )
+        for character in value
     )
 
 

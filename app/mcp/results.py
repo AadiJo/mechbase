@@ -106,10 +106,13 @@ class BrowsePage(BaseModel):
     image_url: str | None = None
 
 
+MAX_NORMALIZED_SECTION_LENGTH = 512
+
+
 class BrowseCursor(BaseModel):
     page: int = Field(ge=1)
     source_id: str = Field(min_length=1, max_length=160)
-    section: str | None = Field(default=None, max_length=160)
+    section: str | None = Field(default=None, max_length=MAX_NORMALIZED_SECTION_LENGTH)
     source_version_id: str = Field(min_length=1, max_length=200)
     ingestion_id: str | None = Field(default=None, max_length=200)
 

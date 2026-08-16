@@ -184,7 +184,7 @@ def test_hyphenated_repeated_subsystem_alias_heading_is_retained() -> None:
 def test_token_phrase_matching_normalizes_punctuation_without_substrings() -> None:
     assert contains_token_phrase("Floor-Pickup geometry", "floor pickup") is True
     assert contains_token_phrase("Harmonic drive", "arm") is False
-    assert contains_token_phrase("机械臂 设计", "机械臂") is True
+    assert contains_token_phrase("机械臂设计", "机械臂") is True
 
 
 def test_repeated_document_title_is_suppressed_before_single_subsystem() -> None:

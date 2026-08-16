@@ -183,7 +183,7 @@ class FakeRetrievalBackend:
                 page=page,
                 section="Elevator" if page in {11, 12, 13} else "Overview",
                 text=(
-                    "Swerve Drive\nMechanical Design\nFloor-Pickup\nHarmonic drive\n机械臂 设计"
+                    "Swerve Drive\nMechanical Design\nFloor-Pickup\nHarmonic drive\n机械臂设计"
                     if page == 1
                     else f"Page {page} source text"
                 ),
@@ -1017,6 +1017,19 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         }
                         assert bounded_section_browse.structured_content["truncated"] is True
                         assert backend.page_context_calls[-1]["pages"] == list(range(1, 51))
+
+                        expanding_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "ß" * 100,
+                            },
+                        )
+                        assert expanding_section_browse.is_error is False
+                        assert (
+                            expanding_section_browse.structured_content["next_cursor"]["section"]
+                            == "ss" * 100
+                        )
                         omitted_section_browse = await session.call_tool(
                             "browse_source",
                             {

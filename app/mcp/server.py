@@ -19,6 +19,7 @@ from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.cache import TTLCache
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
+    MAX_NORMALIZED_SECTION_LENGTH,
     AppliedSearchFilters,
     BrowseCursor,
     BrowseSourceOutput,
@@ -617,6 +618,10 @@ def create_mcp_server(
         section_needle = normalize_token_phrase(section) if section else None
         if section is not None and not section_needle:
             raise ValueError("section must contain at least one letter or number.")
+        if section_needle is not None and len(section_needle) > MAX_NORMALIZED_SECTION_LENGTH:
+            raise ValueError(
+                "section expands beyond the normalized query limit; use a shorter phrase."
+            )
         if cursor is not None and cursor.source_id != source_id:
             raise ValueError("The browse cursor belongs to a different source.")
         if cursor is not None and cursor.section != section_needle:
