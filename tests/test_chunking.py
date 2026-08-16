@@ -156,7 +156,25 @@ def test_repeated_single_subsystem_heading_is_retained() -> None:
     assert _repeated_headers(pdf) == set()
 
 
+def test_repeated_subsystem_alias_heading_is_retained() -> None:
+    pdf = FakeTextPdf(
+        [
+            "Collector\nRoller Geometry\nroller notes",
+            "Collector\nBelt Path\nbelt notes",
+            "Collector\nPackaging\nframe notes",
+        ]
+    )
+
+    assert _repeated_headers(pdf) == set()
+
+
 def test_repeated_document_title_is_suppressed_before_single_subsystem() -> None:
     pdf = FakeTextPdf(["Team 254 Technical Binder\nIntake\nroller notes"] * 3)
 
     assert _repeated_headers(pdf) == {"team 254 technical binder"}
+
+
+def test_repeated_two_line_subsystem_heading_is_retained() -> None:
+    pdf = FakeTextPdf(["Swerve Drive\nMechanical Design\nmodule notes"] * 3)
+
+    assert _repeated_headers(pdf) == set()

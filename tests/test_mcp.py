@@ -182,7 +182,11 @@ class FakeRetrievalBackend:
                 year=2020,
                 page=page,
                 section="Elevator" if page in {11, 12, 13} else "Overview",
-                text=f"Page {page} source text",
+                text=(
+                    "Swerve Drive\nMechanical Design\nPage 1 source text"
+                    if page == 1
+                    else f"Page {page} source text"
+                ),
                 page_image_url=f"/images/254-2020/page-{page:03d}/page.png",
                 image_urls=[f"/images/254-2020/page-{page:03d}/page.png"],
                 result_ids=[f"result_page_{page}"],
@@ -941,6 +945,20 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         ] == [12]
                         assert browsed_section.structured_content["pages"][0]["image_url"] is None
                         assert backend.page_context_calls[-1]["pages"] == [1, 12]
+
+                        browsed_text_heading = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "swerve",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_text_heading.is_error is False
+                        assert [
+                            page["page"]
+                            for page in browsed_text_heading.structured_content["pages"]
+                        ] == [1]
 
                         bounded_section_browse = await session.call_tool(
                             "browse_source",

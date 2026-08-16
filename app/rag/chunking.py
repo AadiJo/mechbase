@@ -8,6 +8,9 @@ MECHANISM_TERMS = {
     "end effector": ["grabber", "manipulator", "wrist", "scorer"],
     "elevator": ["lift", "arm", "extension"],
 }
+MECHANISM_HEADINGS = frozenset(
+    [*MECHANISM_TERMS, *(alias for aliases in MECHANISM_TERMS.values() for alias in aliases)]
+)
 
 SEASON_MECHANISM_TERMS = {
     2024: {"climber": ["trap", "stage chain"]},

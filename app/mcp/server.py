@@ -593,7 +593,14 @@ def create_mcp_server(
         source_id: SourceId,
         start_page: Annotated[int | None, Field(ge=1)] = None,
         end_page: Annotated[int | None, Field(ge=1)] = None,
-        section: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
+        section: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=160,
+                description="Case-insensitive section heading or source-text phrase.",
+            ),
+        ] = None,
         cursor: BrowseCursor | None = None,
         include_previews: bool = True,
     ) -> BrowseSourceOutput:
@@ -645,7 +652,8 @@ def create_mcp_server(
         matching_contexts = [
             context
             for context in contexts
-            if section_needle is None or section_needle in (context.section or "").casefold()
+            if section_needle is None
+            or section_needle in "\n".join((context.section or "", context.text)).casefold()
         ]
         total_matches = len(matching_contexts)
         matching_contexts = matching_contexts[:10]

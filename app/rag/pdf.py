@@ -9,7 +9,12 @@ import pytesseract
 from PIL import Image
 
 from app.rag.artifacts import generation_namespace, source_artifact_root
-from app.rag.chunking import MECHANISM_TERMS, resolve_page_section, section_candidates, split_text
+from app.rag.chunking import (
+    MECHANISM_HEADINGS,
+    resolve_page_section,
+    section_candidates,
+    split_text,
+)
 from app.rag.config import Settings
 from app.rag.models import RagDocument, SourceDoc
 
@@ -238,12 +243,10 @@ def _outline_section_starts(pdf: fitz.Document) -> dict[int, str]:
 
 def _repeated_headers(pdf: fitz.Document) -> set[str]:
     candidate_counts: Counter[str] = Counter()
-    candidate_pages: list[list[str]] = []
     for page in pdf:
         candidates = [
             candidate.casefold() for candidate in section_candidates(page.get_text("text"))[:2]
         ]
-        candidate_pages.append(candidates)
         candidate_counts.update(set(candidates))
     minimum_repeats = max(2, math.ceil(len(pdf) * 0.6))
     repeated = {
@@ -252,7 +255,7 @@ def _repeated_headers(pdf: fitz.Document) -> set[str]:
     repeated = {
         candidate
         for candidate in repeated
-        if not any(mechanism in candidate for mechanism in MECHANISM_TERMS)
+        if not any(f" {mechanism} " in f" {candidate} " for mechanism in MECHANISM_HEADINGS)
     }
     if not repeated:
         return set()
@@ -261,16 +264,11 @@ def _repeated_headers(pdf: fitz.Document) -> set[str]:
     if alternatives:
         return repeated
 
-    # When every plausible heading repeats, retain the last repeated line as the section. This
-    # handles short, single-subsystem binders whose pages all begin with the same section heading,
-    # while still suppressing a preceding document title when one exists.
-    retained = next(
-        (
-            candidate
-            for candidates in candidate_pages
-            for candidate in reversed(candidates)
-            if candidate in repeated
-        ),
-        None,
-    )
-    return repeated - ({retained} if retained is not None else set())
+    # Repeated heading hierarchies are ambiguous without layout information. Suppress only clear
+    # document chrome and retain headings such as "Swerve Drive / Mechanical Design" intact.
+    document_markers = (" binder", " report", "team ", "frc ", "technical ")
+    return {
+        candidate
+        for candidate in repeated
+        if any(marker in f" {candidate}" for marker in document_markers)
+    }
