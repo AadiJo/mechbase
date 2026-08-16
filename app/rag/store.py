@@ -119,8 +119,8 @@ class RagStore:
 
     def corpus_revision(self) -> str:
         self.client.get_collection(self.settings.collection_name)
-        manifest_path = self.settings.artifact_dir / "ingestion-manifest.jsonl"
-        active_path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
+        manifest_path = self.settings.rag_state_dir / "ingestion-manifest.jsonl"
+        active_path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
         try:
             manifest = manifest_path.stat()
             manifest_revision = f"{manifest.st_mtime_ns}:{manifest.st_size}"
@@ -133,7 +133,7 @@ class RagStore:
         return f"{manifest_revision}:{active_revision}"
 
     def active_generations(self) -> dict[str, str]:
-        path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
+        path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -148,7 +148,7 @@ class RagStore:
     def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
         active = self.active_generations()
         active[source_id] = ingestion_id
-        path = self.settings.artifact_dir / ACTIVE_GENERATIONS_FILE
+        path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_name(f".{path.name}.{ingestion_id}.tmp")
         with temporary_path.open("w", encoding="utf-8") as output:
@@ -691,10 +691,8 @@ class RagStore:
             team=payload.get("team"),
             year=payload.get("year"),
             page=page,
-            page_context_url=self._page_context_url(
-                source_pdf, page, source_version_id, ingestion_id
-            ),
-            page_text_url=self._page_text_url(source_pdf, page, source_version_id, ingestion_id),
+            page_context_url=self._page_context_url(source_pdf, page),
+            page_text_url=self._page_text_url(source_pdf, page),
             text=context.text,
             page_image_url=context.page_image_url,
             image_urls=context.image_urls,
@@ -805,14 +803,10 @@ class RagStore:
             page_context_url=self._page_context_url(
                 payload.get("source_pdf", ""),
                 int(payload.get("page", 0)),
-                payload.get("source_version_id"),
-                payload.get("ingestion_id"),
             ),
             page_text_url=self._page_text_url(
                 payload.get("source_pdf", ""),
                 int(payload.get("page", 0)),
-                payload.get("source_version_id"),
-                payload.get("ingestion_id"),
             ),
             debug=debug or {},
         )
@@ -998,8 +992,6 @@ class RagStore:
         self,
         source_pdf: str,
         page: int,
-        source_version_id: str | None = None,
-        ingestion_id: str | None = None,
     ) -> str:
         return f"/pages/{quote(source_pdf, safe='')}/{page}"
 
@@ -1007,8 +999,6 @@ class RagStore:
         self,
         source_pdf: str,
         page: int,
-        source_version_id: str | None = None,
-        ingestion_id: str | None = None,
     ) -> str:
         return f"/pages/{quote(source_pdf, safe='')}/{page}/text"
 
@@ -1023,14 +1013,12 @@ def _metadata_filter(
     active_generations: dict[str, str] | None = None,
 ) -> models.Filter:
     conditions = []
-    if team:
-        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=team)))
-    if team_numbers:
-        conditions.append(_match_values("team", list(dict.fromkeys(team_numbers))))
-    if year:
-        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=year)))
-    if years:
-        conditions.append(_match_values("year", list(dict.fromkeys(years))))
+    normalized_teams = list(dict.fromkeys([*([team] if team else []), *(team_numbers or [])]))
+    if normalized_teams:
+        conditions.append(_match_values("team", normalized_teams))
+    normalized_years = list(dict.fromkeys([*([year] if year else []), *(years or [])]))
+    if normalized_years:
+        conditions.append(_match_values("year", normalized_years))
     if source:
         conditions.append(
             models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source))

@@ -45,5 +45,5 @@ def _is_valid_jpeg(path: Path) -> bool:
         with Image.open(path) as image:
             image.verify()
             return image.format == "JPEG"
-    except OSError:
+    except (OSError, Image.DecompressionBombError):
         return False

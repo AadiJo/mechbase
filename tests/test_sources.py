@@ -13,6 +13,7 @@ from app.rag.ingest import (
     ingest_sources,
     ingestion_fingerprint,
     ingestion_lock,
+    migrate_legacy_control_state,
     publish_artifact_generation,
     remove_abandoned_artifact_staging,
     remove_artifact_generation,
@@ -354,6 +355,35 @@ def test_ingestion_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
         pass
 
 
+def test_legacy_public_control_files_migrate_to_private_state(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    state_dir = tmp_path / "state"
+    artifact_dir.mkdir()
+    legacy_manifest = artifact_dir / "ingestion-manifest.jsonl"
+    legacy_active = artifact_dir / "active-generations.json"
+    legacy_manifest.write_text('{"source":"254.pdf"}\n', encoding="utf-8")
+    legacy_active.write_text('{"254":"generation-a"}', encoding="utf-8")
+    settings = Settings(ARTIFACT_DIR=artifact_dir, RAG_STATE_DIR=state_dir)
+
+    migrate_legacy_control_state(settings)
+
+    assert (state_dir / legacy_manifest.name).read_text(encoding="utf-8") == (
+        '{"source":"254.pdf"}\n'
+    )
+    assert (state_dir / legacy_active.name).read_text(encoding="utf-8") == (
+        '{"254":"generation-a"}'
+    )
+    assert not legacy_manifest.exists()
+    assert not legacy_active.exists()
+
+    legacy_manifest.write_text("stale", encoding="utf-8")
+    migrate_legacy_control_state(settings)
+    assert not legacy_manifest.exists()
+    assert (state_dir / legacy_manifest.name).read_text(encoding="utf-8") == (
+        '{"source":"254.pdf"}\n'
+    )
+
+
 def test_committed_generation_stays_authoritative_when_retirement_fails(
     tmp_path: Path,
     monkeypatch,
@@ -414,6 +444,7 @@ def test_committed_generation_stays_authoritative_when_retirement_fails(
             return [[1.0] for _text in texts]
 
     store = FakeStore()
+    settings = Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1)
     monkeypatch.setattr("app.rag.ingest.extract_documents", lambda *_args, **_kwargs: [document])
 
     with pytest.raises(RuntimeError, match="retirement failed"):
@@ -421,14 +452,14 @@ def test_committed_generation_stays_authoritative_when_retirement_fails(
             [source],
             batch_size=1,
             force=True,
-            settings=Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1),
+            settings=settings,
             store=store,
             embedder=FakeEmbedder(),
         )
 
     assert store.active[source.source_id] != "old"
     assert store.failed_generation_deleted is False
-    assert completed_sources(tmp_path / "ingestion-manifest.jsonl") == {}
+    assert completed_sources(settings.rag_state_dir / "ingestion-manifest.jsonl") == {}
 
 
 def test_normal_retry_finalizes_a_failed_same_fingerprint_force_refresh(
@@ -447,7 +478,8 @@ def test_normal_retry_finalizes_a_failed_same_fingerprint_force_refresh(
     )
     settings = Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1)
     fingerprint = ingestion_fingerprint(source, settings)
-    manifest = tmp_path / "ingestion-manifest.jsonl"
+    manifest = settings.rag_state_dir / "ingestion-manifest.jsonl"
+    manifest.parent.mkdir(parents=True)
     manifest.write_text(
         json.dumps(
             {

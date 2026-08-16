@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -41,7 +41,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async with mcp_server.session_manager.run():
             yield
     finally:
-        await index_task
+        await _cancel_task(index_task)
+
+
+async def _cancel_task(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def _ensure_payload_indexes() -> None:

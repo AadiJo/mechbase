@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     voyage_api_key: str | None = Field(default=None, alias="VOYAGE_API_KEY")
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
     artifact_dir: Path = Field(default=Path("artifacts"), alias="ARTIFACT_DIR")
+    rag_state_dir_override: Path | None = Field(default=None, alias="RAG_STATE_DIR")
     data_dir: Path = Field(default=Path("data"), alias="DATA_DIR")
     collection_name: str = Field(default="frc_mechanisms", alias="COLLECTION_NAME")
     artifact_url_base: str = Field(default="/images", alias="ARTIFACT_URL_BASE")
@@ -55,6 +56,18 @@ class Settings(BaseSettings):
     @property
     def mcp_endpoint_url(self) -> str:
         return f"{str(self.mcp_public_base_url).rstrip('/')}/mcp"
+
+    @property
+    def rag_state_dir(self) -> Path:
+        artifact_dir = self.artifact_dir.resolve()
+        state_dir = (
+            self.rag_state_dir_override.resolve()
+            if self.rag_state_dir_override is not None
+            else artifact_dir.parent / f".{artifact_dir.name}-state"
+        )
+        if state_dir == artifact_dir or artifact_dir in state_dir.parents:
+            raise ValueError("RAG_STATE_DIR must be outside ARTIFACT_DIR.")
+        return state_dir
 
     @property
     def mcp_required_scopes(self) -> list[str]:

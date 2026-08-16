@@ -41,7 +41,7 @@ def test_public_document_ids_preserve_exact_source_identity() -> None:
     assert spaced == _document_id("foo bar@same-content", 1, "text", 0)
 
 
-def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
+def test_build_filter_unions_legacy_and_multi_value_filters() -> None:
     qfilter = _build_filter(
         SearchRequest(
             query="shooter",
@@ -55,11 +55,11 @@ def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
 
     assert qfilter is not None
     conditions = qfilter.must or []
-    team_conditions = [condition for condition in conditions if condition.key == "team"]
-    year_conditions = [condition for condition in conditions if condition.key == "year"]
+    team_condition = next(condition for condition in conditions if condition.key == "team")
+    year_condition = next(condition for condition in conditions if condition.key == "year")
     source_condition = next(condition for condition in conditions if condition.key == "source_pdf")
-    assert [condition.match.value for condition in team_conditions] == ["254", "4414"]
-    assert [condition.match.value for condition in year_conditions] == [2023, 2024]
+    assert team_condition.match.any == ["254", "4414"]
+    assert year_condition.match.any == [2023, 2024]
     assert source_condition.match.value == "254-2023.pdf"
 
 
@@ -719,11 +719,16 @@ class PagingQdrantClient:
         )
 
 
-def test_list_sources_paginates_and_filters_by_source_query() -> None:
+def test_list_sources_pushes_exact_filters_into_the_paginated_store_scan() -> None:
     client = PagingQdrantClient()
     store = RagStore(Settings(), client=client)
 
-    response = store.list_sources(source_query="4414")
+    response = store.list_sources(
+        team_numbers=["4414"],
+        years=[2024],
+        source_ids=["4414-2024"],
+        source_query="4414",
+    )
 
     assert client.calls == 2
     assert "text" not in client.payload_fields
@@ -732,6 +737,10 @@ def test_list_sources_paginates_and_filters_by_source_query() -> None:
     assert response.sources[0].source_id == "4414-2024"
     assert response.sources[0].page_image_count == 1
     assert response.sources[0].source_url == "https://example.com/4414-2024.pdf"
+    conditions = {condition.key: condition for condition in client.scroll_filter.must}
+    assert conditions["team"].match.value == "4414"
+    assert conditions["year"].match.value == 2024
+    assert conditions["source_id"].match.value == "4414-2024"
     assert client.scroll_filter.must_not[0].key == "is_staged"
 
 
@@ -754,3 +763,31 @@ def test_artifact_urls_encode_fragments_and_round_trip_through_static_files(
     response = TestClient(static_app).get(artifact_url)
     assert response.status_code == 200
     assert response.content == b"page-image"
+
+
+def test_ingestion_control_state_is_outside_the_public_artifact_root(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    settings = Settings(ARTIFACT_DIR=artifact_dir)
+    store = RagStore(settings, client=SimpleNamespace())
+
+    store.set_active_generation("254-2023", "generation-a")
+
+    assert settings.rag_state_dir.parent == artifact_dir.parent
+    assert settings.rag_state_dir != artifact_dir
+    assert (settings.rag_state_dir / "active-generations.json").is_file()
+    static_app = FastAPI()
+    static_app.mount("/images", StaticFiles(directory=artifact_dir, check_dir=False))
+    response = TestClient(static_app).get("/images/active-generations.json")
+    assert response.status_code == 404
+
+
+def test_ingestion_control_state_rejects_a_public_subdirectory(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    settings = Settings(
+        ARTIFACT_DIR=artifact_dir,
+        RAG_STATE_DIR=artifact_dir / "state",
+    )
+
+    with pytest.raises(ValueError, match="outside ARTIFACT_DIR"):
+        _ = settings.rag_state_dir

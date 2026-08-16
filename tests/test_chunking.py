@@ -40,6 +40,17 @@ def test_expansion_only_adds_game_specific_terms_for_matching_season() -> None:
     assert "winch" in trap_query
 
 
+def test_unknown_explicit_season_keeps_generic_terms_without_foreign_game_aliases() -> None:
+    expanded = expand_query("multi ball climber", years=[2026])
+
+    assert "shooter" in expanded
+    assert "hang" in expanded
+    assert "winch" in expanded
+    assert "cargo" not in expanded
+    assert "power cell" not in expanded
+    assert "multi note" not in expanded
+
+
 def test_split_text_keeps_content() -> None:
     text = "A" * 400 + "\n\n" + "B" * 400 + "\n\n" + "C" * 400
     chunks = split_text(text, target_chars=700, overlap_chars=50)

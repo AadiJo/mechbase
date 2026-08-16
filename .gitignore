@@ -11,5 +11,6 @@ artifacts/
 data/
 docs/
 qdrant_storage/
+rag_state/
 frc_mechanism_rag.egg-info/
 *.pyc

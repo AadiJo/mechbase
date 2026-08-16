@@ -22,6 +22,12 @@ MULTI_PIECE_TERMS = {
 
 
 def expand_query(query: str, years: list[int] | None = None) -> str:
+    """Add generic aliases plus only the game-specific aliases valid for explicit seasons.
+
+    An omitted year is a broad historical search and uses every known season alias. An explicit
+    unlisted year deliberately keeps only generic terms rather than importing terminology from an
+    unrelated game.
+    """
     lowered = query.lower()
     extra: list[str] = []
     for key, synonyms in MECHANISM_TERMS.items():
@@ -36,6 +42,7 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
                 extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))
     if "multi ball" in lowered:
         extra.append("shooter")
+        # Unknown explicit seasons must not borrow game-piece names from other games.
         selected_terms = [
             term for year in years or MULTI_PIECE_TERMS for term in MULTI_PIECE_TERMS.get(year, [])
         ]

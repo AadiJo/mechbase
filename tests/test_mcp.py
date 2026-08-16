@@ -49,7 +49,7 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
-        self.list_source_calls = 0
+        self.list_source_calls: list[dict[str, object]] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -100,39 +100,66 @@ class FakeRetrievalBackend:
             ),
         )
 
-    def list_sources(self) -> SourceListResponse:
-        self.list_source_calls += 1
+    def list_sources(
+        self,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
+    ) -> SourceListResponse:
+        self.list_source_calls.append(
+            {
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+                "source_query": source_query,
+            }
+        )
+        sources = [
+            SourceSummary(
+                source_id="254-2020",
+                source_version="version-a",
+                source_version_id="254-2020@version-a",
+                ingestion_id="ingestion-a",
+                source_pdf="254-2020.pdf",
+                team="254",
+                year=2020,
+                pages=[1, 12],
+                page_count=2,
+                text_count=3,
+                page_image_count=2,
+                extracted_image_count=1,
+                sample_image_urls=["/images/254-2020/page-012/page.png"],
+            ),
+            SourceSummary(
+                source_id="4414-2024",
+                source_version="version-b",
+                source_version_id="4414-2024@version-b",
+                ingestion_id="ingestion-b",
+                source_pdf="4414-2024.pdf",
+                team="4414",
+                year=2024,
+                pages=[4],
+                page_count=1,
+                text_count=1,
+                page_image_count=1,
+                extracted_image_count=0,
+            ),
+        ]
+        needle = source_query.casefold() if source_query else None
         return SourceListResponse(
             sources=[
-                SourceSummary(
-                    source_id="254-2020",
-                    source_version="version-a",
-                    source_version_id="254-2020@version-a",
-                    ingestion_id="ingestion-a",
-                    source_pdf="254-2020.pdf",
-                    team="254",
-                    year=2020,
-                    pages=[1, 12],
-                    page_count=2,
-                    text_count=3,
-                    page_image_count=2,
-                    extracted_image_count=1,
-                    sample_image_urls=["/images/254-2020/page-012/page.png"],
-                ),
-                SourceSummary(
-                    source_id="4414-2024",
-                    source_version="version-b",
-                    source_version_id="4414-2024@version-b",
-                    ingestion_id="ingestion-b",
-                    source_pdf="4414-2024.pdf",
-                    team="4414",
-                    year=2024,
-                    pages=[4],
-                    page_count=1,
-                    text_count=1,
-                    page_image_count=1,
-                    extracted_image_count=0,
-                ),
+                source
+                for source in sources
+                if (not team_numbers or source.team in team_numbers)
+                and (not years or source.year in years)
+                and (not source_ids or source.source_id in source_ids)
+                and (
+                    needle is None
+                    or needle in source.source_id.casefold()
+                    or needle in source.source_pdf.casefold()
+                )
             ]
         )
 
@@ -209,6 +236,32 @@ def test_candidate_preview_uses_shared_external_image_cache(tmp_path: Path) -> N
     assert second == first
     assert len(list((tmp_path / ".embedding-cache").glob("*.jpg"))) == 1
     assert not (tmp_path / ".embed").exists()
+
+
+def test_candidate_preview_rejects_a_decompression_bomb(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def raise_decompression_bomb(*_args, **_kwargs):
+        raise Image.DecompressionBombError
+
+    source = tmp_path / "page.png"
+    source.write_bytes(b"image")
+    context = ImageContextResponse(
+        image_url="/images/page.png",
+        source_pdf="254-2020.pdf",
+        page=1,
+        page_context_url="/pages/254-2020.pdf/1",
+        page_text_url="/pages/254-2020.pdf/1/text",
+        text="intake",
+        image_urls=["/images/page.png"],
+    )
+    monkeypatch.setattr(
+        "app.mcp.images.cached_resized_image",
+        raise_decompression_bomb,
+    )
+
+    assert load_preview_image(context, _settings(tmp_path)) is None
 
 
 def test_clerk_token_verifier_accepts_active_tokens() -> None:
@@ -387,6 +440,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "evidence_limits",
                         }
                         assert "source_query" in tools["list_sources"].input_schema["properties"]
+                        assert set(tools["list_sources"].input_schema["properties"]) == {
+                            "team_numbers",
+                            "years",
+                            "source_ids",
+                            "source_query",
+                            "limit",
+                        }
                         assert tools["inspect_candidates"].output_schema is None
                         assert "Always follow visual review with render_search_results" in (
                             tools["inspect_candidates"].description or ""
@@ -428,7 +488,6 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "evidence": {
                                         "direct_source_text": True,
                                         "visible_image": True,
-                                        "model_inference": False,
                                         "missing": [],
                                     },
                                 }
@@ -559,7 +618,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert "Selected mechanism pages" in resource_contents.contents[0].text
                         assert resource_contents.contents[0].meta["ui"]["prefersBorder"] is False
 
-                        sources = await session.call_tool("list_sources", {"team": "254"})
+                        sources = await session.call_tool("list_sources", {"team_numbers": [254]})
                         assert sources.is_error is False
                         assert sources.structured_content["sources"][0]["team"] == "254"
                         assert sources.structured_content["sources"][0]["source_id"] == "254-2020"
@@ -578,16 +637,18 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert (
                             sources.structured_content["sources"][0]["extracted_image_count"] == 1
                         )
-                        cached_sources = await session.call_tool("list_sources", {"team": "254"})
+                        cached_sources = await session.call_tool(
+                            "list_sources", {"team_numbers": [254]}
+                        )
                         assert cached_sources.is_error is False
-                        assert backend.list_source_calls == 1
+                        assert len(backend.list_source_calls) == 1
                         queried_sources = await session.call_tool(
                             "list_sources",
-                            {"team": "254", "source_query": "2020"},
+                            {"team_numbers": [254], "source_query": "2020"},
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert backend.list_source_calls == 1
+                        assert len(backend.list_source_calls) == 2
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -601,7 +662,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert backend.list_source_calls == 1
+                        assert len(backend.list_source_calls) == 3
+                        assert backend.list_source_calls[-1] == {
+                            "team_numbers": ["4414"],
+                            "years": [2024],
+                            "source_ids": ["4414-2024"],
+                            "source_query": "4414",
+                        }
 
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}

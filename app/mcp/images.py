@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from PIL import Image
+
 from app.rag.config import Settings
 from app.rag.image_cache import cached_resized_image
 from app.rag.models import ImageContextResponse
@@ -40,7 +42,7 @@ def load_preview_image(
             settings.artifact_dir / ".embedding-cache",
         )
         data = cached.read_bytes()
-    except OSError:
+    except (OSError, Image.DecompressionBombError):
         return None
     return PreviewImage(data=data, mime_type="image/jpeg")
 

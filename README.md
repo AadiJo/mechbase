@@ -77,7 +77,11 @@ MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://claude.ai
 CLERK_OAUTH_ISSUER_URL=https://clerk.example.com
 CLERK_SECRET_KEY=sk_live_...
 SEARCH_MIN_SCORE=0.35
+RAG_STATE_DIR=/private/mechbase-rag-state
 ```
+
+`RAG_STATE_DIR` stores ingestion locks, manifests, and active-generation pointers outside the
+public artifact directory. When omitted, it defaults to a hidden sibling of `ARTIFACT_DIR`.
 
 In the same Clerk instance, enable Dynamic client registration and set its default scope to
 `openid`. Some MCP clients, including ChatGPT and Claude, omit scopes when they register. The

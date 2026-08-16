@@ -17,7 +17,7 @@ from app.rag.config import Settings, get_settings
 from app.rag.models import RagDocument, SourceDoc
 from app.rag.pdf import extract_documents
 from app.rag.sources import iter_pdfs
-from app.rag.store import RagStore
+from app.rag.store import ACTIVE_GENERATIONS_FILE, RagStore
 from app.rag.voyage_client import VoyageEmbedder
 
 EXTRACTION_SCHEMA_VERSION = "2"
@@ -303,8 +303,8 @@ def remove_abandoned_artifact_staging(artifact_dir: Path) -> None:
 
 
 @contextmanager
-def ingestion_lock(artifact_dir: Path) -> Iterator[None]:
-    lock_path = artifact_dir / "ingestion.lock"
+def ingestion_lock(state_dir: Path) -> Iterator[None]:
+    lock_path = state_dir / "ingestion.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         try:
@@ -317,6 +317,32 @@ def ingestion_lock(artifact_dir: Path) -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def migrate_legacy_control_state(settings: Settings) -> None:
+    """Move legacy control files out of the public artifact directory."""
+    settings.rag_state_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ("ingestion-manifest.jsonl", ACTIVE_GENERATIONS_FILE):
+        legacy_path = settings.artifact_dir / filename
+        target_path = settings.rag_state_dir / filename
+        if not legacy_path.is_file():
+            continue
+        if target_path.exists():
+            legacy_path.unlink()
+            _fsync_directory(legacy_path.parent)
+            continue
+
+        temporary_path = target_path.with_name(f".{target_path.name}.{uuid4().hex}.tmp")
+        try:
+            shutil.copy2(legacy_path, temporary_path)
+            with temporary_path.open("rb") as copied_file:
+                os.fsync(copied_file.fileno())
+            temporary_path.replace(target_path)
+            _fsync_directory(target_path.parent)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        legacy_path.unlink()
+        _fsync_directory(legacy_path.parent)
+
+
 def ingest_sources(
     sources: list[SourceDoc],
     *,
@@ -326,7 +352,8 @@ def ingest_sources(
     store: RagStore,
     embedder: VoyageEmbedder,
 ) -> None:
-    manifest_path = settings.artifact_dir / "ingestion-manifest.jsonl"
+    manifest_path = settings.rag_state_dir / "ingestion-manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     completed = {} if force else _completed_source_records(manifest_path)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         for source in sources:
@@ -475,7 +502,8 @@ def main() -> None:
     embedder = VoyageEmbedder(settings)
 
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
-    with ingestion_lock(settings.artifact_dir):
+    with ingestion_lock(settings.rag_state_dir):
+        migrate_legacy_control_state(settings)
         remove_abandoned_artifact_staging(settings.artifact_dir)
         ingest_sources(
             sources,

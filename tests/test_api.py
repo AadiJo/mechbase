@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
 import app.api.auth as auth
@@ -13,6 +15,24 @@ def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["ok"] is True
+
+
+def test_shutdown_cancels_the_payload_index_task() -> None:
+    async def verify() -> tuple[bool, bool]:
+        stopped = asyncio.Event()
+
+        async def index_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        task = asyncio.create_task(index_worker())
+        await asyncio.sleep(0)
+        await main._cancel_task(task)
+        return task.cancelled(), stopped.is_set()
+
+    assert asyncio.run(verify()) == (True, True)
 
 
 def test_search_requires_api_key() -> None:

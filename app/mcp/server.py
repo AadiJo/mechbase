@@ -42,7 +42,6 @@ from app.rag.models import (
     SimilarPagesResponse,
     SourceIdFilter,
     SourceListResponse,
-    SourceSummary,
 )
 from app.rag.search import search as rag_search
 from app.rag.store import RagStore
@@ -68,7 +67,14 @@ class RetrievalBackend(Protocol):
 
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None: ...
 
-    def list_sources(self) -> SourceListResponse: ...
+    def list_sources(
+        self,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
+    ) -> SourceListResponse: ...
 
     def corpus_revision(self) -> str: ...
 
@@ -108,8 +114,20 @@ class RagRetrievalBackend:
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
         return self._store.similar_from_result_id(result_id, top_k)
 
-    def list_sources(self) -> SourceListResponse:
-        return self._store.list_sources()
+    def list_sources(
+        self,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
+    ) -> SourceListResponse:
+        return self._store.list_sources(
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+            source_query=source_query,
+        )
 
 
 def create_mcp_server(
@@ -401,7 +419,7 @@ def create_mcp_server(
         title="List indexed FRC binders",
         description=(
             "List indexed technical binders and their text and image coverage. Use exact team, "
-            "year, filename, or source-id filters to check whether Mechbase covers a request "
+            "year, or source-id filters to check whether Mechbase covers a request "
             "before substituting results from another team or season. source_query performs a "
             "case-insensitive filename and source-id substring match without an embedding call."
         ),
@@ -409,9 +427,6 @@ def create_mcp_server(
         structured_output=True,
     )
     def list_sources(
-        team: Annotated[str | None, Field(pattern=r"^\d{1,5}$")] = None,
-        year: SeasonYear | None = None,
-        source: Annotated[str | None, Field(min_length=1, max_length=255)] = None,
         team_numbers: Annotated[list[TeamNumber], Field(max_length=50)] | None = None,
         years: Annotated[list[SeasonYear], Field(max_length=35)] | None = None,
         source_ids: Annotated[list[SourceId], Field(max_length=50)] | None = None,
@@ -422,57 +437,32 @@ def create_mcp_server(
         normalized_years = list(dict.fromkeys(years or []))
         normalized_source_ids = list(dict.fromkeys(source_ids or []))
         normalized_source_query = source_query.strip() if source_query else None
-        response = source_cache.get_or_compute(
-            retrieval.corpus_revision(),
-            retrieval.list_sources,
+        corpus_revision = retrieval.corpus_revision()
+        cache_key = repr(
+            (
+                corpus_revision,
+                teams,
+                normalized_years,
+                normalized_source_ids,
+                normalized_source_query,
+            )
         )
-        sources = _filter_sources(
-            response.sources,
-            team=team,
-            year=year,
-            source=source,
-            team_numbers=teams,
-            years=normalized_years,
-            source_ids=normalized_source_ids,
-            source_query=normalized_source_query,
+        response = source_cache.get_or_compute(
+            cache_key,
+            lambda: retrieval.list_sources(
+                team_numbers=teams,
+                years=normalized_years,
+                source_ids=normalized_source_ids,
+                source_query=normalized_source_query,
+            ),
         )
         return source_output(
-            sources[:limit],
+            response.sources[:limit],
             public_base_url,
-            total_matching_sources=len(sources),
+            total_matching_sources=len(response.sources),
         )
 
     return server
-
-
-def _filter_sources(
-    sources: list[SourceSummary],
-    *,
-    team: str | None,
-    year: int | None,
-    source: str | None,
-    team_numbers: list[str],
-    years: list[int],
-    source_ids: list[str],
-    source_query: str | None,
-) -> list[SourceSummary]:
-    needle = source_query.casefold() if source_query else None
-    return [
-        item
-        for item in sources
-        if (team is None or item.team == team)
-        and (year is None or item.year == year)
-        and (source is None or item.source_pdf == source)
-        and (not team_numbers or item.team in team_numbers)
-        and (not years or item.year in years)
-        and (not source_ids or item.source_id in source_ids)
-        and (
-            needle is None
-            or needle in item.source_id.casefold()
-            or needle in item.source_pdf.casefold()
-            or needle in item.source_version_id.casefold()
-        )
-    ]
 
 
 def create_mcp_http_app(server: MCPServer, settings: Settings) -> ASGIApp:

@@ -17,7 +17,6 @@ from app.rag.models import (
 class EvidenceClassification(BaseModel):
     direct_source_text: bool
     visible_image: bool
-    model_inference: bool = False
     missing: list[str] = Field(default_factory=list)
 
 
