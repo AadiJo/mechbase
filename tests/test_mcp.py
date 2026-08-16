@@ -61,6 +61,7 @@ class FakeRetrievalBackend:
         self.list_source_calls: list[dict[str, object]] = []
         self.browse_context_calls: list[dict[str, object]] = []
         self.asset_generation: str | None = None
+        self.extra_figure_names: list[str] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -103,6 +104,7 @@ class FakeRetrievalBackend:
                 f"{asset_root}/page.png",
                 f"{asset_root}/image-000.png",
                 f"{asset_root}/image-001.png",
+                *(f"{asset_root}/{name}" for name in self.extra_figure_names),
             ],
         )
 
@@ -559,6 +561,10 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
     Image.new("RGB", (640, 480), "blue").save(figure_image)
     corrupt_figure = page_image.parent / "image-001.png"
     corrupt_figure.write_bytes(b"not an image")
+    for image_number in range(2, 6):
+        (page_image.parent / f"image-{image_number:03d}.png").write_bytes(b"not an image")
+    late_valid_figure = page_image.parent / "image-006.png"
+    Image.new("RGB", (720, 540), "purple").save(late_valid_figure)
     cross_page_image = tmp_path / "254-2020" / "page-013" / "page.png"
     cross_page_image.parent.mkdir(parents=True)
     Image.new("RGB", (1200, 800), "white").save(cross_page_image)
@@ -1002,6 +1008,32 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             {"selections": [{"id": "result_1", "asset_id": corrupt_asset_id}]},
                         )
                         assert corrupt_asset.is_error is True
+
+                        backend.extra_figure_names = [
+                            *(f"image-{image_number:03d}.png" for image_number in range(2, 7))
+                        ]
+                        inspected_after_corrupt_figures = await session.call_tool(
+                            "inspect_candidates", {"ids": ["result_1"]}
+                        )
+                        assert inspected_after_corrupt_figures.is_error is False
+                        valid_assets = inspected_after_corrupt_figures.structured_content[
+                            "candidates"
+                        ][0]["assets"]
+                        assert [asset["kind"] for asset in valid_assets] == [
+                            "page",
+                            "figure",
+                            "figure",
+                        ]
+                        late_figure_id = valid_assets[-1]["asset_id"]
+                        rendered_late_figure = await session.call_tool(
+                            "render_search_results",
+                            {"selections": [{"id": "result_1", "asset_id": late_figure_id}]},
+                        )
+                        assert rendered_late_figure.is_error is False
+                        assert rendered_late_figure.structured_content["results"][0][
+                            "image_url"
+                        ].endswith("/image-006.png")
+                        backend.extra_figure_names = []
 
                         backend.asset_generation = "generation-old"
                         inspected_old_generation = await session.call_tool(

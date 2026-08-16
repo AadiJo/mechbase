@@ -12,6 +12,8 @@ from app.rag.config import Settings
 from app.rag.image_cache import cached_resized_image
 from app.rag.models import ImageContextResponse
 
+MAX_FIGURE_CANDIDATES = 16
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewImage:
@@ -90,7 +92,7 @@ def candidate_asset_sources(
     context: ImageContextResponse,
     *,
     include_assets: bool,
-    max_figures: int = 4,
+    max_figures: int = MAX_FIGURE_CANDIDATES,
 ) -> list[CandidateAssetSource]:
     page_image_url = context.page_image_url
     assets = []
@@ -131,7 +133,7 @@ def candidate_asset_sources(
         return [*assets, *figures]
     if assets:
         return assets[:1]
-    return figures[:1]
+    return figures
 
 
 def _asset_id_from_url(kind: Literal["page", "figure"], image_url: str) -> str:

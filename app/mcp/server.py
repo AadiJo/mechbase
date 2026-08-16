@@ -73,6 +73,7 @@ SourceId = SourceIdFilter
 MechanismType = MechanismTypeFilter
 ResultId = Annotated[str, Field(min_length=1, max_length=256)]
 BROWSE_SECTION_SCAN_PAGES = 50
+MAX_INSPECTED_FIGURES = 4
 
 
 class RetrievalBackend(Protocol):
@@ -405,13 +406,20 @@ def create_mcp_server(
 
             loaded_assets = []
             previews = []
+            loaded_figures = 0
             for asset_source in candidate_asset_sources(
                 context,
                 include_assets=include_assets,
             ):
+                if asset_source.kind == "figure" and loaded_figures == (
+                    MAX_INSPECTED_FIGURES if include_assets else 1
+                ):
+                    break
                 preview = load_preview_url(asset_source.image_url, settings)
                 if preview is None:
                     continue
+                if asset_source.kind == "figure":
+                    loaded_figures += 1
                 loaded_assets.append(
                     visual_asset(
                         context,
