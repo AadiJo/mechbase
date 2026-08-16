@@ -8,7 +8,7 @@ from mcp.server.auth.provider import TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
+from mcp.types import Annotations, CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp
@@ -44,6 +44,7 @@ READ_ONLY = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+MODEL_ONLY = Annotations(audience=["assistant"], priority=1.0)
 
 
 class RetrievalBackend(Protocol):
@@ -101,13 +102,16 @@ def create_mcp_server(
         title="Mechbase FRC Mechanism Search",
         description="Search and retrieve mechanism details from FRC technical binders.",
         instructions=(
-            "Use search to find relevant FRC mechanism pages. Before displaying images, call "
+            "For every non-empty search or find_similar result, complete the visual selection "
+            "flow before answering, even when the user does not explicitly ask for images. Call "
             "inspect_candidates with promising result ids and judge the actual page images plus "
-            "page text against the user's request. Call render_search_results only with visually "
-            "relevant ids. If none are relevant, do not render them. Use fetch for complete page "
-            "text and citations. All tools are read-only."
+            "page text against the request. Never present inspection images directly or use them "
+            "as final answer images. If at least one image is relevant, call "
+            "render_search_results with only those ids. If none are relevant, do not call the "
+            "render tool and say that no useful image was found. Use fetch only when complete page "
+            "text is needed. All tools are read-only."
         ),
-        version="0.1.0",
+        version="0.2.0",
         auth=AuthSettings(
             issuer_url=settings.clerk_oauth_issuer_url,
             required_scopes=settings.mcp_required_scopes,
@@ -153,7 +157,10 @@ def create_mcp_server(
         title="Search FRC mechanisms",
         description=(
             "Search FRC technical binders for mechanism designs and return stable result ids "
-            "with citation URLs. Use fetch to retrieve the full page for a result."
+            "with citation URLs. Always follow a non-empty search with inspect_candidates on the "
+            "most promising ids before answering, even when the user only asks to find or search "
+            "Mechbase and does not mention images. After visual review, display relevant pages "
+            "only through render_search_results."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -168,9 +175,11 @@ def create_mcp_server(
         title="Inspect FRC mechanism candidate images",
         description=(
             "Inspect actual binder page images and extracted page text for result ids returned "
-            "by search or find_similar. Use this before render_search_results. Compare every "
-            "candidate against the user's visual intent, discard irrelevant pages, and render "
-            "nothing when none are useful. Inspect additional batches when needed."
+            "by search or find_similar. Compare every candidate against the user's request and "
+            "discard irrelevant pages. Always follow visual review with render_search_results "
+            "when at least one image is relevant. Never use inspection images as final answer "
+            "images, cite them as displayed images, or describe them as shown to the user. They "
+            "are model-only evaluation inputs. Render nothing when none are useful."
         ),
         annotations=READ_ONLY,
         meta={
@@ -187,9 +196,12 @@ def create_mcp_server(
             TextContent(
                 type="text",
                 text=(
-                    "Visually review each labeled candidate. Use the page image and extracted "
-                    "text together. Only pass relevant ids to render_search_results."
+                    "These candidate images are model-only evaluation inputs for visual review, not "
+                    "answer images. Never show or cite them directly. Use each labeled page image "
+                    "and its extracted text together. If any are relevant, you must call "
+                    "render_search_results with only those ids before answering."
                 ),
+                annotations=MODEL_ONLY,
             )
         ]
         for result_id in dict.fromkeys(ids):
@@ -215,6 +227,7 @@ def create_mcp_server(
                         f"Image available: {'yes' if candidate.has_image else 'no'}\n"
                         f"Extracted page text:\n{candidate.text or '[No page text available]'}"
                     ),
+                    annotations=MODEL_ONLY,
                 )
             )
             if preview is not None:
@@ -223,6 +236,7 @@ def create_mcp_server(
                         type="image",
                         data=base64.b64encode(preview.data).decode("ascii"),
                         mimeType=preview.mime_type,
+                        annotations=MODEL_ONLY,
                     )
                 )
 
@@ -239,7 +253,9 @@ def create_mcp_server(
         title="Fetch an FRC mechanism result",
         description=(
             "Retrieve the complete page text, source metadata, and citable image URLs for an id "
-            "returned by search or find_similar."
+            "returned by search or find_similar. Use this only when full page detail is needed. "
+            "Fetch does not replace inspect_candidates and must not be used to choose or display "
+            "answer images."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -252,7 +268,11 @@ def create_mcp_server(
 
     @server.tool(
         title="Find similar mechanism pages",
-        description="Find mechanism pages similar to a result returned by search.",
+        description=(
+            "Find mechanism pages similar to a result returned by search. Always inspect "
+            "promising returned ids with inspect_candidates before answering, then display only "
+            "visually relevant pages through render_search_results."
+        ),
         annotations=READ_ONLY,
         structured_output=True,
     )

@@ -266,6 +266,12 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                     async with ClientSession(*streams) as session:
                         initialized = await session.initialize()
                         assert initialized.server_info.name == "mechbase"
+                        assert "even when the user does not explicitly ask for images" in (
+                            initialized.instructions or ""
+                        )
+                        assert "Never present inspection images directly" in (
+                            initialized.instructions or ""
+                        )
 
                         listed = await session.list_tools()
                         tools = {tool.name: tool for tool in listed.tools}
@@ -278,9 +284,18 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "list_sources",
                         }
                         assert set(tools["search"].input_schema["properties"]) == {"query"}
+                        assert "Always follow a non-empty search with inspect_candidates" in (
+                            tools["search"].description or ""
+                        )
                         assert tools["search"].output_schema is not None
                         assert set(tools["search"].output_schema["properties"]) == {"results"}
                         assert tools["inspect_candidates"].output_schema is None
+                        assert "Always follow visual review with render_search_results" in (
+                            tools["inspect_candidates"].description or ""
+                        )
+                        assert "Never use inspection images as final answer images" in (
+                            tools["inspect_candidates"].description or ""
+                        )
                         assert (
                             tools["render_search_results"].meta["ui"]["resourceUri"]
                             == "ui://mechbase/selected-results.html"
@@ -320,6 +335,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         ]
                         assert len(image_blocks) == 1
                         assert image_blocks[0].mime_type == "image/jpeg"
+                        assert image_blocks[0].annotations is not None
+                        assert image_blocks[0].annotations.audience == ["assistant"]
                         with Image.open(BytesIO(base64.b64decode(image_blocks[0].data))) as image:
                             assert image.format == "JPEG"
                             assert max(image.size) == 1400
