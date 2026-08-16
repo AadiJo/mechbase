@@ -13,7 +13,7 @@ from mcp.server.auth.provider import AccessToken
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.server import create_mcp_http_app, create_mcp_server
-from app.rag.config import Settings
+from app.rag.config import Settings, get_settings
 from app.rag.models import (
     ImageContextResponse,
     SearchResponse,
@@ -179,11 +179,14 @@ def test_clerk_token_verifier_rejects_inactive_tokens() -> None:
 
 def test_mcp_discovery_is_public_and_api_keys_are_rejected() -> None:
     client = TestClient(app)
+    settings = get_settings()
 
     metadata = client.get("/.well-known/oauth-protected-resource/mcp")
     assert metadata.status_code == 200
-    assert metadata.json()["resource"] == "https://api-frcrag-v2.johari-dev.com/mcp"
-    assert metadata.json()["authorization_servers"] == ["https://clerk.mechbase.johari-dev.com"]
+    assert metadata.json()["resource"] == settings.mcp_endpoint_url
+    assert metadata.json()["authorization_servers"] == [
+        str(settings.clerk_oauth_issuer_url).rstrip("/")
+    ]
 
     response = client.post(
         "/mcp",
