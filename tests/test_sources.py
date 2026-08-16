@@ -91,18 +91,20 @@ def test_ingestion_fingerprint_tracks_provenance_and_embedding_config(tmp_path: 
 def test_remove_superseded_artifacts_only_removes_matching_source_generations(
     tmp_path: Path,
 ) -> None:
-    current = "254-2023@version#current"
+    current_version = "version-current"
+    current = f"{current_version}~current"
+    previous_same_content = f"{current_version}~previous"
     root = source_artifact_root(tmp_path, "254-2023")
     root.mkdir(parents=True)
-    for name in ["254-2023", "254-2023@old#old", current, "254-20230@other#other"]:
+    for name in ["version-old~old", previous_same_content, current, "other-version~other"]:
         (root / name).mkdir()
 
-    remove_superseded_artifacts(tmp_path, "254-2023", current)
+    remove_superseded_artifacts(tmp_path, "254-2023", current, current_version)
 
-    assert not (root / "254-2023").exists()
-    assert not (root / "254-2023@old#old").exists()
+    assert not (root / "version-old~old").exists()
+    assert (root / previous_same_content).is_dir()
     assert (root / current).is_dir()
-    assert not (root / "254-20230@other#other").exists()
+    assert not (root / "other-version~other").exists()
 
 
 def test_remove_artifact_generation_removes_only_the_exact_namespace(tmp_path: Path) -> None:
@@ -128,7 +130,7 @@ def test_artifact_cleanup_cannot_cross_source_id_prefixes(tmp_path: Path) -> Non
     (first_root / "old").mkdir()
     (prefixed_root / "other-source").mkdir()
 
-    remove_superseded_artifacts(tmp_path, "254", "current")
+    remove_superseded_artifacts(tmp_path, "254", "current", "current")
 
     assert (first_root / "current").is_dir()
     assert not (first_root / "old").exists()

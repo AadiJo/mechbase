@@ -1087,25 +1087,25 @@ def _active_filter(
 def _active_generation_condition(active_generations: dict[str, str]) -> models.Filter:
     source_ids = list(active_generations)
     branches: list[models.Condition] = []
-    for source_id, ingestion_id in active_generations.items():
-        generation_condition: models.Condition
-        if ingestion_id == LEGACY_GENERATION:
-            generation_condition = models.IsEmptyCondition(
-                is_empty=models.PayloadField(key="ingestion_id")
-            )
-        else:
-            generation_condition = models.FieldCondition(
-                key="ingestion_id",
-                match=models.MatchValue(value=ingestion_id),
-            )
+    ingestion_ids = [
+        ingestion_id
+        for ingestion_id in active_generations.values()
+        if ingestion_id != LEGACY_GENERATION
+    ]
+    if ingestion_ids:
+        branches.append(_match_values("ingestion_id", ingestion_ids))
+
+    legacy_source_ids = [
+        source_id
+        for source_id, ingestion_id in active_generations.items()
+        if ingestion_id == LEGACY_GENERATION
+    ]
+    if legacy_source_ids:
         branches.append(
             models.Filter(
                 must=[
-                    models.FieldCondition(
-                        key="source_id",
-                        match=models.MatchValue(value=source_id),
-                    ),
-                    generation_condition,
+                    _match_values("source_id", legacy_source_ids),
+                    models.IsEmptyCondition(is_empty=models.PayloadField(key="ingestion_id")),
                 ]
             )
         )
@@ -1205,13 +1205,11 @@ def _latest_source_summaries(summaries: Iterable[SourceSummary]) -> list[SourceS
 def _with_source_revision(
     path: str,
     source_version_id: str | None,
-    ingestion_id: str | None,
+    _ingestion_id: str | None,
 ) -> str:
     parameters = []
     if source_version_id:
         parameters.append(f"source_version_id={quote(source_version_id, safe='')}")
-    if ingestion_id:
-        parameters.append(f"ingestion_id={quote(ingestion_id, safe='')}")
     if not parameters:
         return path
     return f"{path}?{'&'.join(parameters)}"

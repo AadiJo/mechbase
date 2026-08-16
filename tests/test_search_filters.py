@@ -63,6 +63,17 @@ def test_build_filter_combines_legacy_and_multi_value_filters() -> None:
     assert source_condition.match.value == "254-2023.pdf"
 
 
+def test_active_generation_filter_has_constant_condition_count() -> None:
+    active = {f"source-{index}": f"ingestion-{index}" for index in range(1000)}
+
+    qfilter = _build_filter(SearchRequest(query="intake"), active)
+
+    generation_filter = qfilter.must[-1]
+    assert isinstance(generation_filter, models.Filter)
+    assert len(generation_filter.should) == 2
+    assert generation_filter.should[0].match.any == list(active.values())
+
+
 class ExistingCollectionClient:
     def __init__(self) -> None:
         self.created_indexes: list[tuple[str, object]] = []
@@ -317,6 +328,20 @@ def test_search_filter_excludes_superseded_published_generations(tmp_path: Path)
 
     assert [(result.ingestion_id, result.page) for result in results] == [("current", 2)]
     client.close()
+
+
+def test_same_content_reingestion_keeps_stable_page_citations(tmp_path: Path) -> None:
+    store = RagStore(Settings(ARTIFACT_DIR=tmp_path), client=SimpleNamespace())
+    old_payload = _versioned_doc("same", 1, ingestion_id="old").model_dump()
+    new_payload = _versioned_doc("same", 1, ingestion_id="new").model_dump()
+
+    old_result = store._search_result_from_payload(old_payload, 0.9)
+    new_result = store._search_result_from_payload(new_payload, 0.9)
+
+    assert old_result.page_context_url == new_result.page_context_url
+    assert old_result.page_text_url == new_result.page_text_url
+    assert "source_version_id=254-2023%40same" in old_result.page_context_url
+    assert "ingestion_id" not in old_result.page_context_url
 
 
 def test_read_retries_when_active_generation_changes_mid_query(tmp_path: Path) -> None:

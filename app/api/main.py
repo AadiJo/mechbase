@@ -277,7 +277,6 @@ def _source_page_urls(source: SourceSummary, page: int) -> tuple[str, str]:
             key: value
             for key, value in {
                 "source_version_id": source.source_version_id,
-                "ingestion_id": source.ingestion_id,
             }.items()
             if value
         }

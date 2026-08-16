@@ -91,6 +91,7 @@ def remove_superseded_artifacts(
     artifact_dir: Path,
     source_id: str,
     current_namespace: str,
+    current_source_version: str,
 ) -> None:
     artifact_root = artifact_dir.resolve()
     root_path = source_artifact_root(artifact_root, source_id)
@@ -104,7 +105,15 @@ def remove_superseded_artifacts(
     if not root.exists():
         return
     for candidate in root.iterdir():
-        if candidate.is_symlink() or not candidate.is_dir() or candidate.name == current_namespace:
+        is_current_content = candidate.name == current_source_version or candidate.name.startswith(
+            f"{current_source_version}~"
+        )
+        if (
+            candidate.is_symlink()
+            or not candidate.is_dir()
+            or candidate.name == current_namespace
+            or is_current_content
+        ):
             continue
         shutil.rmtree(candidate)
 
@@ -230,6 +239,7 @@ def ingest_sources(
                 settings.artifact_dir,
                 source.source_id,
                 artifact_namespace,
+                source.source_version,
             )
             manifest.write(
                 json.dumps(
