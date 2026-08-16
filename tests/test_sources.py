@@ -221,6 +221,118 @@ def test_committed_generation_stays_authoritative_when_retirement_fails(
     assert completed_sources(tmp_path / "ingestion-manifest.jsonl") == {}
 
 
+def test_normal_retry_finalizes_a_failed_same_fingerprint_force_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "254-2025.pdf"
+    source_path.write_bytes(b"binder")
+    source = SourceDoc(
+        path=source_path,
+        team="254",
+        year=2025,
+        source_id="254-2025",
+        source_version="content",
+        source_version_id="254-2025@content",
+    )
+    settings = Settings(ARTIFACT_DIR=tmp_path, EMBEDDING_DIM=1)
+    fingerprint = ingestion_fingerprint(source, settings)
+    manifest = tmp_path / "ingestion-manifest.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "source": source_path.name,
+                "ingestion_id": "old",
+                "ingestion_fingerprint": fingerprint,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    document = RagDocument(
+        id="result",
+        storage_id="result@new",
+        source_id=source.source_id,
+        source_version=source.source_version,
+        source_version_id=source.source_version_id,
+        source_pdf=source_path.name,
+        team="254",
+        year=2025,
+        page=1,
+        modality="text",
+        text="intake",
+        is_staged=True,
+    )
+
+    class RetryStore:
+        def __init__(self) -> None:
+            self.active = {source.source_id: "old"}
+            self.upserts = 0
+            self.retirements = 0
+
+        def initialize_active_generation(self, _source_id: str) -> None:
+            pass
+
+        def active_generations(self) -> dict[str, str]:
+            return self.active.copy()
+
+        def upsert(self, docs, text_vectors, image_vectors) -> None:
+            assert docs and text_vectors and image_vectors
+            self.upserts += 1
+
+        def publish_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            pass
+
+        def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
+            self.active[source_id] = ingestion_id
+
+        def delete_source_generation(self, _source_id: str, _ingestion_id: str) -> None:
+            raise AssertionError("an active generation must not be deleted")
+
+        def retire_superseded_source_generations(self, _source_id: str, _ingestion_id: str) -> None:
+            self.retirements += 1
+            if self.retirements == 1:
+                raise RuntimeError("retirement failed")
+
+        def delete_superseded_source_generations(self, _source_id: str, _ingestion_id: str) -> None:
+            pass
+
+    class FakeEmbedder:
+        def embed_texts(self, texts, input_type):
+            return [[1.0] for _text in texts]
+
+    store = RetryStore()
+    monkeypatch.setattr("app.rag.ingest.extract_documents", lambda *_args, **_kwargs: [document])
+
+    with pytest.raises(RuntimeError, match="retirement failed"):
+        ingest_sources(
+            [source],
+            batch_size=1,
+            force=True,
+            settings=settings,
+            store=store,
+            embedder=FakeEmbedder(),
+        )
+
+    first_active = store.active[source.source_id]
+    ingest_sources(
+        [source],
+        batch_size=1,
+        force=False,
+        settings=settings,
+        store=store,
+        embedder=FakeEmbedder(),
+    )
+
+    assert store.upserts == 2
+    assert store.active[source.source_id] != first_active
+    assert completed_sources(manifest) == {source_path.name: fingerprint}
+    assert (
+        json.loads(manifest.read_text(encoding="utf-8").splitlines()[-1])["ingestion_id"]
+        == (store.active[source.source_id])
+    )
+
+
 def test_generation_survives_an_error_after_the_active_pointer_rename(
     tmp_path: Path,
     monkeypatch,

@@ -42,19 +42,31 @@ def multimodal_vectors(batch, embedder: VoyageEmbedder, settings):
     return [vector if vector is not None else zero for vector in vectors]
 
 
-def completed_sources(manifest_path: Path) -> dict[str, str | None]:
+def _completed_source_records(
+    manifest_path: Path,
+) -> dict[str, tuple[str | None, str | None]]:
     if not manifest_path.exists():
         return {}
-    done: dict[str, str | None] = {}
+    done: dict[str, tuple[str | None, str | None]] = {}
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
-            done[record["source"]] = record.get("ingestion_fingerprint")
+            done[record["source"]] = (
+                record.get("ingestion_fingerprint"),
+                record.get("ingestion_id"),
+            )
         except (json.JSONDecodeError, KeyError):
             continue
     return done
+
+
+def completed_sources(manifest_path: Path) -> dict[str, str | None]:
+    return {
+        source: fingerprint
+        for source, (fingerprint, _ingestion_id) in _completed_source_records(manifest_path).items()
+    }
 
 
 def ingestion_fingerprint(source: SourceDoc, settings: Settings) -> str:
@@ -141,15 +153,19 @@ def ingest_sources(
     embedder: VoyageEmbedder,
 ) -> None:
     manifest_path = settings.artifact_dir / "ingestion-manifest.jsonl"
-    completed = {} if force else completed_sources(manifest_path)
+    completed = {} if force else _completed_source_records(manifest_path)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         for source in sources:
             fingerprint = ingestion_fingerprint(source, settings)
-            if completed.get(source.path.name) == fingerprint:
-                print(f"Skipping {source.path.name}; already in manifest.", flush=True)
-                continue
-            print(f"Ingesting {source.path.name}...", flush=True)
             store.initialize_active_generation(source.source_id)
+            completed_record = completed.get(source.path.name)
+            if completed_record and completed_record[0] == fingerprint:
+                recorded_ingestion_id = completed_record[1]
+                active_ingestion_id = store.active_generations().get(source.source_id)
+                if recorded_ingestion_id is None or recorded_ingestion_id == active_ingestion_id:
+                    print(f"Skipping {source.path.name}; already in manifest.", flush=True)
+                    continue
+            print(f"Ingesting {source.path.name}...", flush=True)
             ingestion_id = uuid4().hex
             artifact_namespace = generation_namespace(source.source_version, ingestion_id)
             committed = False
