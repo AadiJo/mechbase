@@ -187,6 +187,7 @@ class VisualAsset(BaseModel):
 class InspectOutput(BaseModel):
     candidates: list[VisualCandidate]
     missing_ids: list[str] = Field(default_factory=list)
+    truncated_ids: list[str] = Field(default_factory=list)
 
 
 class RenderSelection(BaseModel):

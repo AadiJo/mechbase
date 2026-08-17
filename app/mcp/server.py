@@ -376,7 +376,8 @@ def create_mcp_server(
             "against the user's request and discard irrelevant images. Always follow visual review with "
             "render_search_results when at least one image is relevant. Never use inspection "
             "images as final answer images, cite them, or describe them as shown to the user. They "
-            "are model-only inputs. Render nothing when none are useful."
+            "are model-only inputs. When truncated_ids is non-empty, inspect those ids again in "
+            "smaller batches before deciding relevance. Render nothing when none are useful."
         ),
         annotations=READ_ONLY,
         meta={
@@ -472,7 +473,12 @@ def create_mcp_server(
                 select_asset(result_id, page_asset)
         for result_id, valid_assets in valid_assets_by_id.items():
             if not selected_by_id[result_id] and valid_assets:
-                select_asset(result_id, valid_assets[0])
+                fallback_figure = next(
+                    (asset for asset in valid_assets if asset[0].kind == "figure"),
+                    None,
+                )
+                if fallback_figure is not None:
+                    select_asset(result_id, fallback_figure)
 
         # Add figures round-robin so one candidate cannot consume the call-wide budget.
         for figure_index in range(MAX_INSPECTED_FIGURES):
@@ -480,6 +486,24 @@ def create_mcp_server(
                 figures = [asset for asset in valid_assets if asset[0].kind == "figure"]
                 if figure_index < len(figures):
                     select_asset(result_id, figures[figure_index])
+
+        truncated_ids = [
+            result_id
+            for result_id, valid_assets in valid_assets_by_id.items()
+            if len(selected_by_id[result_id]) < len(valid_assets)
+        ]
+        if truncated_ids:
+            content.append(
+                TextContent(
+                    type="text",
+                    text=(
+                        "The call-wide image budget omitted one or more previews for candidate "
+                        f"ids: {', '.join(truncated_ids)}. Re-run inspect_candidates with these "
+                        "ids in smaller batches before deciding whether their images are relevant."
+                    ),
+                    annotations=MODEL_ONLY,
+                )
+            )
 
         for result_id, context in contexts_by_id.items():
             selected_assets = selected_by_id[result_id]
@@ -494,13 +518,19 @@ def create_mcp_server(
                 assets=loaded_assets,
             )
             candidates.append(candidate)
+            if candidate.has_image:
+                image_availability = "yes"
+            elif result_id in truncated_ids:
+                image_availability = "deferred by call budget"
+            else:
+                image_availability = "no"
             content.append(
                 TextContent(
                     type="text",
                     text=(
                         f"Candidate id: {candidate.id}\n"
                         f"Title: {candidate.title}\n"
-                        f"Image available: {'yes' if candidate.has_image else 'no'}\n"
+                        f"Image available: {image_availability}\n"
                         f"Extracted page text:\n{candidate.text or '[No page text available]'}"
                     ),
                     annotations=MODEL_ONLY,
@@ -532,7 +562,11 @@ def create_mcp_server(
         if not candidates:
             raise ValueError("None of the supplied result ids could be found.")
 
-        output = InspectOutput(candidates=candidates, missing_ids=missing_ids)
+        output = InspectOutput(
+            candidates=candidates,
+            missing_ids=missing_ids,
+            truncated_ids=truncated_ids,
+        )
         return CallToolResult(
             content=content,
             structuredContent=output.model_dump(mode="json"),

@@ -877,6 +877,19 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             for candidate in budgeted_inspection.structured_content["candidates"]
                         ) == len(budgeted_images)
                         assert len(budgeted_images) < 18
+                        truncated_ids = set(budgeted_inspection.structured_content["truncated_ids"])
+                        assert truncated_ids
+                        candidates_without_images = {
+                            candidate["id"]
+                            for candidate in budgeted_inspection.structured_content["candidates"]
+                            if not candidate["assets"]
+                        }
+                        assert candidates_without_images <= truncated_ids
+                        assert any(
+                            "Re-run inspect_candidates" in block.text
+                            for block in budgeted_inspection.content
+                            if block.type == "text"
+                        )
 
                         fetched = await session.call_tool("fetch", {"id": "result_1"})
                         assert fetched.is_error is False
