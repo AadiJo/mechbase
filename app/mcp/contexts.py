@@ -11,6 +11,7 @@ GameTopic = Literal[
     "scoring",
     "endgame",
     "field_elements",
+    "game_piece_control",
     "robot_constraints",
     "terminology",
 ]
@@ -21,10 +22,11 @@ ALL_GAME_TOPICS: tuple[GameTopic, ...] = (
     "scoring",
     "endgame",
     "field_elements",
+    "game_piece_control",
     "robot_constraints",
     "terminology",
 )
-GAME_CONTEXT_RECORD_VERSION = "2026-08-16.2"
+GAME_CONTEXT_RECORD_VERSION = "2026-08-16.3"
 
 
 class GameCitation(BaseModel):
@@ -211,7 +213,7 @@ _GAME_CONTEXTS = {
                 "15-31",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G22 limited a robot to controlling one POWER CUBE at a time.",
                 ["one cube", "cube control limit", "G22"],
                 "Section 7, Game Rules, G22",
@@ -242,7 +244,7 @@ _GAME_CONTEXTS = {
                 "scoring",
                 "HATCH PANELS sealed bays on ROCKETS and the CARGO SHIP so CARGO could be retained and scored in those bays.",
                 ["rocket", "cargo ship", "bay", "port"],
-                "Sections 3 and 5, Game and MATCH Play",
+                "Sections 2 and 5, Game Overview and MATCH Play",
                 "11, 40-43",
             ),
             (
@@ -260,17 +262,17 @@ _GAME_CONTEXTS = {
                 "14-34",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G4 limited a robot to controlling one GAME PIECE at a time, and G6 prohibited forcefully throwing HATCH PANELS.",
                 ["one game piece", "G4", "G6", "no hatch throwing"],
-                "Section 7, Game Rules, G4-G6",
+                "Section 8, Game Rules, G4-G6",
                 "53-54",
             ),
             (
                 "terminology",
                 "A cargo mechanism handles balls, a hatch mechanism handles panels, and a HAB mechanism raises the robot onto a higher platform at match end.",
                 ["cargo intake", "hatch mechanism", "HAB lift"],
-                "Sections 3-5",
+                "Sections 2-5",
                 "11-43",
             ),
         ],
@@ -309,7 +311,7 @@ _GAME_CONTEXTS = {
                 "14-35",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G6 limited a robot to controlling five POWER CELLS at a time.",
                 ["five balls", "power cell limit", "G6"],
                 "Section 7.2.2, POWER CELL Interaction, G6",
@@ -358,7 +360,7 @@ _GAME_CONTEXTS = {
                 "19-39",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G403 limited a robot to controlling two CARGO at a time.",
                 ["two cargo", "two balls", "G403"],
                 "Section 7, Game Rules, G403",
@@ -407,7 +409,7 @@ _GAME_CONTEXTS = {
                 "18-37",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G403 limited robots completely outside their LOADING ZONE or COMMUNITY to controlling one GAME PIECE at a time.",
                 ["one game piece", "control limit", "G403"],
                 "Section 7.4, GAME PIECES, G403",
@@ -456,7 +458,7 @@ _GAME_CONTEXTS = {
                 "21-40",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rules G403 and G409 generally limited a robot to controlling one NOTE at a time.",
                 ["one note", "G403", "G409"],
                 "Section 7.4, Game Rules, G403 and G409",
@@ -505,7 +507,7 @@ _GAME_CONTEXTS = {
                 "18-35",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Rule G409 allowed control of at most one CORAL and one ALGAE simultaneously.",
                 ["one of each", "coral limit", "algae limit", "G409"],
                 "Section 7.4, Game Rules, G409",
@@ -554,7 +556,7 @@ _GAME_CONTEXTS = {
                 "17-33",
             ),
             (
-                "robot_constraints",
+                "game_piece_control",
                 "Robots may control any amount of FUEL at a time.",
                 ["unlimited fuel", "fuel control limit"],
                 "Section 4, Game Overview",

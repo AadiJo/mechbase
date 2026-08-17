@@ -4,6 +4,8 @@ import pytest
 
 from app.mcp.contexts import ALL_GAME_TOPICS, game_context, team_research_targets
 
+FACT_TOPICS = [topic for topic in ALL_GAME_TOPICS if topic != "robot_constraints"]
+
 EXPECTED_CITATION_PAGES = {
     2018: ["33", "13-14", "13-14", "15-31", "57-58", "13-31"],
     2019: ["33-34", "11, 40-43", "42-43", "14-34", "53-54", "11-43"],
@@ -26,11 +28,11 @@ EXPECTED_CITATION_SECTIONS = {
     ],
     2019: [
         "Section 4, ARENA, GAME PIECES",
-        "Sections 3 and 5, Game and MATCH Play",
+        "Sections 2 and 5, Game Overview and MATCH Play",
         "Section 5, MATCH Play, Scoring",
         "Section 4, ARENA",
-        "Section 7, Game Rules, G4-G6",
-        "Sections 3-5",
+        "Section 8, Game Rules, G4-G6",
+        "Sections 2-5",
     ],
     2020: [
         "Section 3.6, POWER CELL",
@@ -92,7 +94,9 @@ def test_every_reviewed_game_fact_has_validated_official_provenance(
 
     assert output.coverage.supported is True
     assert output.requested_topics == list(ALL_GAME_TOPICS)
-    assert [fact.topic for fact in output.facts] == list(ALL_GAME_TOPICS)
+    assert [fact.topic for fact in output.facts] == FACT_TOPICS
+    assert output.coverage.available_topics == FACT_TOPICS
+    assert output.coverage.missing_topics == ["robot_constraints"]
     assert [fact.citation.pages for fact in output.facts] == expected_pages
     assert [fact.citation.section for fact in output.facts] == EXPECTED_CITATION_SECTIONS[year]
     assert all(
@@ -117,6 +121,16 @@ def test_unsupported_game_defaults_to_all_topics_as_missing() -> None:
     assert output.requested_topics == list(ALL_GAME_TOPICS)
     assert output.coverage.missing_topics == list(ALL_GAME_TOPICS)
     assert output.facts == []
+
+
+def test_possession_limits_are_not_reported_as_robot_construction_constraints() -> None:
+    constraints = game_context(2024, ["robot_constraints"])
+    game_piece_control = game_context(2024, ["game_piece_control"])
+
+    assert constraints.facts == []
+    assert constraints.coverage.missing_topics == ["robot_constraints"]
+    assert [fact.topic for fact in game_piece_control.facts] == ["game_piece_control"]
+    assert "one NOTE" in game_piece_control.facts[0].summary
 
 
 def test_first_events_targets_start_at_its_archive_boundary() -> None:

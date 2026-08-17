@@ -58,6 +58,7 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
+        self.source_catalog_search_calls: list[dict[str, object]] = []
         self.fetch_calls: list[str] = []
         self.fetch_context_calls: list[dict[str, object]] = []
         self.similar_calls: list[dict[str, object]] = []
@@ -75,6 +76,34 @@ class FakeRetrievalBackend:
         self.search_calls.append(request)
         return SearchResponse(
             query=request.query,
+            results=[_search_result("result_1", 12)],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
+        )
+
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse:
+        self.source_catalog_search_calls.append(
+            {
+                "query": query,
+                "top_k": top_k,
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+            }
+        )
+        return SearchResponse(
+            query=query,
             results=[_search_result("result_1", 12)],
             coverage=SearchCoverage(
                 candidate_pages=1,
@@ -1307,10 +1336,13 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert team_context.structured_content["mechanism_search"][
                             "applied_filters"
                         ]["years"] == [2020]
-                        assert backend.search_calls[-1].team_numbers == ["254"]
-                        assert backend.search_calls[-1].years == [2020]
-                        assert backend.search_calls[-1].source_ids == ["254-2020"]
-                        assert backend.search_calls[-1].top_k == 4
+                        assert backend.source_catalog_search_calls[-1] == {
+                            "query": "elevator rigging",
+                            "top_k": 4,
+                            "team_numbers": ["254"],
+                            "years": [2020],
+                            "source_ids": ["254-2020"],
+                        }
                         assert {
                             target["provider"]
                             for target in team_context.structured_content["live_research_targets"]
@@ -1320,7 +1352,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             for target in team_context.structured_content["live_research_targets"]
                         )
 
-                        searches_before_missing_team = len(backend.search_calls)
+                        searches_before_missing_team = len(backend.source_catalog_search_calls)
                         missing_team_context = await session.call_tool(
                             "get_team_context",
                             {
@@ -1350,9 +1382,11 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                 "abstention_reason"
                             ]
                         )
-                        assert len(backend.search_calls) == searches_before_missing_team
+                        assert (
+                            len(backend.source_catalog_search_calls) == searches_before_missing_team
+                        )
 
-                        searches_before_refresh = len(backend.search_calls)
+                        searches_before_refresh = len(backend.source_catalog_search_calls)
                         backend.revision_sequence = [
                             "test-corpus-a",
                             "test-corpus-b",
@@ -1368,7 +1402,9 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             },
                         )
                         assert refreshed_team_context.is_error is False
-                        assert len(backend.search_calls) == searches_before_refresh + 2
+                        assert (
+                            len(backend.source_catalog_search_calls) == searches_before_refresh + 2
+                        )
                         assert backend.revision_sequence == []
 
                         backend.extra_sources = [
@@ -1382,7 +1418,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             for index in range(21)
                         ]
                         backend.revision_sequence = ["many-sources", "many-sources"]
-                        searches_before_large_catalog = len(backend.search_calls)
+                        searches_before_large_catalog = len(backend.source_catalog_search_calls)
                         large_catalog_context = await session.call_tool(
                             "get_team_context",
                             {
@@ -1391,14 +1427,11 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             },
                         )
                         assert large_catalog_context.is_error is False
-                        large_catalog_calls = backend.search_calls[searches_before_large_catalog:]
-                        assert len(large_catalog_calls) == 2
-                        assert all(len(request.source_ids) <= 20 for request in large_catalog_calls)
-                        assert {
-                            source_id
-                            for request in large_catalog_calls
-                            for source_id in request.source_ids
-                        } == {
+                        large_catalog_calls = backend.source_catalog_search_calls[
+                            searches_before_large_catalog:
+                        ]
+                        assert len(large_catalog_calls) == 1
+                        assert set(large_catalog_calls[0]["source_ids"]) == {
                             "254-2020",
                             *(f"254-archive-{index}" for index in range(21)),
                         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from functools import partial
 from typing import Annotated, Protocol
 from urllib.parse import urlparse
 
@@ -60,7 +61,6 @@ from app.rag.models import (
     ImageContextResponse,
     MechanismTypeFilter,
     PageContextResponse,
-    SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchSort,
@@ -71,6 +71,7 @@ from app.rag.models import (
     SourceSummary,
 )
 from app.rag.search import search as rag_search
+from app.rag.search import search_source_catalog as rag_search_source_catalog
 from app.rag.store import RagStore
 
 READ_ONLY = ToolAnnotations(
@@ -90,11 +91,20 @@ BROWSE_SECTION_SCAN_PAGES = 50
 MAX_INSPECTED_FIGURES = 4
 MAX_INSPECTION_IMAGES = 12
 MAX_INSPECTION_ENCODED_BYTES = 8 * 1024 * 1024
-SEARCH_SOURCE_FILTER_LIMIT = 20
 
 
 class RetrievalBackend(Protocol):
     def search(self, request: SearchRequest) -> SearchResponse: ...
+
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse: ...
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
 
@@ -163,6 +173,25 @@ class RagRetrievalBackend:
             source_ids=request.source_ids,
             mechanism_types=request.mechanism_types,
             sort=request.sort,
+            store=self._store,
+        )
+
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse:
+        return rag_search_source_catalog(
+            query,
+            top_k,
+            self._settings,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
             store=self._store,
         )
 
@@ -946,7 +975,7 @@ def create_mcp_server(
     )
     def get_game_context(
         year: SeasonYear,
-        topics: Annotated[list[GameTopic] | None, Field(max_length=6)] = None,
+        topics: Annotated[list[GameTopic] | None, Field(max_length=7)] = None,
     ) -> GameContextOutput:
         return game_context(year, list(dict.fromkeys(topics or [])))
 
@@ -1003,26 +1032,25 @@ def create_mcp_server(
                 source_ids=list(dict.fromkeys(source.source_id for source in matching_sources)),
             )
             if query is not None and matching_sources:
-                responses: list[SearchResponse] = []
-                for offset in range(0, len(filters.source_ids), SEARCH_SOURCE_FILTER_LIMIT):
-                    request = SearchRequest(
-                        query=query,
-                        top_k=top_k,
-                        team_numbers=filters.team_numbers,
-                        years=filters.years,
-                        source_ids=filters.source_ids[offset : offset + SEARCH_SOURCE_FILTER_LIMIT],
-                    )
-                    cache_key = f"{corpus_revision}:{request.model_dump_json()}"
-                    responses.append(
-                        search_cache.get_or_compute(
-                            cache_key,
-                            lambda current_request=request: retrieval.search(current_request),
-                        )
-                    )
-                response = _merge_search_responses(
+                search_parameters = (
                     query,
-                    responses,
-                    top_k=top_k,
+                    top_k,
+                    filters.team_numbers,
+                    filters.years,
+                    filters.source_ids,
+                )
+                cache_key = repr((corpus_revision, "source-catalog", search_parameters))
+                run_search = partial(
+                    retrieval.search_source_catalog,
+                    query,
+                    top_k,
+                    team_numbers=filters.team_numbers,
+                    years=filters.years,
+                    source_ids=filters.source_ids,
+                )
+                response = search_cache.get_or_compute(
+                    cache_key,
+                    run_search,
                 )
                 mechanism_search = search_output(
                     response,
@@ -1058,45 +1086,6 @@ def create_mcp_server(
         )
 
     return server
-
-
-def _merge_search_responses(
-    query: str,
-    responses: list[SearchResponse],
-    *,
-    top_k: int,
-) -> SearchResponse:
-    if len(responses) == 1:
-        return responses[0]
-
-    results_by_id = {result.id: result for response in responses for result in response.results}
-    results = sorted(
-        results_by_id.values(),
-        key=lambda result: result.score,
-        reverse=True,
-    )[:top_k]
-    coverage = SearchCoverage(
-        candidate_pages=sum(response.coverage.candidate_pages for response in responses),
-        candidate_sources=sum(response.coverage.candidate_sources for response in responses),
-        weak_pages_dropped=sum(response.coverage.weak_pages_dropped for response in responses),
-        returned_pages=len(results),
-        candidate_window_truncated=any(
-            response.coverage.candidate_window_truncated for response in responses
-        ),
-    )
-    abstention_reason = None
-    if not results:
-        abstention_reason = (
-            "No indexed pages met the calibrated relevance threshold for this query and filter set."
-            if coverage.candidate_pages
-            else "No indexed pages matched this query and filter set."
-        )
-    return SearchResponse(
-        query=query,
-        results=results,
-        coverage=coverage,
-        abstention_reason=abstention_reason,
-    )
 
 
 def _filter_source_query(
