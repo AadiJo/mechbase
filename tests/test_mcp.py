@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 from io import BytesIO
 from pathlib import Path
 
@@ -577,14 +578,15 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
     cross_page_image.parent.mkdir(parents=True)
     Image.new("RGB", (1200, 800), "white").save(cross_page_image)
     Image.new("RGB", (500, 400), "green").save(cross_page_image.parent / "image-000.png")
-    noise_page = Image.effect_noise((1800, 1200), 100).convert("RGB")
-    noise_figure = Image.effect_noise((1200, 900), 100).convert("RGB")
+    random_pixels = random.Random(0).randbytes(1400 * 1400 * 3)
+    high_entropy_image = Image.frombytes("RGB", (1400, 1400), random_pixels)
     for page in range(20, 26):
         budget_root = tmp_path / "254-2020" / f"page-{page:03d}"
         budget_root.mkdir(parents=True)
-        noise_page.save(budget_root / "page.png")
-        noise_figure.save(budget_root / "image-000.png")
-        noise_figure.save(budget_root / "image-001.png")
+        budget_image = high_entropy_image if page == 20 else Image.new("RGB", (1400, 1400), "blue")
+        budget_image.save(budget_root / "page.png")
+        for image_number in range(4):
+            budget_image.save(budget_root / f"image-{image_number:03d}.png")
     for generation in ("generation-old", "generation-new"):
         generation_root = tmp_path / "254-2020" / generation / "page-012"
         generation_root.mkdir(parents=True)
@@ -859,6 +861,28 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             )
                             == 1
                         )
+
+                        backend.extra_figure_names = ["image-002.png", "image-003.png"]
+                        oversized_single_inspection = await session.call_tool(
+                            "inspect_candidates",
+                            {"ids": ["result_budget_0"]},
+                        )
+                        assert oversized_single_inspection.is_error is False
+                        oversized_assets = oversized_single_inspection.structured_content[
+                            "candidates"
+                        ][0]["assets"]
+                        assert len(oversized_assets) == 5
+                        assert oversized_single_inspection.structured_content["truncated_ids"] == []
+                        oversized_images = [
+                            block
+                            for block in oversized_single_inspection.content
+                            if block.type == "image"
+                        ]
+                        assert sum(len(block.data) for block in oversized_images) <= (
+                            MAX_INSPECTION_ENCODED_BYTES
+                        )
+                        assert all(asset["preview_width"] < 1400 for asset in oversized_assets)
+                        backend.extra_figure_names = []
 
                         budgeted_inspection = await session.call_tool(
                             "inspect_candidates",

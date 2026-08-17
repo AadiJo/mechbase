@@ -436,6 +436,32 @@ def create_mcp_server(
                 valid_assets.append((asset_source, preview))
             valid_assets_by_id[result_id] = valid_assets
 
+        if len(valid_assets_by_id) == 1:
+            result_id, valid_assets = next(iter(valid_assets_by_id.items()))
+            encoded_bytes = sum(
+                4 * ((len(preview.data) + 2) // 3) for _source, preview in valid_assets
+            )
+            for max_side in (1200, 1000, 800, 640, 480, 320):
+                if encoded_bytes <= MAX_INSPECTION_ENCODED_BYTES:
+                    break
+                resized_assets = [
+                    (asset_source, preview)
+                    for asset_source, _preview in valid_assets
+                    if (
+                        preview := load_preview_url(
+                            asset_source.image_url,
+                            settings,
+                            max_side=max_side,
+                        )
+                    )
+                    is not None
+                ]
+                valid_assets = resized_assets
+                encoded_bytes = sum(
+                    4 * ((len(preview.data) + 2) // 3) for _asset_source, preview in valid_assets
+                )
+            valid_assets_by_id[result_id] = valid_assets
+
         selected_by_id: dict[str, list[tuple[CandidateAssetSource, PreviewImage]]] = {
             result_id: [] for result_id in contexts_by_id
         }
