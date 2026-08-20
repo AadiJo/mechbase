@@ -17,16 +17,19 @@ from PIL import Image
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.images import load_preview_image
-from app.mcp.results import search_output
+from app.mcp.results import fetch_output, search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
+    FetchContextResponse,
     ImageContextResponse,
+    PageContextResponse,
     SearchCoverage,
     SearchRequest,
     SearchResponse,
     SearchResult,
     SimilarPagesResponse,
+    SourceBrowseResponse,
     SourceListResponse,
     SourceSummary,
 )
@@ -49,7 +52,13 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
+        self.fetch_calls: list[str] = []
+        self.fetch_context_calls: list[dict[str, object]] = []
+        self.similar_calls: list[dict[str, object]] = []
+        self.similar_attempts: list[str] = []
+        self.page_context_calls: list[dict[str, object]] = []
         self.list_source_calls: list[dict[str, object]] = []
+        self.browse_context_calls: list[dict[str, object]] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -67,6 +76,7 @@ class FakeRetrievalBackend:
         return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
+        self.fetch_calls.append(result_id)
         if result_id == "missing":
             return None
         return ImageContextResponse(
@@ -87,18 +97,103 @@ class FakeRetrievalBackend:
             image_urls=["/images/254-2020/page-012/page.png"],
         )
 
-    def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
+    def fetch_contexts(
+        self,
+        result_id: str,
+        adjacent_pages: int,
+    ) -> FetchContextResponse | None:
+        self.fetch_context_calls.append({"result_id": result_id, "adjacent_pages": adjacent_pages})
+        context = self.fetch(result_id)
+        if context is None:
+            return None
+        adjacent_contexts = []
+        if adjacent_pages:
+            adjacent_contexts = self.page_contexts(
+                context.source_pdf,
+                [context.page - 1, context.page + 1],
+                context.source_version_id,
+                context.ingestion_id,
+            )
+        return FetchContextResponse(
+            context=context,
+            adjacent_contexts=adjacent_contexts,
+        )
+
+    def find_similar(
+        self,
+        result_id: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SimilarPagesResponse | None:
+        self.similar_attempts.append(result_id)
         if result_id == "missing":
             return None
+        self.similar_calls.append(
+            {
+                "result_id": result_id,
+                "top_k": top_k,
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+            }
+        )
+        result = _search_result("result_2", 8)
+        result.debug["similarity_reason"] = "both"
         return SimilarPagesResponse(
-            seed={"id": result_id},
-            results=[_search_result("result_2", 8)][:top_k],
+            seed={"id": result_id, "modality": "text"},
+            results=[result][:top_k],
             coverage=SearchCoverage(
                 candidate_pages=1,
                 candidate_sources=1,
                 returned_pages=1,
             ),
         )
+
+    def page_contexts(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+    ) -> list[PageContextResponse]:
+        self.page_context_calls.append(
+            {
+                "source_pdf": source_pdf,
+                "pages": pages,
+                "source_version_id": source_version_id,
+                "ingestion_id": ingestion_id,
+            }
+        )
+        if source_pdf != "254-2020.pdf":
+            return []
+        available_pages = {1, 11, 12, 13}
+        selected_pages = sorted({1, 12} if pages is None else available_pages & set(pages))
+        return [
+            PageContextResponse(
+                source_id="254-2020",
+                source_version="version-a",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2020,
+                page=page,
+                section="Elevator" if page in {11, 12, 13} else "Overview",
+                text=(
+                    "Swerve Drive\nMechanical Design\nFloor-Pickup\nHarmonic drive\n机械臂设计"
+                    if page == 1
+                    else f"Page {page} source text"
+                ),
+                page_image_url=f"/images/254-2020/page-{page:03d}/page.png",
+                image_urls=[f"/images/254-2020/page-{page:03d}/page.png"],
+                result_ids=[f"result_page_{page}"],
+                primary_result_id=f"result_page_{page}",
+            )
+            for page in selected_pages
+        ]
 
     def list_sources(
         self,
@@ -116,7 +211,26 @@ class FakeRetrievalBackend:
                 "source_query": source_query,
             }
         )
-        sources = [
+        sources = self._catalog_sources()
+        needle = source_query.casefold() if source_query else None
+        return SourceListResponse(
+            sources=[
+                source
+                for source in sources
+                if (not team_numbers or source.team in team_numbers)
+                and (not years or source.year in years)
+                and (not source_ids or source.source_id in source_ids)
+                and (
+                    needle is None
+                    or needle in source.source_id.casefold()
+                    or needle in source.source_pdf.casefold()
+                )
+            ]
+        )
+
+    @staticmethod
+    def _catalog_sources() -> list[SourceSummary]:
+        return [
             SourceSummary(
                 source_id="254-2020",
                 source_version="version-a",
@@ -146,21 +260,62 @@ class FakeRetrievalBackend:
                 page_image_count=1,
                 extracted_image_count=0,
             ),
+            SourceSummary(
+                source_id="999-2024",
+                source_version="version-c",
+                source_version_id="999-2024@version-c",
+                ingestion_id="ingestion-c",
+                source_pdf="999-2024.pdf",
+                team="999",
+                year=2024,
+                pages=list(range(1, 101)),
+                page_count=100,
+                text_count=100,
+                page_image_count=100,
+                extracted_image_count=0,
+            ),
         ]
-        needle = source_query.casefold() if source_query else None
-        return SourceListResponse(
-            sources=[
-                source
-                for source in sources
-                if (not team_numbers or source.team in team_numbers)
-                and (not years or source.year in years)
-                and (not source_ids or source.source_id in source_ids)
-                and (
-                    needle is None
-                    or needle in source.source_id.casefold()
-                    or needle in source.source_pdf.casefold()
-                )
-            ]
+
+    def browse_contexts(
+        self,
+        source_id: str,
+        *,
+        start_page: int | None,
+        end_page: int | None,
+        resume_page: int | None,
+        scan_limit: int,
+    ) -> SourceBrowseResponse | None:
+        self.browse_context_calls.append(
+            {
+                "source_id": source_id,
+                "start_page": start_page,
+                "end_page": end_page,
+                "resume_page": resume_page,
+                "scan_limit": scan_limit,
+            }
+        )
+        source = next(
+            (item for item in self._catalog_sources() if item.source_id == source_id),
+            None,
+        )
+        if source is None:
+            return None
+        if start_page is not None and end_page is not None:
+            requested_pages = list(range(start_page, end_page + 1))
+        else:
+            requested_pages = [
+                page for page in sorted(source.pages) if resume_page is None or page >= resume_page
+            ][:scan_limit]
+        contexts = self.page_contexts(
+            source.source_pdf,
+            [page for page in requested_pages if page in source.pages],
+            source.source_version_id,
+            source.ingestion_id,
+        )
+        return SourceBrowseResponse(
+            source=source,
+            requested_pages=requested_pages,
+            contexts=contexts,
         )
 
 
@@ -214,6 +369,31 @@ def test_search_output_preserves_weak_result_abstention() -> None:
     assert output.results == []
     assert output.coverage.weak_pages_dropped == 3
     assert output.abstention_reason == ("No indexed pages met the calibrated relevance threshold.")
+
+
+def test_fetch_citation_stays_on_the_exact_generation_artifact() -> None:
+    def context(generation: str) -> ImageContextResponse:
+        image_url = f"/images/254-2020/{generation}/page-001/page.png"
+        return ImageContextResponse(
+            result_id="result_1",
+            source_id="254-2020",
+            source_version_id=f"254-2020@{generation}",
+            ingestion_id=generation,
+            source_pdf="254-2020.pdf",
+            page=1,
+            page_context_url="/pages/254-2020.pdf/1",
+            page_text_url="/pages/254-2020.pdf/1/text",
+            text="elevator",
+            page_image_url=image_url,
+            image_urls=[image_url],
+        )
+
+    old_output = fetch_output(context("generation-old"), "result_1", "https://api.example.com")
+    new_output = fetch_output(context("generation-new"), "result_1", "https://api.example.com")
+
+    assert old_output.pages[0].url.endswith("/generation-old/page-001/page.png")
+    assert new_output.pages[0].url.endswith("/generation-new/page-001/page.png")
+    assert old_output.pages[0].url != new_output.pages[0].url
 
 
 def test_candidate_preview_uses_shared_external_image_cache(tmp_path: Path) -> None:
@@ -418,6 +598,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "find_similar",
                             "render_search_results",
                             "list_sources",
+                            "browse_source",
                         }
                         assert set(tools["search"].input_schema["properties"]) == {
                             "query",
@@ -574,14 +755,88 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         )
                         assert "continuous belt" in fetched.structured_content["text"]
+                        assert [page["page"] for page in fetched.structured_content["pages"]] == [
+                            12
+                        ]
+
+                        fetched_with_neighbors = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 1}
+                        )
+                        assert [
+                            page["page"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        ] == [11, 12, 13]
+                        assert all(
+                            page["evidence"]["direct_source_text"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        )
+                        assert all(
+                            "/images/254-2020/" in page["url"]
+                            for page in fetched_with_neighbors.structured_content["pages"]
+                        )
+                        assert backend.page_context_calls[-1]["pages"] == [11, 13]
+
+                        fetch_context_calls_before_refresh = len(backend.fetch_context_calls)
+                        refreshed_fetch = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 1}
+                        )
+                        assert refreshed_fetch.is_error is False
+                        assert [
+                            page["page"] for page in refreshed_fetch.structured_content["pages"]
+                        ] == [11, 12, 13]
+                        assert (
+                            len(backend.fetch_context_calls)
+                            == fetch_context_calls_before_refresh + 1
+                        )
+                        assert backend.fetch_context_calls[-1] == {
+                            "result_id": "result_1",
+                            "adjacent_pages": 1,
+                        }
 
                         similar = await session.call_tool(
-                            "find_similar", {"id": "result_1", "top_k": 1}
+                            "find_similar",
+                            {
+                                "id": "result_1",
+                                "team_numbers": [254],
+                                "years": [2020],
+                                "source_ids": ["254-2020"],
+                                "top_k": 1,
+                            },
                         )
                         assert similar.is_error is False
                         assert similar.structured_content["results"][0]["id"] == "result_2"
                         assert similar.structured_content["coverage"]["candidate_pages"] == 1
                         assert similar.structured_content["coverage"]["returned_pages"] == 1
+                        assert (
+                            similar.structured_content["results"][0]["similarity_reason"] == "both"
+                        )
+                        assert backend.similar_calls[-1] == {
+                            "result_id": "result_1",
+                            "top_k": 1,
+                            "team_numbers": ["254"],
+                            "years": [2020],
+                            "source_ids": ["254-2020"],
+                        }
+                        cached_similar = await session.call_tool(
+                            "find_similar",
+                            {
+                                "id": "result_1",
+                                "team_numbers": [254],
+                                "years": [2020],
+                                "source_ids": ["254-2020"],
+                                "top_k": 1,
+                            },
+                        )
+                        assert cached_similar.is_error is False
+                        assert len(backend.similar_calls) == 1
+
+                        missing_similar = await session.call_tool("find_similar", {"id": "missing"})
+                        assert missing_similar.is_error is True
+                        repeated_missing_similar = await session.call_tool(
+                            "find_similar", {"id": "missing"}
+                        )
+                        assert repeated_missing_similar.is_error is True
+                        assert backend.similar_attempts.count("missing") == 1
 
                         rendered = await session.call_tool(
                             "render_search_results", {"ids": ["result_1"]}
@@ -642,6 +897,201 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert cached_sources.is_error is False
                         assert len(backend.list_source_calls) == 1
+
+                        browsed = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 2,
+                                "include_previews": True,
+                            },
+                        )
+                        assert browsed.is_error is False
+                        assert browsed.structured_content["source_id"] == "254-2020"
+                        assert browsed.structured_content["pages"][0]["result_id"] == (
+                            "result_page_1"
+                        )
+                        assert "result_ids" not in browsed.structured_content["pages"][0]
+                        assert browsed.structured_content["missing_pages"] == [2]
+                        assert browsed.structured_content["pages"][0]["image_url"].startswith(
+                            "https://api.example.com/images/"
+                        )
+                        assert browsed.structured_content["pages"][0]["url"].startswith(
+                            "https://api.example.com/images/"
+                        )
+                        assert browsed.structured_content["scanned_pages"] == 1
+                        assert browsed.structured_content["next_cursor"] is None
+                        assert backend.page_context_calls[-1]["pages"] == [1]
+                        assert backend.browse_context_calls[-1] == {
+                            "source_id": "254-2020",
+                            "start_page": 1,
+                            "end_page": 2,
+                            "resume_page": None,
+                            "scan_limit": 10,
+                        }
+
+                        browsed_section = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "elevator",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_section.is_error is False
+                        assert [
+                            page["page"] for page in browsed_section.structured_content["pages"]
+                        ] == [12]
+                        assert browsed_section.structured_content["pages"][0]["image_url"] is None
+                        assert backend.page_context_calls[-1]["pages"] == [1, 12]
+
+                        browsed_text_heading = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "swerve",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_text_heading.is_error is False
+                        assert [
+                            page["page"]
+                            for page in browsed_text_heading.structured_content["pages"]
+                        ] == [1]
+
+                        browsed_hyphenated_heading = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "floor pickup",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_hyphenated_heading.is_error is False
+                        assert [
+                            page["page"]
+                            for page in browsed_hyphenated_heading.structured_content["pages"]
+                        ] == [1]
+
+                        browsed_substring = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "arm",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_substring.is_error is False
+                        assert browsed_substring.structured_content["pages"] == []
+
+                        browsed_non_latin_heading = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "section": "机械臂",
+                                "include_previews": False,
+                            },
+                        )
+                        assert browsed_non_latin_heading.is_error is False
+                        assert [
+                            page["page"]
+                            for page in browsed_non_latin_heading.structured_content["pages"]
+                        ] == [1]
+
+                        bounded_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                            },
+                        )
+                        assert bounded_section_browse.is_error is False
+                        assert bounded_section_browse.structured_content["scanned_pages"] == 50
+                        assert bounded_section_browse.structured_content["next_cursor"] == {
+                            "page": 51,
+                            "source_id": "999-2024",
+                            "section": "elevator",
+                            "source_version_id": "999-2024@version-c",
+                            "ingestion_id": "ingestion-c",
+                        }
+                        assert bounded_section_browse.structured_content["truncated"] is True
+                        assert backend.page_context_calls[-1]["pages"] == list(range(1, 51))
+
+                        expanding_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "ß" * 100,
+                            },
+                        )
+                        assert expanding_section_browse.is_error is False
+                        assert (
+                            expanding_section_browse.structured_content["next_cursor"]["section"]
+                            == "ss" * 100
+                        )
+                        omitted_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert omitted_section_browse.is_error is True
+                        changed_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "intake",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert changed_section_browse.is_error is True
+                        stale_cursor_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                                "cursor": {
+                                    "page": 51,
+                                    "source_id": "999-2024",
+                                    "section": "elevator",
+                                    "source_version_id": "999-2024@old",
+                                    "ingestion_id": "ingestion-old",
+                                },
+                            },
+                        )
+                        assert stale_cursor_browse.is_error is True
+                        continued_section_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "999-2024",
+                                "section": "elevator",
+                                "cursor": bounded_section_browse.structured_content["next_cursor"],
+                            },
+                        )
+                        assert continued_section_browse.is_error is False
+                        assert continued_section_browse.structured_content["next_cursor"] is None
+                        assert backend.page_context_calls[-1]["pages"] == list(range(51, 101))
+
+                        oversized_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 11,
+                            },
+                        )
+                        assert oversized_browse.is_error is True
+                        invalid_adjacent_fetch = await session.call_tool(
+                            "fetch", {"id": "result_1", "adjacent_pages": 2}
+                        )
+                        assert invalid_adjacent_fetch.is_error is True
+                        incomplete_browse = await session.call_tool(
+                            "browse_source",
+                            {"source_id": "254-2020", "start_page": 1},
+                        )
+                        assert incomplete_browse.is_error is True
                         queried_sources = await session.call_tool(
                             "list_sources",
                             {"team_numbers": [254], "source_query": "2020"},
@@ -670,10 +1120,38 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "source_query": None,
                         }
 
+                        browse_context_calls_before_refresh = len(backend.browse_context_calls)
+                        refreshed_browse = await session.call_tool(
+                            "browse_source",
+                            {
+                                "source_id": "254-2020",
+                                "start_page": 1,
+                                "end_page": 2,
+                            },
+                        )
+                        assert refreshed_browse.is_error is False
+                        assert refreshed_browse.structured_content["missing_pages"] == [2]
+                        assert (
+                            len(backend.browse_context_calls)
+                            == browse_context_calls_before_refresh + 1
+                        )
+                        assert backend.browse_context_calls[-1] == {
+                            "source_id": "254-2020",
+                            "start_page": 1,
+                            "end_page": 2,
+                            "resume_page": None,
+                            "scan_limit": 10,
+                        }
+
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}
                         )
                         assert invalid.is_error is True
+
+                        oversized_id = "x" * 257
+                        invalid_id = await session.call_tool("find_similar", {"id": oversized_id})
+                        assert invalid_id.is_error is True
+                        assert oversized_id not in backend.similar_attempts
 
                         too_many_images = await session.call_tool(
                             "inspect_candidates",

@@ -48,20 +48,26 @@ The API also exposes a stateless Streamable HTTP MCP server at `/mcp`. It is add
 frontend and all existing REST endpoints continue to use Mechbase API keys without changes.
 The MCP endpoint accepts Clerk OAuth access tokens only.
 
-The server provides six read-only tools:
+The server provides seven read-only tools:
 
 - `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
   result-count controls. Results include stable source IDs, evidence classification, calibrated
   score bands, coverage, and an abstention reason when no page is relevant enough.
 - `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
   model can check visual relevance before anything is displayed.
-- `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
-- `find_similar(id, top_k)` finds related mechanism pages.
+- `fetch(id, adjacent_pages)` returns full page text, source metadata, and absolute citation URLs,
+  optionally including one neighboring page on each side.
+- `find_similar(id, ...)` finds related mechanism pages by text and shape, supports exact team,
+  year, and source filters, and explains which form of similarity matched each result.
 - `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
   hosts that support MCP Apps. Other clients still receive its structured result.
 - `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
   search, stable logical IDs plus content versions, provenance when known, and complete text and
   image coverage counts.
+- `browse_source(...)` navigates one exact binder by page range or section and returns page-scoped
+  text, immutable preview citations, and primary result IDs without leaving that source. Long
+  section scans return a generation-pinned `next_cursor` so follow-up calls stay bounded and
+  cannot silently cross a source refresh.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.

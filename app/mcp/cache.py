@@ -3,10 +3,11 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from threading import Condition, Lock
 from time import monotonic
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 Key = TypeVar("Key", bound=Hashable)
 Value = TypeVar("Value")
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,8 @@ class TTLCache(Generic[Key, Value]):
 
     def get(self, key: Key) -> Value | None:
         with self._lock:
-            return self._get_locked(key)
+            value = self._get_locked(key)
+            return None if value is _MISSING else cast(Value, value)
 
     def put(self, key: Key, value: Value) -> None:
         with self._lock:
@@ -39,8 +41,8 @@ class TTLCache(Generic[Key, Value]):
         with self._condition:
             while True:
                 cached = self._get_locked(key)
-                if cached is not None:
-                    return cached
+                if cached is not _MISSING:
+                    return cast(Value, cached)
                 if key not in self._inflight:
                     self._inflight.add(key)
                     break
@@ -60,13 +62,13 @@ class TTLCache(Generic[Key, Value]):
             self._condition.notify_all()
         return value
 
-    def _get_locked(self, key: Key) -> Value | None:
+    def _get_locked(self, key: Key) -> Value | object:
         entry = self._entries.get(key)
         if entry is None:
-            return None
+            return _MISSING
         if entry.expires_at <= monotonic():
             self._entries.pop(key, None)
-            return None
+            return _MISSING
         self._entries.move_to_end(key)
         return entry.value
 

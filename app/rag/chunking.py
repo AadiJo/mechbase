@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 MECHANISM_TERMS = {
     "shooter": ["launcher", "flywheel", "hood", "turret", "drum shooter", "multi lane"],
@@ -8,6 +9,9 @@ MECHANISM_TERMS = {
     "end effector": ["grabber", "manipulator", "wrist", "scorer"],
     "elevator": ["lift", "arm", "extension"],
 }
+MECHANISM_HEADINGS = frozenset(
+    [*MECHANISM_TERMS, *(alias for aliases in MECHANISM_TERMS.values() for alias in aliases)]
+)
 
 SEASON_MECHANISM_TERMS = {
     2024: {"climber": ["trap", "stage chain"]},
@@ -52,12 +56,78 @@ def expand_query(query: str, years: list[int] | None = None) -> str:
     return " ".join([query, *dict.fromkeys(extra)])
 
 
-def section_from_text(text: str) -> str | None:
+def section_candidates(text: str) -> list[str]:
+    candidates = []
     for line in text.splitlines()[:8]:
         stripped = line.strip()
         if 3 <= len(stripped) <= 80 and re.match(r"^[A-Z0-9][A-Za-z0-9 /&+-]+$", stripped):
-            return stripped
-    return None
+            candidates.append(stripped)
+    return list(dict.fromkeys(candidates))
+
+
+def normalize_token_phrase(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in normalized).split()
+    )
+
+
+def contains_token_phrase(text: str, phrase: str) -> bool:
+    normalized_haystack = normalize_token_phrase(text)
+    normalized_needle = normalize_token_phrase(phrase)
+    if _uses_unsegmented_script(normalized_needle):
+        return normalized_needle.replace(" ", "") in normalized_haystack.replace(" ", "")
+
+    haystack = normalized_haystack.split()
+    needle = normalized_needle.split()
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[index : index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def _uses_unsegmented_script(value: str) -> bool:
+    script_names = ("CJK", "HIRAGANA", "KATAKANA", "HANGUL", "THAI", "LAO", "KHMER", "MYANMAR")
+    return any(
+        character.isalnum()
+        and (
+            unicodedata.east_asian_width(character) in {"W", "F"}
+            or any(script in unicodedata.name(character, "") for script in script_names)
+        )
+        for character in value
+    )
+
+
+def section_from_text(text: str, ignored: set[str] | None = None) -> str | None:
+    ignored_keys = {normalize_token_phrase(value) for value in ignored or set()}
+    return next(
+        (
+            candidate
+            for candidate in section_candidates(text)
+            if normalize_token_phrase(candidate) not in ignored_keys
+        ),
+        None,
+    )
+
+
+def inherited_section_from_text(
+    text: str,
+    previous: str | None,
+    ignored: set[str] | None = None,
+) -> str | None:
+    return section_from_text(text, ignored) or previous
+
+
+def resolve_page_section(
+    text: str,
+    previous: str | None,
+    ignored: set[str] | None = None,
+    *,
+    outline_heading: str | None = None,
+) -> str | None:
+    return outline_heading or section_from_text(text, ignored) or previous
 
 
 def split_text(text: str, target_chars: int, overlap_chars: int) -> list[str]:

@@ -111,14 +111,17 @@ class PageContextResponse(BaseModel):
     source_version_id: str | None = None
     ingestion_id: str | None = None
     source_pdf: str
+    source_url: str | None = None
     team: str | None = None
     year: int | None = None
     page: int
+    section: str | None = None
     text: str
     text_chunks: list[str] = Field(default_factory=list)
     page_image_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
     result_ids: list[str] = Field(default_factory=list)
+    primary_result_id: str | None = None
 
 
 class PageTextResponse(BaseModel):
@@ -190,6 +193,7 @@ class ImageContextResponse(BaseModel):
     source_version_id: str | None = None
     ingestion_id: str | None = None
     source_pdf: str
+    source_url: str | None = None
     team: str | None = None
     year: int | None = None
     page: int
@@ -198,3 +202,14 @@ class ImageContextResponse(BaseModel):
     text: str
     page_image_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
+
+
+class FetchContextResponse(BaseModel):
+    context: ImageContextResponse
+    adjacent_contexts: list[PageContextResponse] = Field(default_factory=list)
+
+
+class SourceBrowseResponse(BaseModel):
+    source: SourceSummary
+    requested_pages: list[int] = Field(default_factory=list)
+    contexts: list[PageContextResponse] = Field(default_factory=list)

@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
-from app.rag.models import RagDocument, SearchRequest
+from app.rag.models import PageContextResponse, RagDocument, SearchRequest, SimilarPagesResponse
 from app.rag.pdf import _document_id
 from app.rag.search import _expansion_years
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
@@ -115,6 +115,7 @@ def test_ensure_collection_adds_missing_metadata_indexes() -> None:
         "ingestion_id",
         "is_staged",
         "source_pdf",
+        "page",
         "modality",
         "artifact_path",
         "linked_artifacts",
@@ -376,6 +377,228 @@ def test_read_retries_when_active_generation_changes_mid_query(tmp_path: Path) -
     assert reads == [{"254-2023": "old"}, {"254-2023": "new"}]
 
 
+class SnapshotBoundFetchStore(RagStore):
+    def __init__(
+        self,
+        snapshots: list[dict[str, str]],
+        *,
+        missing_generations: set[str] | None = None,
+    ) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(snapshots)
+        self.missing_generations = missing_generations or set()
+        self.payload_snapshots: list[dict[str, str]] = []
+        self.context_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        return next(self._snapshots)
+
+    def _payload_and_vectors_for_result_id_active(
+        self,
+        result_id: str,
+        active_generations: dict[str, str],
+    ) -> tuple[dict | None, dict | None]:
+        self.payload_snapshots.append(active_generations)
+        ingestion_id = active_generations["254-2023"]
+        if ingestion_id in self.missing_generations:
+            return None, None
+        payload = _versioned_doc(
+            "same",
+            2,
+            ingestion_id=ingestion_id,
+            text=f"{ingestion_id} intake",
+        ).model_dump()
+        payload["id"] = result_id
+        return payload, None
+
+    def _page_contexts_for_active(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+        active_generations: dict[str, str],
+    ) -> list[PageContextResponse]:
+        self.context_snapshots.append(active_generations)
+        assert source_pdf == "254-2023.pdf"
+        assert source_version_id == "254-2023@same"
+        assert ingestion_id == active_generations["254-2023"]
+        return [
+            PageContextResponse(
+                source_id="254-2023",
+                source_version="same",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2023,
+                page=page,
+                text=f"{ingestion_id} page {page}",
+            )
+            for page in pages or []
+        ]
+
+
+def test_fetch_contexts_retries_the_whole_source_read_after_activation() -> None:
+    old = {"254-2023": "old", "4414-2023": "steady"}
+    new = {"254-2023": "new", "4414-2023": "steady"}
+    store = SnapshotBoundFetchStore([old, new, new, new])
+
+    response = store.fetch_contexts("result", adjacent_pages=1)
+
+    assert response is not None
+    assert response.context.ingestion_id == "new"
+    assert [context.ingestion_id for context in response.adjacent_contexts] == ["new", "new"]
+    assert store.payload_snapshots == [old, new]
+    assert store.context_snapshots == [old, new]
+
+
+def test_fetch_contexts_ignores_unrelated_source_activation() -> None:
+    before = {"254-2023": "steady", "4414-2023": "old"}
+    after = {"254-2023": "steady", "4414-2023": "new"}
+    store = SnapshotBoundFetchStore([before, after])
+
+    response = store.fetch_contexts("result", adjacent_pages=0)
+
+    assert response is not None
+    assert response.context.ingestion_id == "steady"
+    assert store.payload_snapshots == [before]
+    assert store.context_snapshots == [before]
+
+
+def test_fetch_contexts_retries_a_missing_id_when_the_active_map_changes() -> None:
+    old = {"254-2023": "old"}
+    new = {"254-2023": "new"}
+    store = SnapshotBoundFetchStore(
+        [old, new, new, new],
+        missing_generations={"old"},
+    )
+
+    response = store.fetch_contexts("new-result", adjacent_pages=0)
+
+    assert response is not None
+    assert response.context.result_id == "new-result"
+    assert response.context.ingestion_id == "new"
+    assert store.payload_snapshots == [old, new]
+    assert store.context_snapshots == [new]
+
+
+def test_fetch_contexts_reports_repeated_activation_while_id_is_missing() -> None:
+    first = {"254-2023": "first"}
+    second = {"254-2023": "second"}
+    third = {"254-2023": "third"}
+    fourth = {"254-2023": "fourth"}
+    fifth = {"254-2023": "fifth"}
+    sixth = {"254-2023": "sixth"}
+    store = SnapshotBoundFetchStore(
+        [first, second, third, fourth, fifth, sixth],
+        missing_generations={"first", "third", "fifth"},
+    )
+
+    with pytest.raises(RuntimeError, match="while fetching result 'missing'"):
+        store.fetch_contexts("missing", adjacent_pages=0)
+
+    assert store.payload_snapshots == [first, third, fifth]
+    assert store.context_snapshots == []
+
+
+class SnapshotBoundBrowseStore(RagStore):
+    def __init__(self, snapshots: list[dict[str, str]]) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(snapshots)
+        self.current_snapshot: dict[str, str] = {}
+        self.summary_snapshots: list[dict[str, str]] = []
+        self.context_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        self.current_snapshot = next(self._snapshots)
+        return self.current_snapshot
+
+    def _iter_source_payloads(self, qfilter: models.Filter | None):
+        assert qfilter is not None
+        snapshot = dict(self.current_snapshot)
+        self.summary_snapshots.append(snapshot)
+        ingestion_id = snapshot["254-2023"]
+        for page in (1, 2):
+            yield _versioned_doc(
+                "same",
+                page,
+                ingestion_id=ingestion_id,
+                text=f"{ingestion_id} page {page}",
+            ).model_dump()
+
+    def _page_contexts_for_active(
+        self,
+        source_pdf: str,
+        pages: list[int] | None,
+        source_version_id: str | None,
+        ingestion_id: str | None,
+        active_generations: dict[str, str],
+    ) -> list[PageContextResponse]:
+        self.context_snapshots.append(active_generations)
+        return [
+            PageContextResponse(
+                source_id="254-2023",
+                source_version="same",
+                source_version_id=source_version_id,
+                ingestion_id=ingestion_id,
+                source_pdf=source_pdf,
+                team="254",
+                year=2023,
+                page=page,
+                text=f"{ingestion_id} page {page}",
+            )
+            for page in pages or []
+        ]
+
+
+def test_browse_contexts_retries_summary_and_pages_under_one_source_snapshot() -> None:
+    old = {"254-2023": "old", "4414-2023": "steady"}
+    new = {"254-2023": "new", "4414-2023": "steady"}
+    store = SnapshotBoundBrowseStore([old, new, new, new])
+
+    response = store.browse_contexts(
+        "254-2023",
+        start_page=1,
+        end_page=2,
+        resume_page=None,
+        scan_limit=10,
+    )
+
+    assert response is not None
+    assert response.source.ingestion_id == "new"
+    assert [context.ingestion_id for context in response.contexts] == ["new", "new"]
+    assert store.summary_snapshots == [old, new]
+    assert store.context_snapshots == [old, new]
+
+
+def test_browse_contexts_reuses_the_generation_pinned_source_summary() -> None:
+    active = {"254-2023": "steady"}
+    store = SnapshotBoundBrowseStore([active, active, active, active])
+
+    first = store.browse_contexts(
+        "254-2023",
+        start_page=None,
+        end_page=None,
+        resume_page=None,
+        scan_limit=1,
+    )
+    second = store.browse_contexts(
+        "254-2023",
+        start_page=None,
+        end_page=None,
+        resume_page=2,
+        scan_limit=1,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.requested_pages == [1]
+    assert second.requested_pages == [2]
+    assert store.summary_snapshots == [active]
+    assert store.context_snapshots == [active, active]
+
+
 def test_source_summaries_do_not_mix_versions() -> None:
     store = RagStore(Settings(), client=SimpleNamespace())
 
@@ -449,6 +672,51 @@ def test_page_context_is_scoped_to_the_result_generation() -> None:
     assert conditions["ingestion_id"].match.value == "generation-new"
     assert client.scroll_filter.must_not[0].key == "is_staged"
     assert context.source_version_id == "254-2023@new"
+
+
+class BatchPageClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.scroll_filter = None
+
+    def scroll(self, **kwargs):
+        self.calls += 1
+        self.scroll_filter = kwargs["scroll_filter"]
+        return (
+            [
+                SimpleNamespace(
+                    payload={
+                        **_versioned_doc(
+                            "new",
+                            page,
+                            ingestion_id="generation-new",
+                            text=f"page {page}",
+                        ).model_dump(),
+                        "id": f"result-{page}",
+                    }
+                )
+                for page in (2, 1)
+            ],
+            None,
+        )
+
+
+def test_page_contexts_loads_multiple_pages_in_one_snapshot_read() -> None:
+    client = BatchPageClient()
+    store = RagStore(Settings(), client=client)
+
+    contexts = store.page_contexts(
+        "254-2023.pdf",
+        [2, 1],
+        "254-2023@new",
+        "generation-new",
+    )
+
+    assert client.calls == 1
+    assert [context.page for context in contexts] == [1, 2]
+    assert [context.text for context in contexts] == ["page 1", "page 2"]
+    conditions = {condition.key: condition for condition in client.scroll_filter.must}
+    assert conditions["page"].match.any == [2, 1]
 
 
 class MixedGenerationPageClient:
@@ -674,6 +942,286 @@ def test_find_similar_drops_hits_below_relevance_floor() -> None:
     assert response.coverage.candidate_pages == 1
     assert response.coverage.weak_pages_dropped == 1
     assert response.coverage.returned_pages == 0
+
+
+class DualVectorSimilarityClient:
+    def __init__(self) -> None:
+        self.queried_vectors: list[str] = []
+
+    def query_points(self, **kwargs):
+        self.queried_vectors.append(kwargs["using"])
+        scores = {
+            TEXT_VECTOR: {
+                "both": 0.70,
+                "text-only": 0.60,
+                "shape-only": 0.10,
+            },
+            IMAGE_VECTOR: {
+                "both": 0.80,
+                "text-only": 0.10,
+                "shape-only": 0.75,
+            },
+        }
+        return SimpleNamespace(
+            points=[
+                _hit(point_id, f"{point_id}.pdf", "254", 2023, score)
+                for point_id, score in scores[kwargs["using"]].items()
+            ]
+        )
+
+
+class ResultSimilarityClient(DualVectorSimilarityClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scroll_calls = 0
+
+    def scroll(self, **kwargs):
+        self.scroll_calls += 1
+        conditions = {condition.key: condition for condition in kwargs["scroll_filter"].must}
+        seed = _hit("seed", "seed.pdf", "254", 2023, 1.0)
+        if "id" in conditions:
+            seed.vector = {TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.0]}
+            return ([seed], None)
+        seed.payload["id"] = "seed-page-image"
+        seed.payload["modality"] = "page_image"
+        seed.vector = {TEXT_VECTOR: [0.1], IMAGE_VECTOR: [0.2]}
+        return (
+            [seed],
+            None,
+        )
+
+
+def test_result_similarity_queries_both_seed_vectors() -> None:
+    client = ResultSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert client.scroll_calls == 2
+    assert client.queried_vectors == [TEXT_VECTOR, IMAGE_VECTOR]
+    assert [result.debug["similarity_reason"] for result in response.results] == [
+        "both",
+        "shape",
+        "text",
+    ]
+
+
+class TextOnlyResultSimilarityClient(ResultSimilarityClient):
+    def scroll(self, **kwargs):
+        conditions = {condition.key: condition for condition in kwargs["scroll_filter"].must}
+        if "id" not in conditions:
+            self.scroll_calls += 1
+            return [], None
+        return super().scroll(**kwargs)
+
+
+def test_result_similarity_skips_placeholder_image_vectors_without_a_page_image() -> None:
+    client = TextOnlyResultSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert client.queried_vectors == [TEXT_VECTOR]
+
+
+class SnapshotBoundSimilarityStore(RagStore):
+    def __init__(self) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(
+            [
+                {"254-2023": "generation-old"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+            ]
+        )
+        self.seed_snapshots: list[dict[str, str]] = []
+        self.query_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        return next(self._snapshots)
+
+    def _similarity_seed_for_result_id(
+        self,
+        result_id: str,
+        active_generations: dict[str, str],
+    ) -> tuple[dict, dict]:
+        self.seed_snapshots.append(active_generations)
+        return (
+            {
+                "id": result_id,
+                "source_id": "254-2023",
+                "source_pdf": "254-2023.pdf",
+                "page": 1,
+                "modality": "text",
+            },
+            {TEXT_VECTOR: [0.1]},
+        )
+
+    def _similar_from_vectors(
+        self,
+        vectors: dict[str, list[float]],
+        top_k: int,
+        seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
+    ) -> SimilarPagesResponse:
+        assert vectors == {TEXT_VECTOR: [0.1]}
+        assert top_k == 10
+        assert seed_payload["id"] == "seed"
+        assert team_numbers is None
+        assert years is None
+        assert source_ids is None
+        assert active_generations is not None
+        self.query_snapshots.append(active_generations)
+        return SimilarPagesResponse(seed=seed_payload, results=[])
+
+
+def test_result_similarity_retries_seed_and_candidates_under_one_snapshot() -> None:
+    store = SnapshotBoundSimilarityStore()
+
+    response = store.similar_from_result_id("seed", 10)
+
+    assert response is not None
+    assert store.seed_snapshots == [
+        {"254-2023": "generation-old"},
+        {"254-2023": "generation-new"},
+    ]
+    assert store.query_snapshots == store.seed_snapshots
+
+
+class SnapshotBoundPageSimilarityStore(RagStore):
+    def __init__(self) -> None:
+        super().__init__(Settings(), client=SimpleNamespace())
+        self._snapshots = iter(
+            [
+                {"254-2023": "generation-old"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+                {"254-2023": "generation-new"},
+            ]
+        )
+        self.current_snapshot: dict[str, str] = {}
+        self.seed_snapshots: list[dict[str, str]] = []
+        self.query_snapshots: list[dict[str, str]] = []
+
+    def active_generations(self) -> dict[str, str]:
+        self.current_snapshot = next(self._snapshots)
+        return self.current_snapshot
+
+    def _scroll_payloads(
+        self,
+        qfilter: models.Filter | None,
+        limit: int | None,
+        with_vectors: bool = False,
+    ):
+        assert qfilter is not None
+        assert limit is None
+        assert with_vectors is True
+        snapshot = dict(self.current_snapshot)
+        self.seed_snapshots.append(snapshot)
+        return [
+            (
+                {
+                    "id": "seed",
+                    "source_id": "254-2023",
+                    "source_pdf": "254-2023.pdf",
+                    "ingestion_id": snapshot["254-2023"],
+                    "page": 1,
+                    "modality": "text",
+                },
+                {TEXT_VECTOR: [0.1]},
+            )
+        ]
+
+    def _similar_from_vector(
+        self,
+        vector_name: str,
+        vector: list[float],
+        top_k: int,
+        seed_payload: dict,
+        *,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        active_generations: dict[str, str] | None = None,
+    ) -> SimilarPagesResponse:
+        assert vector_name == TEXT_VECTOR
+        assert vector == [0.1]
+        assert top_k == 10
+        assert seed_payload["id"] == "seed"
+        assert team_numbers is None
+        assert years is None
+        assert source_ids is None
+        assert active_generations is not None
+        self.query_snapshots.append(active_generations)
+        return SimilarPagesResponse(seed=seed_payload, results=[])
+
+
+def test_page_similarity_retries_seed_and_candidates_under_one_snapshot() -> None:
+    store = SnapshotBoundPageSimilarityStore()
+
+    response = store.similar_from_page("254-2023.pdf", 1, 10)
+
+    assert response is not None
+    assert store.seed_snapshots == [
+        {"254-2023": "generation-old"},
+        {"254-2023": "generation-new"},
+    ]
+    assert store.query_snapshots == store.seed_snapshots
+
+
+def test_find_similar_reports_text_shape_and_combined_matches() -> None:
+    client = DualVectorSimilarityClient()
+    store = RagStore(Settings(SEARCH_MIN_SCORE=0.35), client=client)
+
+    response = store._similar_from_vectors(
+        {TEXT_VECTOR: [0.0], IMAGE_VECTOR: [0.0]},
+        10,
+        {"id": "seed", "source_pdf": "seed.pdf", "page": 1, "modality": "text"},
+    )
+
+    assert [result.id for result in response.results] == ["both", "shape-only", "text-only"]
+    assert [result.debug["similarity_reason"] for result in response.results] == [
+        "both",
+        "shape",
+        "text",
+    ]
+    assert response.coverage.candidate_pages == 3
+    assert response.coverage.weak_pages_dropped == 0
+    assert client.queried_vectors == [TEXT_VECTOR, IMAGE_VECTOR]
+
+
+def test_find_similar_applies_exact_metadata_filters_before_retrieval() -> None:
+    client = FakeQdrantClient()
+    client.query_filter = None
+
+    def query_points(**kwargs):
+        client.query_filter = kwargs["query_filter"]
+        return SimpleNamespace(points=[])
+
+    client.query_points = query_points
+    store = RagStore(Settings(), client=client)
+
+    store._similar_from_vector(
+        TEXT_VECTOR,
+        [0.0],
+        10,
+        {"id": "seed", "source_pdf": "seed.pdf", "page": 1, "modality": "text"},
+        team_numbers=["254"],
+        years=[2023],
+        source_ids=["254-2023"],
+    )
+
+    conditions = {condition.key: condition for condition in client.query_filter.must}
+    assert conditions["team"].match.value == "254"
+    assert conditions["year"].match.value == 2023
+    assert conditions["source_id"].match.value == "254-2023"
 
 
 def test_search_request_bounds_filter_cost() -> None:
