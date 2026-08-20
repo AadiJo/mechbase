@@ -16,10 +16,14 @@ from PIL import Image
 
 from app.api.main import app
 from app.mcp.auth import ClerkTokenVerifier
+from app.mcp.images import load_preview_image
+from app.mcp.results import search_output
 from app.mcp.server import create_mcp_http_app, create_mcp_server
 from app.rag.config import Settings, get_settings
 from app.rag.models import (
     ImageContextResponse,
+    SearchCoverage,
+    SearchRequest,
     SearchResponse,
     SearchResult,
     SimilarPagesResponse,
@@ -44,11 +48,23 @@ class FakeTokenVerifier:
 
 class FakeRetrievalBackend:
     def __init__(self) -> None:
-        self.search_calls: list[tuple[str, int]] = []
+        self.search_calls: list[SearchRequest] = []
+        self.list_source_calls: list[dict[str, object]] = []
 
-    def search(self, query: str, top_k: int) -> SearchResponse:
-        self.search_calls.append((query, top_k))
-        return SearchResponse(query=query, results=[_search_result("result_1", 12)])
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.search_calls.append(request)
+        return SearchResponse(
+            query=request.query,
+            results=[_search_result("result_1", 12)],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
+        )
+
+    def corpus_revision(self) -> str:
+        return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
         if result_id == "missing":
@@ -56,6 +72,10 @@ class FakeRetrievalBackend:
         return ImageContextResponse(
             result_id=result_id,
             image_url="/images/254-2020/page-012/image-000.png",
+            source_id="254-2020",
+            source_version="version-a",
+            source_version_id="254-2020@version-a",
+            ingestion_id="ingestion-a",
             source_pdf="254-2020.pdf",
             team="254",
             year=2020,
@@ -73,24 +93,72 @@ class FakeRetrievalBackend:
         return SimilarPagesResponse(
             seed={"id": result_id},
             results=[_search_result("result_2", 8)][:top_k],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
         )
 
     def list_sources(
         self,
         *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
     ) -> SourceListResponse:
+        self.list_source_calls.append(
+            {
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+                "source_query": source_query,
+            }
+        )
+        sources = [
+            SourceSummary(
+                source_id="254-2020",
+                source_version="version-a",
+                source_version_id="254-2020@version-a",
+                ingestion_id="ingestion-a",
+                source_pdf="254-2020.pdf",
+                team="254",
+                year=2020,
+                pages=[1, 12],
+                page_count=2,
+                text_count=3,
+                page_image_count=2,
+                extracted_image_count=1,
+                sample_image_urls=["/images/254-2020/page-012/page.png"],
+            ),
+            SourceSummary(
+                source_id="4414-2024",
+                source_version="version-b",
+                source_version_id="4414-2024@version-b",
+                ingestion_id="ingestion-b",
+                source_pdf="4414-2024.pdf",
+                team="4414",
+                year=2024,
+                pages=[4],
+                page_count=1,
+                text_count=1,
+                page_image_count=1,
+                extracted_image_count=0,
+            ),
+        ]
+        needle = source_query.casefold() if source_query else None
         return SourceListResponse(
             sources=[
-                SourceSummary(
-                    source_pdf=source or "254-2020.pdf",
-                    team=team or "254",
-                    year=year or 2020,
-                    pages=[1, 12],
-                    page_count=2,
-                    sample_image_urls=["/images/254-2020/page-012/page.png"],
+                source
+                for source in sources
+                if (not team_numbers or source.team in team_numbers)
+                and (not years or source.year in years)
+                and (not source_ids or source.source_id in source_ids)
+                and (
+                    needle is None
+                    or needle in source.source_id.casefold()
+                    or needle in source.source_pdf.casefold()
                 )
             ]
         )
@@ -100,6 +168,11 @@ def _search_result(result_id: str, page: int) -> SearchResult:
     return SearchResult(
         id=result_id,
         score=0.9,
+        score_band="strong",
+        source_id="254-2020",
+        source_version="version-a",
+        source_version_id="254-2020@version-a",
+        ingestion_id="ingestion-a",
         source_pdf="254-2020.pdf",
         team="254",
         year=2020,
@@ -126,6 +199,69 @@ def _settings(artifact_dir: Path | None = None) -> Settings:
     return Settings(
         **values,
     )
+
+
+def test_search_output_preserves_weak_result_abstention() -> None:
+    response = SearchResponse(
+        query="cake recipe",
+        results=[],
+        coverage=SearchCoverage(candidate_pages=3, weak_pages_dropped=3),
+        abstention_reason="No indexed pages met the calibrated relevance threshold.",
+    )
+
+    output = search_output(response, "https://api.example.com")
+
+    assert output.results == []
+    assert output.coverage.weak_pages_dropped == 3
+    assert output.abstention_reason == ("No indexed pages met the calibrated relevance threshold.")
+
+
+def test_candidate_preview_uses_shared_external_image_cache(tmp_path: Path) -> None:
+    source = tmp_path / "page.png"
+    Image.new("RGB", (64, 64), "white").save(source)
+    context = ImageContextResponse(
+        image_url="/images/page.png",
+        source_pdf="254-2020.pdf",
+        page=1,
+        page_context_url="/pages/254-2020.pdf/1",
+        page_text_url="/pages/254-2020.pdf/1/text",
+        text="intake",
+        image_urls=["/images/page.png"],
+    )
+
+    first = load_preview_image(context, _settings(tmp_path), max_side=32)
+    second = load_preview_image(context, _settings(tmp_path), max_side=32)
+
+    assert first is not None
+    assert second == first
+    assert len(list((tmp_path / ".embedding-cache").glob("*.jpg"))) == 1
+    assert not (tmp_path / ".embed").exists()
+
+
+def test_candidate_preview_rejects_a_decompression_bomb(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def raise_decompression_bomb(*_args, **_kwargs):
+        raise Image.DecompressionBombError
+
+    source = tmp_path / "page.png"
+    source.write_bytes(b"image")
+    context = ImageContextResponse(
+        image_url="/images/page.png",
+        source_pdf="254-2020.pdf",
+        page=1,
+        page_context_url="/pages/254-2020.pdf/1",
+        page_text_url="/pages/254-2020.pdf/1/text",
+        text="intake",
+        image_urls=["/images/page.png"],
+    )
+    monkeypatch.setattr(
+        "app.mcp.images.cached_resized_image",
+        raise_decompression_bomb,
+    )
+
+    assert load_preview_image(context, _settings(tmp_path)) is None
 
 
 def test_clerk_token_verifier_accepts_active_tokens() -> None:
@@ -283,12 +419,34 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "render_search_results",
                             "list_sources",
                         }
-                        assert set(tools["search"].input_schema["properties"]) == {"query"}
+                        assert set(tools["search"].input_schema["properties"]) == {
+                            "query",
+                            "team_numbers",
+                            "years",
+                            "source_ids",
+                            "mechanism_types",
+                            "sort",
+                            "top_k",
+                        }
                         assert "Always follow a non-empty search with inspect_candidates" in (
                             tools["search"].description or ""
                         )
                         assert tools["search"].output_schema is not None
-                        assert set(tools["search"].output_schema["properties"]) == {"results"}
+                        assert set(tools["search"].output_schema["properties"]) == {
+                            "results",
+                            "applied_filters",
+                            "coverage",
+                            "abstention_reason",
+                            "evidence_limits",
+                        }
+                        assert "source_query" in tools["list_sources"].input_schema["properties"]
+                        assert set(tools["list_sources"].input_schema["properties"]) == {
+                            "team_numbers",
+                            "years",
+                            "source_ids",
+                            "source_query",
+                            "limit",
+                        }
                         assert tools["inspect_candidates"].output_schema is None
                         assert "Always follow visual review with render_search_results" in (
                             tools["inspect_candidates"].description or ""
@@ -317,11 +475,80 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                                     "url": (
                                         "https://api.example.com/images/254-2020/page-012/page.png"
                                     ),
+                                    "source_id": "254-2020",
+                                    "source_version": "version-a",
+                                    "source_version_id": "254-2020@version-a",
+                                    "ingestion_id": "ingestion-a",
+                                    "source_pdf": "254-2020.pdf",
+                                    "team": "254",
+                                    "year": 2020,
+                                    "page": 12,
+                                    "snippet": "elevator",
+                                    "score_band": "strong",
+                                    "evidence": {
+                                        "direct_source_text": True,
+                                        "visible_image": True,
+                                        "missing": [],
+                                    },
                                 }
-                            ]
+                            ],
+                            "applied_filters": {
+                                "team_numbers": [],
+                                "years": [],
+                                "source_ids": [],
+                                "mechanism_types": [],
+                                "sort": "relevance",
+                            },
+                            "coverage": {
+                                "candidate_pages": 1,
+                                "candidate_sources": 1,
+                                "weak_pages_dropped": 0,
+                                "returned_pages": 1,
+                                "candidate_window_truncated": False,
+                            },
+                            "abstention_reason": None,
+                            "evidence_limits": [
+                                (
+                                    "Binder evidence does not independently verify competition "
+                                    "performance."
+                                ),
+                                ("Vector relevance does not establish comparative design quality."),
+                            ],
                         }
                         assert json.loads(searched.content[0].text) == searched.structured_content
-                        assert backend.search_calls == [("elevator", 10)]
+                        assert len(backend.search_calls) == 1
+                        assert backend.search_calls[0].query == "elevator"
+                        assert backend.search_calls[0].top_k == 10
+                        cached_search = await session.call_tool("search", {"query": " elevator "})
+                        assert cached_search.is_error is False
+                        assert len(backend.search_calls) == 1
+
+                        filtered = await session.call_tool(
+                            "search",
+                            {
+                                "query": "cone intake",
+                                "team_numbers": [254, 4414, 254],
+                                "years": [2023],
+                                "source_ids": ["254-2023"],
+                                "mechanism_types": ["intake"],
+                                "sort": "newest",
+                                "top_k": 4,
+                            },
+                        )
+                        assert filtered.is_error is False
+                        assert filtered.structured_content["applied_filters"] == {
+                            "team_numbers": ["254", "4414"],
+                            "years": [2023],
+                            "source_ids": ["254-2023"],
+                            "mechanism_types": ["intake"],
+                            "sort": "newest",
+                        }
+                        assert backend.search_calls[1].team_numbers == ["254", "4414"]
+                        assert backend.search_calls[1].years == [2023]
+                        assert backend.search_calls[1].source_ids == ["254-2023"]
+                        assert backend.search_calls[1].mechanism_types == ["intake"]
+                        assert backend.search_calls[1].sort == "newest"
+                        assert backend.search_calls[1].top_k == 4
 
                         inspected = await session.call_tool(
                             "inspect_candidates", {"ids": ["result_1"]}
@@ -353,6 +580,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert similar.is_error is False
                         assert similar.structured_content["results"][0]["id"] == "result_2"
+                        assert similar.structured_content["coverage"]["candidate_pages"] == 1
+                        assert similar.structured_content["coverage"]["returned_pages"] == 1
 
                         rendered = await session.call_tool(
                             "render_search_results", {"ids": ["result_1"]}
@@ -389,12 +618,57 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert "Selected mechanism pages" in resource_contents.contents[0].text
                         assert resource_contents.contents[0].meta["ui"]["prefersBorder"] is False
 
-                        sources = await session.call_tool("list_sources", {"team": "254"})
+                        sources = await session.call_tool("list_sources", {"team_numbers": [254]})
                         assert sources.is_error is False
                         assert sources.structured_content["sources"][0]["team"] == "254"
+                        assert sources.structured_content["sources"][0]["source_id"] == "254-2020"
+                        assert (
+                            sources.structured_content["sources"][0]["source_version_id"]
+                            == "254-2020@version-a"
+                        )
+                        assert sources.structured_content["coverage_found"] is True
+                        assert sources.structured_content["total_matching_sources"] == 1
+                        assert sources.structured_content["truncated"] is False
                         assert sources.structured_content["sources"][0]["sample_image_urls"] == [
                             "https://api.example.com/images/254-2020/page-012/page.png"
                         ]
+                        assert sources.structured_content["sources"][0]["text_count"] == 3
+                        assert sources.structured_content["sources"][0]["page_image_count"] == 2
+                        assert (
+                            sources.structured_content["sources"][0]["extracted_image_count"] == 1
+                        )
+                        cached_sources = await session.call_tool(
+                            "list_sources", {"team_numbers": [254]}
+                        )
+                        assert cached_sources.is_error is False
+                        assert len(backend.list_source_calls) == 1
+                        queried_sources = await session.call_tool(
+                            "list_sources",
+                            {"team_numbers": [254], "source_query": "2020"},
+                        )
+                        assert queried_sources.is_error is False
+                        assert queried_sources.structured_content["coverage_found"] is True
+                        assert len(backend.list_source_calls) == 1
+
+                        filtered_sources = await session.call_tool(
+                            "list_sources",
+                            {
+                                "team_numbers": [4414],
+                                "years": [2024],
+                                "source_ids": ["4414-2024"],
+                                "source_query": "4414",
+                            },
+                        )
+                        assert filtered_sources.is_error is False
+                        assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
+                        assert filtered_sources.structured_content["sources"][0]["year"] == 2024
+                        assert len(backend.list_source_calls) == 2
+                        assert backend.list_source_calls[-1] == {
+                            "team_numbers": ["4414"],
+                            "years": [2024],
+                            "source_ids": ["4414-2024"],
+                            "source_query": None,
+                        }
 
                         invalid = await session.call_tool(
                             "find_similar", {"id": "result_1", "top_k": 21}

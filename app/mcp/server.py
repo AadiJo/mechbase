@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Annotated, Protocol
 from urllib.parse import urlparse
 
@@ -10,12 +11,15 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Annotations, CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
+from qdrant_client.http.exceptions import ApiException, ResponseHandlingException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
+from app.mcp.cache import TTLCache
 from app.mcp.images import load_preview_image
 from app.mcp.results import (
+    AppliedSearchFilters,
     FetchOutput,
     InspectOutput,
     RenderOutput,
@@ -31,9 +35,14 @@ from app.mcp.widget import SELECTED_RESULTS_WIDGET_HTML, SELECTED_RESULTS_WIDGET
 from app.rag.config import Settings
 from app.rag.models import (
     ImageContextResponse,
+    MechanismTypeFilter,
+    SearchRequest,
     SearchResponse,
+    SearchSort,
     SimilarPagesResponse,
+    SourceIdFilter,
     SourceListResponse,
+    SourceSummary,
 )
 from app.rag.search import search as rag_search
 from app.rag.store import RagStore
@@ -45,10 +54,15 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,
 )
 MODEL_ONLY = Annotations(audience=["assistant"], priority=1.0)
+LOGGER = logging.getLogger(__name__)
+TeamNumber = Annotated[int, Field(ge=1, le=99999)]
+SeasonYear = Annotated[int, Field(ge=1992, le=2100)]
+SourceId = SourceIdFilter
+MechanismType = MechanismTypeFilter
 
 
 class RetrievalBackend(Protocol):
-    def search(self, query: str, top_k: int) -> SearchResponse: ...
+    def search(self, request: SearchRequest) -> SearchResponse: ...
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
 
@@ -57,33 +71,64 @@ class RetrievalBackend(Protocol):
     def list_sources(
         self,
         *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
     ) -> SourceListResponse: ...
+
+    def corpus_revision(self) -> str: ...
 
 
 class RagRetrievalBackend:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._store = RagStore(settings)
+        self._last_revision = "unknown"
 
-    def search(self, query: str, top_k: int) -> SearchResponse:
-        return rag_search(query, top_k=top_k, debug=False, settings=self._settings)
+    def search(self, request: SearchRequest) -> SearchResponse:
+        return rag_search(
+            request.query,
+            top_k=request.top_k,
+            debug=False,
+            settings=self._settings,
+            team_numbers=request.team_numbers,
+            years=request.years,
+            source_ids=request.source_ids,
+            mechanism_types=request.mechanism_types,
+            sort=request.sort,
+            store=self._store,
+        )
+
+    def corpus_revision(self) -> str:
+        try:
+            revision = self._store.corpus_revision()
+        except (ApiException, ResponseHandlingException):
+            LOGGER.warning("Could not refresh the Qdrant corpus revision; using the last value.")
+            return self._last_revision
+        self._last_revision = revision
+        return revision
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
-        return RagStore(self._settings).image_context(result_id=result_id)
+        return self._store.image_context(result_id=result_id)
 
     def find_similar(self, result_id: str, top_k: int) -> SimilarPagesResponse | None:
-        return RagStore(self._settings).similar_from_result_id(result_id, top_k)
+        return self._store.similar_from_result_id(result_id, top_k)
 
     def list_sources(
         self,
         *,
-        team: str | None,
-        year: int | None,
-        source: str | None,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
     ) -> SourceListResponse:
-        return RagStore(self._settings).list_sources(team=team, year=year, source=source)
+        return self._store.list_sources(
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
+            source_query=source_query,
+        )
 
 
 def create_mcp_server(
@@ -120,6 +165,8 @@ def create_mcp_server(
         token_verifier=verifier,
     )
     public_base_url = str(settings.mcp_public_base_url)
+    search_cache: TTLCache[str, SearchResponse] = TTLCache(ttl_seconds=15 * 60)
+    source_cache: TTLCache[str, SourceListResponse] = TTLCache(ttl_seconds=5 * 60)
     parsed_public_url = urlparse(public_base_url)
     public_origin = f"{parsed_public_url.scheme}://{parsed_public_url.netloc}"
 
@@ -156,20 +203,55 @@ def create_mcp_server(
     @server.tool(
         title="Search FRC mechanisms",
         description=(
-            "Search FRC technical binders for mechanism designs and return stable result ids "
-            "with citation URLs. Always follow a non-empty search with inspect_candidates on the "
-            "most promising ids before answering, even when the user only asks to find or search "
-            "Mechbase and does not mention images. After visual review, display relevant pages "
-            "only through render_search_results."
+            "Search FRC technical binders for mechanism designs. Use team_numbers, years, and "
+            "source_ids whenever the user names exact teams, seasons, or binders. "
+            "mechanism_types add semantic search terms; they are not exact metadata filters. "
+            "The sort option orders relevant candidates and does not measure design quality or "
+            "competition performance. Always follow a non-empty search with inspect_candidates "
+            "on the most promising ids before answering. After visual review, display relevant "
+            "pages only through render_search_results."
         ),
         annotations=READ_ONLY,
         structured_output=True,
     )
-    def search(query: str) -> SearchOutput:
+    def search(
+        query: Annotated[str, Field(max_length=500)],
+        team_numbers: Annotated[list[TeamNumber], Field(max_length=20)] | None = None,
+        years: Annotated[list[SeasonYear], Field(max_length=20)] | None = None,
+        source_ids: Annotated[list[SourceId], Field(max_length=20)] | None = None,
+        mechanism_types: Annotated[list[MechanismType], Field(max_length=8)] | None = None,
+        sort: SearchSort = "relevance",
+        top_k: Annotated[int | None, Field(ge=1, le=20)] = None,
+    ) -> SearchOutput:
+        filters = AppliedSearchFilters(
+            team_numbers=[str(team) for team in dict.fromkeys(team_numbers or [])],
+            years=list(dict.fromkeys(years or [])),
+            source_ids=list(dict.fromkeys(source_ids or [])),
+            mechanism_types=list(dict.fromkeys(mechanism_types or [])),
+            sort=sort,
+        )
         if not query.strip():
-            return SearchOutput(results=[])
-        response = retrieval.search(query.strip(), settings.mcp_search_top_k)
-        return search_output(response.results, public_base_url)
+            return SearchOutput(
+                results=[],
+                applied_filters=filters,
+                abstention_reason="The query was empty.",
+            )
+        request = SearchRequest(
+            query=query.strip(),
+            top_k=top_k or settings.mcp_search_top_k,
+            team_numbers=filters.team_numbers,
+            years=filters.years,
+            source_ids=filters.source_ids,
+            mechanism_types=filters.mechanism_types,
+            sort=filters.sort,
+        )
+        cache_key = f"{retrieval.corpus_revision()}:{request.model_dump_json()}"
+        response = search_cache.get_or_compute(cache_key, lambda: retrieval.search(request))
+        return search_output(
+            response,
+            public_base_url,
+            applied_filters=filters,
+        )
 
     @server.tool(
         title="Inspect FRC mechanism candidate images",
@@ -283,7 +365,19 @@ def create_mcp_server(
         response = retrieval.find_similar(id, top_k)
         if response is None:
             raise ValueError(f"No result found for id {id!r}.")
-        return search_output(response.results, public_base_url)
+        return search_output(
+            SearchResponse(
+                query="",
+                results=response.results,
+                coverage=response.coverage,
+                abstention_reason=(
+                    None
+                    if response.results
+                    else "No similar pages met the calibrated relevance threshold."
+                ),
+            ),
+            public_base_url,
+        )
 
     @server.tool(
         title="Display selected FRC mechanism pages",
@@ -324,20 +418,67 @@ def create_mcp_server(
 
     @server.tool(
         title="List indexed FRC binders",
-        description="List indexed technical binders, optionally filtered by team, year, or filename.",
+        description=(
+            "List indexed technical binders and their text and image coverage. Use exact team, "
+            "year, or source-id filters to check whether Mechbase covers a request "
+            "before substituting results from another team or season. source_query performs a "
+            "case-insensitive filename and source-id substring match without an embedding call."
+        ),
         annotations=READ_ONLY,
         structured_output=True,
     )
     def list_sources(
-        team: str | None = None,
-        year: int | None = None,
-        source: str | None = None,
+        team_numbers: Annotated[list[TeamNumber], Field(max_length=50)] | None = None,
+        years: Annotated[list[SeasonYear], Field(max_length=35)] | None = None,
+        source_ids: Annotated[list[SourceId], Field(max_length=50)] | None = None,
+        source_query: Annotated[str | None, Field(min_length=1, max_length=160)] = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
     ) -> SourceOutput:
-        response = retrieval.list_sources(team=team, year=year, source=source)
-        return source_output(response.sources[:limit], public_base_url)
+        teams = [str(value) for value in dict.fromkeys(team_numbers or [])]
+        normalized_years = list(dict.fromkeys(years or []))
+        normalized_source_ids = list(dict.fromkeys(source_ids or []))
+        normalized_source_query = source_query.strip() if source_query else None
+        corpus_revision = retrieval.corpus_revision()
+        cache_key = repr(
+            (
+                corpus_revision,
+                teams,
+                normalized_years,
+                normalized_source_ids,
+            )
+        )
+        response = source_cache.get_or_compute(
+            cache_key,
+            lambda: retrieval.list_sources(
+                team_numbers=teams,
+                years=normalized_years,
+                source_ids=normalized_source_ids,
+            ),
+        )
+        sources = _filter_source_query(response.sources, normalized_source_query)
+        return source_output(
+            sources[:limit],
+            public_base_url,
+            total_matching_sources=len(sources),
+        )
 
     return server
+
+
+def _filter_source_query(
+    sources: list[SourceSummary],
+    source_query: str | None,
+) -> list[SourceSummary]:
+    if source_query is None:
+        return sources
+    needle = source_query.casefold()
+    return [
+        source
+        for source in sources
+        if needle in source.source_id.casefold()
+        or needle in source.source_pdf.casefold()
+        or needle in source.source_version_id.casefold()
+    ]
 
 
 def create_mcp_http_app(server: MCPServer, settings: Settings) -> ASGIApp:

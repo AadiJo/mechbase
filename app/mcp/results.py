@@ -3,17 +3,59 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, JsonValue
 
 from app.mcp.images import preview_image_url
-from app.rag.models import ImageContextResponse, SearchResult, SourceSummary
+from app.rag.models import (
+    ImageContextResponse,
+    ScoreBand,
+    SearchCoverage,
+    SearchResponse,
+    SearchResult,
+    SearchSort,
+    SourceSummary,
+)
+
+
+class EvidenceClassification(BaseModel):
+    direct_source_text: bool
+    visible_image: bool
+    missing: list[str] = Field(default_factory=list)
 
 
 class SearchItem(BaseModel):
     id: str
     title: str
     url: str
+    source_id: str
+    source_version_id: str
+    source_version: str | None = None
+    ingestion_id: str | None = None
+    source_pdf: str
+    team: str | None = None
+    year: int | None = None
+    page: int
+    snippet: str = ""
+    score_band: ScoreBand
+    evidence: EvidenceClassification
+
+
+class AppliedSearchFilters(BaseModel):
+    team_numbers: list[str] = Field(default_factory=list)
+    years: list[int] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    mechanism_types: list[str] = Field(default_factory=list)
+    sort: SearchSort = "relevance"
 
 
 class SearchOutput(BaseModel):
     results: list[SearchItem]
+    applied_filters: AppliedSearchFilters = Field(default_factory=AppliedSearchFilters)
+    coverage: SearchCoverage = Field(default_factory=SearchCoverage)
+    abstention_reason: str | None = None
+    evidence_limits: list[str] = Field(
+        default_factory=lambda: [
+            "Binder evidence does not independently verify competition performance.",
+            "Vector relevance does not establish comparative design quality.",
+        ]
+    )
 
 
 class FetchOutput(BaseModel):
@@ -25,16 +67,28 @@ class FetchOutput(BaseModel):
 
 
 class SourceItem(BaseModel):
+    source_id: str
+    source_version_id: str
+    source_version: str | None = None
+    ingestion_id: str | None = None
     source_pdf: str
     team: str | None = None
     year: int | None = None
     pages: list[int] = Field(default_factory=list)
     page_count: int
+    text_count: int
+    page_image_count: int
+    extracted_image_count: int
     sample_image_urls: list[str] = Field(default_factory=list)
+    ingested_at: str | None = None
+    source_url: str | None = None
 
 
 class SourceOutput(BaseModel):
     sources: list[SourceItem]
+    coverage_found: bool
+    total_matching_sources: int
+    truncated: bool
 
 
 class VisualCandidate(BaseModel):
@@ -70,17 +124,51 @@ class RenderOutput(BaseModel):
     results: list[RenderItem]
 
 
-def search_output(results: list[SearchResult], public_base_url: str) -> SearchOutput:
+def search_output(
+    response: SearchResponse,
+    public_base_url: str,
+    *,
+    applied_filters: AppliedSearchFilters | None = None,
+) -> SearchOutput:
+    items = [
+        SearchItem(
+            id=result.id,
+            title=_result_title(result.source_pdf, result.page, result.team),
+            url=_result_url(result, public_base_url),
+            source_id=result.source_id,
+            source_version=result.source_version,
+            source_version_id=result.source_version_id,
+            ingestion_id=result.ingestion_id,
+            source_pdf=result.source_pdf,
+            team=result.team,
+            year=result.year,
+            page=result.page,
+            snippet=_truncate(result.text.strip(), 500),
+            score_band=result.score_band,
+            evidence=EvidenceClassification(
+                direct_source_text=bool(result.text.strip()),
+                visible_image=bool(result.artifact_url or result.linked_artifact_urls),
+                missing=[
+                    label
+                    for missing, label in (
+                        (not result.text.strip(), "direct source text"),
+                        (
+                            not (result.artifact_url or result.linked_artifact_urls),
+                            "visible image evidence",
+                        ),
+                    )
+                    if missing
+                ],
+            ),
+        )
+        for result in response.results
+        if result.id
+    ]
     return SearchOutput(
-        results=[
-            SearchItem(
-                id=result.id,
-                title=_result_title(result.source_pdf, result.page, result.team),
-                url=_result_url(result, public_base_url),
-            )
-            for result in results
-            if result.id
-        ]
+        results=items,
+        applied_filters=applied_filters or AppliedSearchFilters(),
+        coverage=response.coverage.model_copy(update={"returned_pages": len(items)}),
+        abstention_reason=response.abstention_reason,
     )
 
 
@@ -98,6 +186,10 @@ def fetch_output(
         text=context.text,
         url=canonical_url,
         metadata={
+            "source_id": context.source_id,
+            "source_version": context.source_version,
+            "source_version_id": context.source_version_id,
+            "ingestion_id": context.ingestion_id,
             "source_pdf": context.source_pdf,
             "team": context.team,
             "year": context.year,
@@ -110,21 +202,36 @@ def fetch_output(
 def source_output(
     sources: list[SourceSummary],
     public_base_url: str,
+    *,
+    total_matching_sources: int | None = None,
 ) -> SourceOutput:
+    total = len(sources) if total_matching_sources is None else total_matching_sources
     return SourceOutput(
         sources=[
             SourceItem(
+                source_id=source.source_id,
+                source_version=source.source_version,
+                source_version_id=source.source_version_id,
+                ingestion_id=source.ingestion_id,
                 source_pdf=source.source_pdf,
                 team=source.team,
                 year=source.year,
                 pages=source.pages,
                 page_count=source.page_count,
+                text_count=source.text_count,
+                page_image_count=source.page_image_count,
+                extracted_image_count=source.extracted_image_count,
                 sample_image_urls=[
                     _absolute_url(public_base_url, url) for url in source.sample_image_urls
                 ],
+                ingested_at=source.ingested_at,
+                source_url=source.source_url,
             )
             for source in sources
-        ]
+        ],
+        coverage_found=total > 0,
+        total_matching_sources=total,
+        truncated=len(sources) < total,
     )
 
 

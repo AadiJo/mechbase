@@ -1,15 +1,19 @@
+import asyncio
+import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import RedirectResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 
 from app.api.auth import ApiKeyContext, record_usage, require_api_key
 from app.mcp.server import create_mcp_http_app, create_mcp_server
-from app.rag.config import get_settings
+from app.rag.config import Settings, get_settings
+from app.rag.ingest import control_state_lock, migrate_legacy_control_state
 from app.rag.models import (
     ImageContextResponse,
     PageContextResponse,
@@ -27,26 +31,89 @@ from app.rag.store import RagStore
 from app.rag.voyage_client import MissingVoyageApiKey
 
 settings = get_settings()
+LOGGER = logging.getLogger(__name__)
 mcp_server = create_mcp_server(settings)
 mcp_http_app = create_mcp_http_app(mcp_server, settings)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await prepare_control_state_async(settings)
+    await _ensure_payload_indexes()
     async with mcp_server.session_manager.run():
         yield
+
+
+def prepare_control_state(current_settings: Settings) -> None:
+    with control_state_lock(current_settings, blocking=True):
+        migrate_legacy_control_state(current_settings)
+
+
+async def prepare_control_state_async(current_settings: Settings) -> None:
+    await _run_blocking_safely(partial(prepare_control_state, current_settings))
+
+
+async def _ensure_payload_indexes() -> None:
+    """Create declared Qdrant indexes before accepting traffic."""
+    store = RagStore(settings)
+    try:
+        await _run_blocking_safely(store.ensure_payload_indexes)
+    except Exception:
+        LOGGER.warning("Could not ensure Qdrant payload indexes during startup.", exc_info=True)
+    finally:
+        try:
+            store.client.close()
+        except Exception:
+            LOGGER.warning("Could not close the startup Qdrant client.", exc_info=True)
+
+
+async def _run_blocking_safely(operation: Callable[[], object]) -> None:
+    worker = asyncio.create_task(asyncio.to_thread(operation))
+    cancellation: asyncio.CancelledError | None = None
+    worker_error: BaseException | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+        except BaseException as exc:
+            worker_error = exc
+            break
+    if cancellation is not None:
+        if not worker.cancelled():
+            worker.exception()
+        raise cancellation
+    if worker_error is not None:
+        raise worker_error
+    worker.result()
+
+
+PRIVATE_ARTIFACT_ROOTS = frozenset(
+    {"active-generations.json", "ingestion-manifest.jsonl", "ingestion.lock"}
+)
+
+
+class ArtifactStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        path_parts = path.split("/")
+        if any(part.startswith(".") or part in PRIVATE_ARTIFACT_ROOTS for part in path_parts):
+            return PlainTextResponse("Not Found", status_code=404)
+        return await super().get_response(path, scope)
 
 
 app = FastAPI(title="FRC Mechanism RAG", version="0.1.0", lifespan=lifespan)
 app.mount(
     settings.artifact_url_base,
-    StaticFiles(directory=settings.artifact_dir, check_dir=False),
+    ArtifactStaticFiles(directory=settings.artifact_dir, check_dir=False),
     name="images",
 )
 if settings.artifact_url_base != "/artifacts":
     app.mount(
         "/artifacts",
-        StaticFiles(directory=settings.artifact_dir, check_dir=False),
+        ArtifactStaticFiles(directory=settings.artifact_dir, check_dir=False),
         name="artifacts",
     )
 
@@ -96,6 +163,11 @@ def search_endpoint(
             team=request.team,
             year=request.year,
             source=request.source,
+            team_numbers=request.team_numbers,
+            years=request.years,
+            source_ids=request.source_ids,
+            mechanism_types=request.mechanism_types,
+            sort=request.sort,
             modality=request.modality,
         )
     except MissingVoyageApiKey as exc:
@@ -140,8 +212,11 @@ def search_sources(
     source_matches = []
     for source_item in sources.sources[: request.top_k]:
         page = source_item.pages[0] if source_item.pages else 0
+        context_url, text_url = _source_page_urls(source_item, page)
         source_matches.append(
             {
+                "source_version_id": source_item.source_version_id,
+                "ingestion_id": source_item.ingestion_id,
                 "source_pdf": source_item.source_pdf,
                 "team": source_item.team,
                 "year": source_item.year,
@@ -149,12 +224,8 @@ def search_sources(
                 "score": 1.0,
                 "best_snippets": [],
                 "image_urls": source_item.sample_image_urls,
-                "page_context_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}"
-                if page
-                else "",
-                "page_text_url": f"/pages/{quote(source_item.source_pdf, safe='')}/{page}/text"
-                if page
-                else "",
+                "page_context_url": context_url,
+                "page_text_url": text_url,
             }
         )
     return SourceSearchResponse(query=None, matches=source_matches)
@@ -176,7 +247,7 @@ def similar_pages(
     result_id: str | None = None,
     source_pdf: str | None = None,
     page: int | None = None,
-    top_k: int = 10,
+    top_k: int = Query(default=10, ge=1, le=20),
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> SimilarPagesResponse:
     store = RagStore(get_settings())
@@ -209,9 +280,13 @@ def image_context(
 def page_context(
     source_pdf: str,
     page: int,
+    source_version_id: str | None = None,
+    ingestion_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageContextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page)
+    context = RagStore(get_settings()).page_context(
+        source_pdf, page, source_version_id, ingestion_id
+    )
     if context is None:
         raise HTTPException(status_code=404, detail="Page context not found.")
     return context
@@ -221,9 +296,13 @@ def page_context(
 def page_text(
     source_pdf: str,
     page: int,
+    source_version_id: str | None = None,
+    ingestion_id: str | None = None,
     _api_key: ApiKeyContext = Depends(require_api_key),
 ) -> PageTextResponse:
-    context = RagStore(get_settings()).page_context(source_pdf, page)
+    context = RagStore(get_settings()).page_context(
+        source_pdf, page, source_version_id, ingestion_id
+    )
     if context is None or not context.text.strip():
         raise HTTPException(status_code=404, detail="Page text not found.")
     return PageTextResponse(source_pdf=source_pdf, page=page, text=context.text)
@@ -233,6 +312,13 @@ def page_text(
 def init_collection(_api_key: ApiKeyContext = Depends(require_api_key)) -> dict:
     RagStore(get_settings()).ensure_collection()
     return {"ok": True}
+
+
+def _source_page_urls(source: SourceSummary, page: int) -> tuple[str, str]:
+    if not page:
+        return "", ""
+    path = f"/pages/{quote(source.source_pdf, safe='')}/{page}"
+    return path, f"{path}/text"
 
 
 @app.get("/.well-known/oauth-authorization-server", include_in_schema=False)

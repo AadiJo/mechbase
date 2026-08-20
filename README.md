@@ -23,6 +23,9 @@ docker compose run --rm ingest python -m app.rag.ingest --data-dir /app/data --l
 docker compose up api
 ```
 
+Optionally add `data/sources.json` as a filename-to-URL map so ingestion can preserve original
+HTTP or HTTPS source URLs.
+
 Search:
 
 ```bash
@@ -47,14 +50,18 @@ The MCP endpoint accepts Clerk OAuth access tokens only.
 
 The server provides six read-only tools:
 
-- `search(query)` returns the standard ChatGPT company-knowledge result shape.
+- `search(...)` searches mechanisms with optional team, year, source, mechanism, sort, and
+  result-count controls. Results include stable source IDs, evidence classification, calibrated
+  score bands, coverage, and an abstention reason when no page is relevant enough.
 - `inspect_candidates(ids)` returns labeled MCP image content and extracted page text so the
   model can check visual relevance before anything is displayed.
 - `fetch(id)` returns full page text, source metadata, and absolute citation URLs.
 - `find_similar(id, top_k)` finds related mechanism pages.
 - `render_search_results(ids)` displays only model-selected pages in an inline image rail on MCP
   hosts that support MCP Apps. Other clients still receive its structured result.
-- `list_sources(...)` lists indexed technical binders.
+- `list_sources(...)` lists indexed technical binders with exact metadata filters, source-name
+  search, stable logical IDs plus content versions, provenance when known, and complete text and
+  image coverage counts.
 
 Every non-empty mechanism search uses `search` -> `inspect_candidates` ->
 `render_search_results`, even when the user does not explicitly ask to inspect or display images.
@@ -69,7 +76,12 @@ MCP_OAUTH_SCOPES=openid
 MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://claude.ai
 CLERK_OAUTH_ISSUER_URL=https://clerk.example.com
 CLERK_SECRET_KEY=sk_live_...
+SEARCH_MIN_SCORE=0.35
+RAG_STATE_DIR=/private/mechbase-rag-state
 ```
+
+`RAG_STATE_DIR` stores ingestion locks, manifests, and active-generation pointers outside the
+public artifact directory. When omitted, it defaults to a hidden sibling of `ARTIFACT_DIR`.
 
 In the same Clerk instance, enable Dynamic client registration and set its default scope to
 `openid`. Some MCP clients, including ChatGPT and Claude, omit scopes when they register. The
@@ -89,10 +101,11 @@ In ChatGPT developer mode, refresh the plugin connection after changing tool nam
 descriptions, schemas, annotations, authentication, or UI resources. Then start a new chat.
 Backend-only changes that preserve the advertised MCP metadata do not require a refresh.
 
-Fetch a page image through the API/VPS:
+Fetch a page image through the API/VPS using an `artifact_url` returned by `search` or a
+`sample_image_url` returned by `list_sources`:
 
 ```bash
-curl -I http://localhost:8000/images/694-2020/page-019/page.png
+curl -I "$ARTIFACT_URL"
 ```
 
 Fetch all known context for a page:
@@ -129,3 +142,7 @@ Run the starter retrieval eval:
 docker compose run --rm ingest python -m app.rag.eval \
   --eval-file /app/evals/frc_mechanism_eval.json --top-k 5
 ```
+
+The eval includes positive recall cases and unrelated-query abstention cases. Tune
+`SEARCH_MIN_SCORE` against the indexed corpus; the floor applies to the raw vector score before
+the lexical ranking bonus.

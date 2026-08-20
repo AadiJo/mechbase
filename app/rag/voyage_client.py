@@ -4,9 +4,9 @@ import time
 from pathlib import Path
 
 import httpx
-from PIL import Image
 
 from app.rag.config import Settings
+from app.rag.image_cache import cached_resized_image
 
 
 class MissingVoyageApiKey(RuntimeError):
@@ -55,11 +55,17 @@ class VoyageEmbedder:
                     {
                         "type": "image_base64",
                         "image_base64": _data_url(
-                            _embedding_image(Path(image_path), self.settings.max_embed_image_side)
+                            cached_resized_image(
+                                Path(image_path),
+                                self.settings.max_embed_image_side,
+                                self.settings.artifact_dir / ".embedding-cache",
+                            )
                         ),
                     }
                 )
-            inputs.append({"content": content or [{"type": "text", "text": "FRC robot mechanism image"}]})
+            inputs.append(
+                {"content": content or [{"type": "text", "text": "FRC robot mechanism image"}]}
+            )
         response = self._post(
             "/multimodalembeddings",
             {
@@ -95,16 +101,3 @@ def _data_url(path: Path) -> str:
     if media_type == "image/jpg":
         media_type = "image/jpeg"
     return f"data:{media_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
-
-
-def _embedding_image(path: Path, max_side: int) -> Path:
-    cache_dir = path.parent / ".embed"
-    cache_dir.mkdir(exist_ok=True)
-    out = cache_dir / f"{path.stem}-{max_side}.jpg"
-    if out.exists():
-        return out
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        image.thumbnail((max_side, max_side))
-        image.save(out, "JPEG", quality=82, optimize=True)
-    return out

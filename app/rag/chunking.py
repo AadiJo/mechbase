@@ -4,20 +4,51 @@ MECHANISM_TERMS = {
     "shooter": ["launcher", "flywheel", "hood", "turret", "drum shooter", "multi lane"],
     "intake": ["collector", "acquire", "floor pickup", "feeder"],
     "indexer": ["serializer", "conveyor", "hopper", "magazine"],
-    "climber": ["hang", "trap", "cage", "winch"],
+    "climber": ["hang", "winch"],
     "end effector": ["grabber", "manipulator", "wrist", "scorer"],
     "elevator": ["lift", "arm", "extension"],
 }
 
+SEASON_MECHANISM_TERMS = {
+    2024: {"climber": ["trap", "stage chain"]},
+    2025: {"climber": ["cage", "deep cage", "shallow cage"]},
+}
+MULTI_PIECE_TERMS = {
+    2019: ["cargo", "two cargo", "three cargo"],
+    2020: ["power cell", "two ball", "three ball"],
+    2022: ["cargo", "two ball", "three ball"],
+    2024: ["multi note", "two note", "three note"],
+}
 
-def expand_query(query: str) -> str:
+
+def expand_query(query: str, years: list[int] | None = None) -> str:
+    """Add generic aliases plus only the game-specific aliases valid for explicit seasons.
+
+    An omitted year is a broad historical search and uses every known season alias. An explicit
+    unlisted year deliberately keeps only generic terms rather than importing terminology from an
+    unrelated game.
+    """
     lowered = query.lower()
     extra: list[str] = []
+    mechanism_years = SEASON_MECHANISM_TERMS if years is None else years
     for key, synonyms in MECHANISM_TERMS.items():
-        if key in lowered or any(s in lowered for s in synonyms):
+        season_synonyms = {
+            term
+            for season_terms in SEASON_MECHANISM_TERMS.values()
+            for term in season_terms.get(key, [])
+        }
+        if key in lowered or any(term in lowered for term in [*synonyms, *season_synonyms]):
             extra.extend([key, *synonyms])
+            for year in mechanism_years:
+                extra.extend(SEASON_MECHANISM_TERMS.get(year, {}).get(key, []))
     if "multi ball" in lowered:
-        extra.extend(["multi note", "two ball", "three ball", "cargo", "power cell", "shooter"])
+        extra.append("shooter")
+        # Unknown explicit seasons must not borrow game-piece names from other games.
+        multi_piece_years = MULTI_PIECE_TERMS if years is None else years
+        selected_terms = [
+            term for year in multi_piece_years for term in MULTI_PIECE_TERMS.get(year, [])
+        ]
+        extra.extend(selected_terms)
     return " ".join([query, *dict.fromkeys(extra)])
 
 

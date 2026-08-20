@@ -1,6 +1,12 @@
+import json
+import os
 import re
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
-from urllib.parse import quote
+from typing import TypeVar
+from urllib.parse import quote, unquote, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import QdrantClient, models
@@ -10,6 +16,8 @@ from app.rag.models import (
     ImageContextResponse,
     PageContextResponse,
     RagDocument,
+    ScoreBand,
+    SearchCoverage,
     SearchRequest,
     SearchResult,
     SimilarPagesResponse,
@@ -18,41 +26,290 @@ from app.rag.models import (
     SourceSummary,
 )
 
-
 TEXT_VECTOR = "text"
 IMAGE_VECTOR = "image"
+MAX_RETRIEVAL_PAGES = 20
+ACTIVE_GENERATIONS_FILE = "active-generations.json"
+LEGACY_GENERATION = "__legacy__"
+ReadValue = TypeVar("ReadValue")
+SOURCE_SUMMARY_FIELDS = [
+    "source_id",
+    "source_version",
+    "source_version_id",
+    "ingestion_id",
+    "source_pdf",
+    "team",
+    "year",
+    "page",
+    "modality",
+    "artifact_path",
+    "ingested_at",
+    "source_url",
+]
+PAYLOAD_INDEXES = {
+    "id": models.PayloadSchemaType.KEYWORD,
+    "team": models.PayloadSchemaType.KEYWORD,
+    "year": models.PayloadSchemaType.INTEGER,
+    "source_id": models.PayloadSchemaType.KEYWORD,
+    "source_version": models.PayloadSchemaType.KEYWORD,
+    "source_version_id": models.PayloadSchemaType.KEYWORD,
+    "ingestion_id": models.PayloadSchemaType.KEYWORD,
+    "is_staged": models.PayloadSchemaType.BOOL,
+    "source_pdf": models.PayloadSchemaType.KEYWORD,
+    "modality": models.PayloadSchemaType.KEYWORD,
+    "artifact_path": models.PayloadSchemaType.KEYWORD,
+    "linked_artifacts": models.PayloadSchemaType.KEYWORD,
+}
+
+
+@dataclass
+class _SourceAccumulator:
+    source_id: str
+    source_version: str | None
+    source_version_id: str
+    ingestion_id: str | None
+    source_pdf: str
+    team: str | None
+    year: int | None
+    ingested_at: str | None
+    source_url: str | None
+    pages: set[int] = field(default_factory=set)
+    text_count: int = 0
+    page_image_count: int = 0
+    extracted_image_count: int = 0
+    sample_image_urls: list[str] = field(default_factory=list)
 
 
 class RagStore:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, client: QdrantClient | None = None):
         self.settings = settings
-        self.client = QdrantClient(url=settings.qdrant_url)
+        self.client = client or QdrantClient(
+            url=settings.qdrant_url,
+            timeout=settings.qdrant_timeout_seconds,
+        )
 
     def ensure_collection(self) -> None:
         existing = {collection.name for collection in self.client.get_collections().collections}
-        if self.settings.collection_name in existing:
-            return
-        vector_params = models.VectorParams(
-            size=self.settings.embedding_dim,
-            distance=models.Distance.COSINE,
-        )
-        self.client.create_collection(
-            collection_name=self.settings.collection_name,
-            vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
-        )
+        if self.settings.collection_name not in existing:
+            vector_params = models.VectorParams(
+                size=self.settings.embedding_dim,
+                distance=models.Distance.COSINE,
+            )
+            self.client.create_collection(
+                collection_name=self.settings.collection_name,
+                vectors_config={TEXT_VECTOR: vector_params, IMAGE_VECTOR: vector_params},
+            )
 
-    def upsert(self, docs: list[RagDocument], text_vectors: list[list[float]], image_vectors: list[list[float]]) -> None:
+        self.ensure_payload_indexes()
+
+    def ensure_payload_indexes(self) -> bool:
+        existing = {collection.name for collection in self.client.get_collections().collections}
+        if self.settings.collection_name not in existing:
+            return False
+
+        collection = self.client.get_collection(self.settings.collection_name)
+        indexed_fields = set((getattr(collection, "payload_schema", None) or {}).keys())
+        for field_name, field_schema in PAYLOAD_INDEXES.items():
+            if field_name in indexed_fields:
+                continue
+            self.client.create_payload_index(
+                collection_name=self.settings.collection_name,
+                field_name=field_name,
+                field_schema=field_schema,
+                wait=True,
+            )
+        return True
+
+    def corpus_revision(self) -> str:
+        self.client.get_collection(self.settings.collection_name)
+        manifest_path = self.settings.rag_state_dir / "ingestion-manifest.jsonl"
+        active_path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
+        try:
+            manifest = manifest_path.stat()
+            manifest_revision = f"{manifest.st_mtime_ns}:{manifest.st_size}"
+        except FileNotFoundError:
+            manifest_revision = "missing"
+        try:
+            active_revision = sha256(active_path.read_bytes()).hexdigest()[:16]
+        except FileNotFoundError:
+            active_revision = "missing"
+        return f"{manifest_revision}:{active_revision}"
+
+    def active_generations(self) -> dict[str, str]:
+        path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(raw, dict) or not all(
+            isinstance(source_id, str) and isinstance(ingestion_id, str)
+            for source_id, ingestion_id in raw.items()
+        ):
+            raise ValueError(f"{path} must contain a string-to-string JSON object.")
+        return raw
+
+    def set_active_generation(self, source_id: str, ingestion_id: str) -> None:
+        active = self.active_generations()
+        active[source_id] = ingestion_id
+        path = self.settings.rag_state_dir / ACTIVE_GENERATIONS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f".{path.name}.{ingestion_id}.tmp")
+        with temporary_path.open("w", encoding="utf-8") as output:
+            json.dump(active, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def initialize_active_generation(self, source_id: str) -> None:
+        active = self.active_generations()
+        if source_id in active:
+            return
+        payloads = self._scroll_payloads(
+            _active_filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    )
+                ]
+            ),
+            limit=None,
+        )
+        if payloads:
+            generation = _latest_generation(payloads)
+            current_payload = next(
+                payload for payload in payloads if _generation_key(payload) == generation
+            )
+            ingestion_id = current_payload.get("ingestion_id") or LEGACY_GENERATION
+        else:
+            ingestion_id = LEGACY_GENERATION
+        self.set_active_generation(source_id, str(ingestion_id))
+
+    def _read_with_active_snapshot(
+        self,
+        read: Callable[[dict[str, str]], ReadValue],
+    ) -> tuple[ReadValue, dict[str, str]]:
+        for _attempt in range(3):
+            active = self.active_generations()
+            value = read(active)
+            if active == self.active_generations():
+                return value, active
+        raise RuntimeError("The active source generation changed repeatedly; retry the read.")
+
+    def upsert(
+        self,
+        docs: list[RagDocument],
+        text_vectors: list[list[float]],
+        image_vectors: list[list[float]],
+    ) -> None:
         points: list[models.PointStruct] = []
         for doc, text_vector, image_vector in zip(docs, text_vectors, image_vectors, strict=True):
             points.append(
                 models.PointStruct(
-                    id=str(uuid5(NAMESPACE_URL, doc.id)),
+                    id=str(uuid5(NAMESPACE_URL, doc.storage_id or doc.id)),
                     vector={TEXT_VECTOR: text_vector, IMAGE_VECTOR: image_vector},
                     payload=doc.model_dump(),
                 )
             )
         if points:
-            self.client.upsert(collection_name=self.settings.collection_name, points=points, wait=True)
+            self.client.upsert(
+                collection_name=self.settings.collection_name, points=points, wait=True
+            )
+
+    def delete_superseded_source_generations(
+        self,
+        source_id: str,
+        ingestion_id: str,
+    ) -> None:
+        self.client.delete(
+            collection_name=self.settings.collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source_id",
+                            match=models.MatchValue(value=source_id),
+                        )
+                    ],
+                    must_not=[
+                        models.FieldCondition(
+                            key="ingestion_id",
+                            match=models.MatchValue(value=ingestion_id),
+                        )
+                    ],
+                )
+            ),
+            wait=True,
+        )
+
+    def delete_source_generation(self, source_id: str, ingestion_id: str) -> None:
+        self.client.delete(
+            collection_name=self.settings.collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source_id",
+                            match=models.MatchValue(value=source_id),
+                        ),
+                        models.FieldCondition(
+                            key="ingestion_id",
+                            match=models.MatchValue(value=ingestion_id),
+                        ),
+                    ]
+                )
+            ),
+            wait=True,
+        )
+
+    def publish_source_generation(self, source_id: str, ingestion_id: str) -> None:
+        self.client.set_payload(
+            collection_name=self.settings.collection_name,
+            payload={"is_staged": False},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    ),
+                    models.FieldCondition(
+                        key="ingestion_id",
+                        match=models.MatchValue(value=ingestion_id),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+
+    def retire_superseded_source_generations(
+        self,
+        source_id: str,
+        ingestion_id: str,
+    ) -> None:
+        self.client.set_payload(
+            collection_name=self.settings.collection_name,
+            payload={"is_staged": True},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=source_id),
+                    )
+                ],
+                must_not=[
+                    models.FieldCondition(
+                        key="ingestion_id",
+                        match=models.MatchValue(value=ingestion_id),
+                    )
+                ],
+            ),
+            wait=True,
+        )
 
     def search(
         self,
@@ -60,66 +317,148 @@ class RagStore:
         text_vector: list[float],
         image_vector: list[float],
         expanded_query: str,
-    ) -> list[SearchResult]:
-        qfilter = _build_filter(request)
-        limit = max(request.top_k * 3, request.top_k)
-        text_hits = self.client.query_points(
-            collection_name=self.settings.collection_name,
-            query=text_vector,
-            using=TEXT_VECTOR,
-            query_filter=qfilter,
-            limit=limit,
-            with_payload=True,
-        ).points
-        image_hits = self.client.query_points(
-            collection_name=self.settings.collection_name,
-            query=image_vector,
-            using=IMAGE_VECTOR,
-            query_filter=qfilter,
-            limit=limit,
-            with_payload=True,
-        ).points
+    ) -> tuple[list[SearchResult], SearchCoverage]:
+        limit = max(request.top_k * 12, 60)
+        (text_hits, image_hits), active_generations = self._read_with_active_snapshot(
+            lambda active: (
+                self.client.query_points(
+                    collection_name=self.settings.collection_name,
+                    query=text_vector,
+                    using=TEXT_VECTOR,
+                    query_filter=_build_filter(request, active),
+                    limit=limit,
+                    with_payload=True,
+                ).points,
+                self.client.query_points(
+                    collection_name=self.settings.collection_name,
+                    query=image_vector,
+                    using=IMAGE_VECTOR,
+                    query_filter=_build_filter(request, active),
+                    limit=limit,
+                    with_payload=True,
+                ).points,
+            )
+        )
         merged: dict[str, tuple[float, dict, dict]] = {}
         for source, hits in [("text", text_hits), ("image", image_hits)]:
             for hit in hits:
+                point_id = str(hit.id)
                 payload = dict(hit.payload or {})
+                if not _is_current_generation(payload, active_generations):
+                    continue
                 lexical = _lexical_bonus(expanded_query, payload.get("text", ""))
-                score = float(hit.score) + lexical
-                if hit.id not in merged or score > merged[hit.id][0]:
-                    merged[hit.id] = (
+                vector_score = float(hit.score)
+                score = vector_score + lexical
+                existing = merged.get(point_id)
+                max_vector_score = max(
+                    vector_score,
+                    float(existing[2]["max_vector_score"]) if existing else vector_score,
+                )
+                if existing is None or score > existing[0]:
+                    merged[point_id] = (
                         score,
                         payload,
-                        {"vector_source": source, "vector_score": float(hit.score), "lexical_bonus": lexical},
+                        {
+                            "vector_source": source,
+                            "vector_score": vector_score,
+                            "max_vector_score": max_vector_score,
+                            "lexical_bonus": lexical,
+                        },
                     )
+                else:
+                    existing[2]["max_vector_score"] = max_vector_score
         ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
-        results: list[SearchResult] = []
-        seen_pages: set[tuple[str, int]] = set()
-        for point_id, (score, payload, debug) in ranked:
-            page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
-            if page_key in seen_pages:
+        candidate_pages: set[tuple[str, int]] = set()
+        candidate_sources: set[str] = set()
+        relevant_pages: set[tuple[str, int]] = set()
+        ranked_results: list[SearchResult] = []
+        for _point_id, (score, payload, debug) in ranked:
+            page_key = _page_key(payload)
+            source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+            candidate_pages.add(page_key)
+            candidate_sources.add(source_id)
+            vector_score = float(debug["max_vector_score"])
+            if vector_score < self.settings.search_min_score or page_key in relevant_pages:
                 continue
-            seen_pages.add(page_key)
-            results.append(self._search_result_from_payload(payload, score, debug if request.debug else {}))
-            if len(results) >= request.top_k:
-                break
-        return results
+            relevant_pages.add(page_key)
+            ranked_results.append(
+                self._search_result_from_payload(
+                    payload,
+                    score,
+                    debug if request.debug else {},
+                    band_score=vector_score,
+                )
+            )
 
+        weak_pages_dropped = len(candidate_pages - relevant_pages)
 
-    def page_context(self, source_pdf: str, page: int) -> PageContextResponse | None:
-        hits, _ = self.client.scroll(
-            collection_name=self.settings.collection_name,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
-                    models.FieldCondition(key="page", match=models.MatchValue(value=page)),
-                ]
-            ),
-            limit=256,
-            with_payload=True,
+        if request.sort == "newest":
+            ranked_results.sort(
+                key=lambda result: (
+                    result.year is not None,
+                    result.year or 0,
+                    result.score,
+                ),
+                reverse=True,
+            )
+        elif request.sort == "oldest":
+            ranked_results.sort(
+                key=lambda result: (
+                    result.year is None,
+                    result.year or 0,
+                    -result.score,
+                )
+            )
+        results = ranked_results[: request.top_k]
+        return results, SearchCoverage(
+            candidate_pages=len(candidate_pages),
+            candidate_sources=len(candidate_sources),
+            weak_pages_dropped=weak_pages_dropped,
+            returned_pages=len(results),
+            candidate_window_truncated=(len(text_hits) == limit or len(image_hits) == limit),
         )
-        payloads = [dict(hit.payload or {}) for hit in hits]
+
+    def page_context(
+        self,
+        source_pdf: str,
+        page: int,
+        source_version_id: str | None = None,
+        ingestion_id: str | None = None,
+    ) -> PageContextResponse | None:
+        conditions = [
+            models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
+            models.FieldCondition(key="page", match=models.MatchValue(value=page)),
+        ]
+        if source_version_id:
+            conditions.append(
+                models.FieldCondition(
+                    key="source_version_id",
+                    match=models.MatchValue(value=source_version_id),
+                )
+            )
+        if ingestion_id:
+            conditions.append(
+                models.FieldCondition(
+                    key="ingestion_id",
+                    match=models.MatchValue(value=ingestion_id),
+                )
+            )
+        payloads, active_generations = self._read_with_active_snapshot(
+            lambda active: self._scroll_payloads(
+                _active_filter(must=conditions, active_generations=active),
+                limit=None,
+            )
+        )
+        payloads = [
+            payload for payload in payloads if _is_current_generation(payload, active_generations)
+        ]
         if not payloads:
             return None
+        if ingestion_id is None:
+            selected_generation = _latest_generation(payloads)
+            payloads = [
+                payload for payload in payloads if _generation_key(payload) == selected_generation
+            ]
 
         text_payloads = [p for p in payloads if p.get("modality") == "text" and p.get("text")]
         if text_payloads:
@@ -145,6 +484,10 @@ class RagStore:
 
         first = payloads[0]
         return PageContextResponse(
+            source_id=first.get("source_id"),
+            source_version=first.get("source_version"),
+            source_version_id=first.get("source_version_id"),
+            ingestion_id=first.get("ingestion_id"),
             source_pdf=source_pdf,
             team=first.get("team"),
             year=first.get("year"),
@@ -156,30 +499,80 @@ class RagStore:
             result_ids=[payload.get("id", "") for payload in payloads if payload.get("id")],
         )
 
-
     def list_sources(
         self,
         team: str | None = None,
         year: int | None = None,
         source: str | None = None,
+        team_numbers: list[str] | None = None,
+        years: list[int] | None = None,
+        source_ids: list[str] | None = None,
+        source_query: str | None = None,
     ) -> SourceListResponse:
-        payloads = self._scroll_payloads(_metadata_filter(team=team, year=year, source=source), limit=10000)
-        return SourceListResponse(sources=self._summarize_sources(payloads))
+        payloads, active_generations = self._read_with_active_snapshot(
+            lambda active: list(
+                self._iter_source_payloads(
+                    _metadata_filter(
+                        team=team,
+                        year=year,
+                        source=source,
+                        team_numbers=team_numbers,
+                        years=years,
+                        source_ids=source_ids,
+                        active_generations=active,
+                    )
+                )
+            )
+        )
+        current_payloads = (
+            payload for payload in payloads if _is_current_generation(payload, active_generations)
+        )
+        summaries = _latest_source_summaries(self._summarize_sources(current_payloads))
+        if source_query:
+            needle = source_query.casefold()
+            summaries = [
+                summary
+                for summary in summaries
+                if needle in summary.source_id.casefold()
+                or needle in summary.source_pdf.casefold()
+                or needle in summary.source_version_id.casefold()
+            ]
+        return SourceListResponse(sources=summaries)
 
     def source_summary(self, source_pdf: str) -> SourceSummary | None:
-        payloads = self._scroll_payloads(_metadata_filter(source=source_pdf), limit=10000)
-        summaries = self._summarize_sources(payloads)
-        return summaries[0] if summaries else None
+        payloads, active_generations = self._read_with_active_snapshot(
+            lambda active: list(
+                self._iter_source_payloads(
+                    _metadata_filter(source=source_pdf, active_generations=active)
+                )
+            )
+        )
+        current_payloads = (
+            payload for payload in payloads if _is_current_generation(payload, active_generations)
+        )
+        summaries = self._summarize_sources(current_payloads)
+        return (
+            max(
+                summaries,
+                key=lambda summary: (summary.ingested_at or "", summary.ingestion_id or ""),
+            )
+            if summaries
+            else None
+        )
 
-    def source_search_from_results(self, query: str | None, results: list[SearchResult]) -> list[SourcePageMatch]:
+    def source_search_from_results(
+        self, query: str | None, results: list[SearchResult]
+    ) -> list[SourcePageMatch]:
         grouped: dict[tuple[str, int], SourcePageMatch] = {}
         for result in results:
-            key = (result.source_pdf, result.page)
+            key = (result.ingestion_id or result.source_version_id, result.page)
             existing = grouped.get(key)
             snippet = result.text[:500] if result.text else ""
             image_urls = [url for url in [result.artifact_url, *result.linked_artifact_urls] if url]
             if existing is None:
                 grouped[key] = SourcePageMatch(
+                    source_version_id=result.source_version_id,
+                    ingestion_id=result.ingestion_id,
                     source_pdf=result.source_pdf,
                     team=result.team,
                     year=result.year,
@@ -192,7 +585,11 @@ class RagStore:
                 )
                 continue
             existing.score = max(existing.score, result.score)
-            if snippet and snippet not in existing.best_snippets and len(existing.best_snippets) < 3:
+            if (
+                snippet
+                and snippet not in existing.best_snippets
+                and len(existing.best_snippets) < 3
+            ):
                 existing.best_snippets.append(snippet)
             existing.image_urls = list(dict.fromkeys([*existing.image_urls, *image_urls]))
         return sorted(grouped.values(), key=lambda match: match.score, reverse=True)
@@ -201,24 +598,38 @@ class RagStore:
         payload, vectors = self._payload_and_vectors_for_result_id(result_id)
         if payload is None or vectors is None:
             return None
-        vector_name = IMAGE_VECTOR if payload.get("modality") in {"page_image", "extracted_image"} else TEXT_VECTOR
+        vector_name = (
+            IMAGE_VECTOR
+            if payload.get("modality") in {"page_image", "extracted_image"}
+            else TEXT_VECTOR
+        )
         vector = vectors.get(vector_name)
         if vector is None:
             return None
         return self._similar_from_vector(vector_name, vector, top_k, payload)
 
-    def similar_from_page(self, source_pdf: str, page: int, top_k: int) -> SimilarPagesResponse | None:
-        payloads = self._scroll_payloads(
-            models.Filter(
-                must=[
-                    models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
-                    models.FieldCondition(key="page", match=models.MatchValue(value=page)),
-                    models.FieldCondition(key="modality", match=models.MatchValue(value="text")),
-                ]
-            ),
-            limit=1,
-            with_vectors=True,
+    def similar_from_page(
+        self, source_pdf: str, page: int, top_k: int
+    ) -> SimilarPagesResponse | None:
+        conditions = [
+            models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source_pdf)),
+            models.FieldCondition(key="page", match=models.MatchValue(value=page)),
+            models.FieldCondition(key="modality", match=models.MatchValue(value="text")),
+        ]
+        payloads, active_generations = self._read_with_active_snapshot(
+            lambda active: self._scroll_payloads(
+                _active_filter(must=conditions, active_generations=active),
+                limit=None,
+                with_vectors=True,
+            )
         )
+        if not payloads:
+            return None
+        payloads = [
+            (payload, vectors)
+            for payload, vectors in payloads
+            if _is_current_generation(payload, active_generations)
+        ]
         if not payloads:
             return None
         payload, vectors = payloads[0]
@@ -238,26 +649,47 @@ class RagStore:
         elif image_url:
             artifact_path = self._artifact_path_from_url(image_url)
             if artifact_path:
-                payloads = self._scroll_payloads(
-                    models.Filter(
-                        should=[
-                            models.FieldCondition(key="artifact_path", match=models.MatchValue(value=artifact_path)),
-                            models.FieldCondition(key="linked_artifacts", match=models.MatchAny(any=[artifact_path])),
-                        ]
+                artifact_conditions = [
+                    models.FieldCondition(
+                        key="artifact_path", match=models.MatchValue(value=artifact_path)
                     ),
-                    limit=1,
+                    models.FieldCondition(
+                        key="linked_artifacts", match=models.MatchAny(any=[artifact_path])
+                    ),
+                ]
+                payloads, active_generations = self._read_with_active_snapshot(
+                    lambda active: self._scroll_payloads(
+                        _active_filter(
+                            should=artifact_conditions,
+                            active_generations=active,
+                        ),
+                        limit=None,
+                    )
                 )
-                payload = payloads[0] if payloads else None
+                payload = next(
+                    (
+                        candidate
+                        for candidate in payloads
+                        if _is_current_generation(candidate, active_generations)
+                    ),
+                    None,
+                )
         if payload is None:
             return None
         source_pdf = payload.get("source_pdf", "")
         page = int(payload.get("page", 0))
-        context = self.page_context(source_pdf, page)
+        source_version_id = payload.get("source_version_id")
+        ingestion_id = payload.get("ingestion_id")
+        context = self.page_context(source_pdf, page, source_version_id, ingestion_id)
         if context is None:
             return None
         return ImageContextResponse(
             result_id=payload.get("id"),
             image_url=self._artifact_url(payload.get("artifact_path")) or image_url,
+            source_id=payload.get("source_id"),
+            source_version=payload.get("source_version"),
+            source_version_id=source_version_id,
+            ingestion_id=ingestion_id,
             source_pdf=source_pdf,
             team=payload.get("team"),
             year=payload.get("year"),
@@ -276,25 +708,47 @@ class RagStore:
         top_k: int,
         seed_payload: dict,
     ) -> SimilarPagesResponse:
-        hits = self.client.query_points(
-            collection_name=self.settings.collection_name,
-            query=vector,
-            using=vector_name,
-            limit=max(top_k * 4, top_k + 5),
-            with_payload=True,
-        ).points
+        top_k = min(max(top_k, 1), MAX_RETRIEVAL_PAGES)
+        limit = max(top_k * 12, 60)
+        hits, active_generations = self._read_with_active_snapshot(
+            lambda active: (
+                self.client.query_points(
+                    collection_name=self.settings.collection_name,
+                    query=vector,
+                    using=vector_name,
+                    query_filter=_active_filter(active_generations=active),
+                    limit=limit,
+                    with_payload=True,
+                ).points
+            )
+        )
         results: list[SearchResult] = []
+        candidate_pages: set[tuple[str, int]] = set()
+        candidate_sources: set[str] = set()
+        relevant_pages: set[tuple[str, int]] = set()
         seen_pages: set[tuple[str, int]] = set()
-        seed_page = (seed_payload.get("source_pdf", ""), int(seed_payload.get("page", 0)))
+        seed_page = _page_key(seed_payload)
         for hit in hits:
             payload = dict(hit.payload or {})
-            page_key = (payload.get("source_pdf", ""), int(payload.get("page", 0)))
-            if page_key == seed_page or page_key in seen_pages:
+            if not _is_current_generation(payload, active_generations):
                 continue
+            page_key = _page_key(payload)
+            if page_key == seed_page:
+                continue
+            candidate_pages.add(page_key)
+            candidate_sources.add(
+                str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+            )
+            if float(hit.score) < self.settings.search_min_score or page_key in seen_pages:
+                continue
+            relevant_pages.add(page_key)
             seen_pages.add(page_key)
-            results.append(self._search_result_from_payload(payload, float(hit.score), {"vector_source": vector_name}))
-            if len(results) >= top_k:
-                break
+            if len(results) < top_k:
+                results.append(
+                    self._search_result_from_payload(
+                        payload, float(hit.score), {"vector_source": vector_name}
+                    )
+                )
         return SimilarPagesResponse(
             seed={
                 "id": seed_payload.get("id"),
@@ -303,12 +757,38 @@ class RagStore:
                 "modality": seed_payload.get("modality"),
             },
             results=results,
+            coverage=SearchCoverage(
+                candidate_pages=len(candidate_pages),
+                candidate_sources=len(candidate_sources),
+                weak_pages_dropped=len(candidate_pages - relevant_pages),
+                returned_pages=len(results),
+                candidate_window_truncated=len(hits) == limit,
+            ),
         )
 
-    def _search_result_from_payload(self, payload: dict, score: float, debug: dict | None = None) -> SearchResult:
+    def _search_result_from_payload(
+        self,
+        payload: dict,
+        score: float,
+        debug: dict | None = None,
+        *,
+        band_score: float | None = None,
+    ) -> SearchResult:
         return SearchResult(
             id=str(payload.get("id") or ""),
             score=score,
+            score_band=_score_band(
+                score if band_score is None else band_score,
+                self.settings.search_min_score,
+            ),
+            source_id=str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem),
+            source_version=payload.get("source_version"),
+            source_version_id=str(
+                payload.get("source_version_id")
+                or payload.get("source_id")
+                or Path(payload.get("source_pdf", "")).stem
+            ),
+            ingestion_id=payload.get("ingestion_id"),
             source_pdf=payload.get("source_pdf", ""),
             team=payload.get("team"),
             year=payload.get("year"),
@@ -319,29 +799,74 @@ class RagStore:
             artifact_url=self._artifact_url(payload.get("artifact_path")),
             linked_artifacts=payload.get("linked_artifacts") or [],
             linked_artifact_urls=[
-                url for path in payload.get("linked_artifacts") or [] if (url := self._artifact_url(path))
+                url
+                for path in payload.get("linked_artifacts") or []
+                if (url := self._artifact_url(path))
             ],
-            page_context_url=self._page_context_url(payload.get("source_pdf", ""), int(payload.get("page", 0))),
-            page_text_url=self._page_text_url(payload.get("source_pdf", ""), int(payload.get("page", 0))),
+            page_context_url=self._page_context_url(
+                payload.get("source_pdf", ""),
+                int(payload.get("page", 0)),
+            ),
+            page_text_url=self._page_text_url(
+                payload.get("source_pdf", ""),
+                int(payload.get("page", 0)),
+            ),
             debug=debug or {},
         )
 
     def _payload_and_vectors_for_result_id(self, result_id: str) -> tuple[dict | None, dict | None]:
-        points = self.client.retrieve(
-            collection_name=self.settings.collection_name,
-            ids=[str(uuid5(NAMESPACE_URL, result_id))],
-            with_payload=True,
-            with_vectors=True,
+        conditions = [
+            models.FieldCondition(
+                key="id",
+                match=models.MatchValue(value=result_id),
+            )
+        ]
+        matches, active_generations = self._read_with_active_snapshot(
+            lambda active: self._scroll_payloads(
+                _active_filter(must=conditions, active_generations=active),
+                limit=None,
+                with_vectors=True,
+            )
         )
-        if not points:
+        if not matches:
             return None, None
-        point = points[0]
-        return dict(point.payload or {}), dict(point.vector or {})
+        matches = [
+            (payload, vectors)
+            for payload, vectors in matches
+            if _is_current_generation(payload, active_generations)
+        ]
+        if not matches:
+            return None, None
+        latest_generation = _latest_generation(payload for payload, _vectors in matches)
+        return next(
+            (payload, vectors)
+            for payload, vectors in matches
+            if _generation_key(payload) == latest_generation
+        )
+
+    def _iter_source_payloads(
+        self,
+        qfilter: models.Filter | None,
+    ) -> Iterator[dict]:
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.settings.collection_name,
+                scroll_filter=qfilter,
+                limit=1024,
+                offset=offset,
+                with_payload=SOURCE_SUMMARY_FIELDS,
+                with_vectors=False,
+            )
+            for point in points:
+                yield dict(point.payload or {})
+            if offset is None:
+                return
 
     def _scroll_payloads(
         self,
         qfilter: models.Filter | None,
-        limit: int,
+        limit: int | None,
         with_vectors: bool = False,
     ):
         output = []
@@ -350,7 +875,7 @@ class RagStore:
             points, offset = self.client.scroll(
                 collection_name=self.settings.collection_name,
                 scroll_filter=qfilter,
-                limit=min(limit - len(output), 256),
+                limit=min(limit - len(output), 256) if limit is not None else 256,
                 offset=offset,
                 with_payload=True,
                 with_vectors=with_vectors,
@@ -361,47 +886,99 @@ class RagStore:
                     output.append((payload, dict(point.vector or {})))
                 else:
                     output.append(payload)
-            if offset is None or len(output) >= limit:
+            if offset is None or (limit is not None and len(output) >= limit):
                 return output
 
-    def _summarize_sources(self, payloads: list[dict]) -> list[SourceSummary]:
-        grouped: dict[str, list[dict]] = {}
+    def _summarize_sources(self, payloads: Iterable[dict]) -> list[SourceSummary]:
+        grouped: dict[tuple[str, str], _SourceAccumulator] = {}
         for payload in payloads:
-            grouped.setdefault(payload.get("source_pdf", ""), []).append(payload)
+            source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+            source_version_id = str(payload.get("source_version_id") or source_id)
+            ingestion_id = payload.get("ingestion_id")
+            generation_key = (source_id, str(ingestion_id or source_version_id))
+            accumulator = grouped.get(generation_key)
+            if accumulator is None:
+                accumulator = _SourceAccumulator(
+                    source_id=source_id,
+                    source_version=payload.get("source_version"),
+                    source_version_id=source_version_id,
+                    ingestion_id=ingestion_id,
+                    source_pdf=payload.get("source_pdf", ""),
+                    team=payload.get("team"),
+                    year=payload.get("year"),
+                    ingested_at=payload.get("ingested_at"),
+                    source_url=payload.get("source_url"),
+                )
+                grouped[generation_key] = accumulator
+            accumulator.source_version = accumulator.source_version or payload.get("source_version")
+            accumulator.source_url = accumulator.source_url or payload.get("source_url")
+            accumulator.team = accumulator.team or payload.get("team")
+            accumulator.year = accumulator.year or payload.get("year")
+            incoming_ingested_at = payload.get("ingested_at")
+            if incoming_ingested_at and (
+                accumulator.ingested_at is None or incoming_ingested_at > accumulator.ingested_at
+            ):
+                accumulator.ingested_at = incoming_ingested_at
+            page = int(payload.get("page", 0))
+            if page:
+                accumulator.pages.add(page)
+            modality = payload.get("modality")
+            if modality == "text":
+                accumulator.text_count += 1
+            elif modality == "page_image":
+                accumulator.page_image_count += 1
+            elif modality == "extracted_image":
+                accumulator.extracted_image_count += 1
+            url = self._artifact_url(payload.get("artifact_path"))
+            if (
+                url
+                and url not in accumulator.sample_image_urls
+                and len(accumulator.sample_image_urls) < 5
+            ):
+                accumulator.sample_image_urls.append(url)
+
         summaries = []
-        for source_pdf, items in grouped.items():
-            pages = sorted({int(item.get("page", 0)) for item in items if item.get("page")})
-            modality_counts = {"text": 0, "page_image": 0, "extracted_image": 0}
-            sample_image_urls = []
-            for item in items:
-                modality = item.get("modality")
-                if modality in modality_counts:
-                    modality_counts[modality] += 1
-                url = self._artifact_url(item.get("artifact_path"))
-                if url and url not in sample_image_urls and len(sample_image_urls) < 5:
-                    sample_image_urls.append(url)
-            first = items[0]
+        for accumulator in grouped.values():
+            pages = sorted(accumulator.pages)
             summaries.append(
                 SourceSummary(
-                    source_pdf=source_pdf,
-                    team=first.get("team"),
-                    year=first.get("year"),
+                    source_id=accumulator.source_id,
+                    source_version=accumulator.source_version,
+                    source_version_id=accumulator.source_version_id,
+                    ingestion_id=accumulator.ingestion_id,
+                    source_pdf=accumulator.source_pdf,
+                    team=accumulator.team,
+                    year=accumulator.year,
                     pages=pages,
                     page_count=len(pages),
-                    text_count=modality_counts["text"],
-                    page_image_count=modality_counts["page_image"],
-                    extracted_image_count=modality_counts["extracted_image"],
-                    sample_image_urls=sample_image_urls,
+                    text_count=accumulator.text_count,
+                    page_image_count=accumulator.page_image_count,
+                    extracted_image_count=accumulator.extracted_image_count,
+                    sample_image_urls=accumulator.sample_image_urls,
+                    ingested_at=accumulator.ingested_at,
+                    source_url=accumulator.source_url,
                 )
             )
-        return sorted(summaries, key=lambda item: (item.team or "", item.year or 0, item.source_pdf))
+        return sorted(
+            summaries, key=lambda item: (item.team or "", item.year or 0, item.source_pdf)
+        )
 
     def _artifact_path_from_url(self, image_url: str) -> str | None:
-        prefixes = [self.settings.artifact_url_base.rstrip("/"), "/artifacts"]
+        request_path = unquote(urlsplit(image_url).path)
+        prefixes = [
+            urlsplit(self.settings.artifact_url_base).path.rstrip("/"),
+            "/artifacts",
+        ]
         for prefix in prefixes:
-            if image_url.startswith(prefix + "/"):
-                rel = image_url.removeprefix(prefix + "/")
-                return str((self.settings.artifact_dir / rel).resolve())
+            if request_path.startswith(prefix + "/"):
+                rel = request_path.removeprefix(prefix + "/")
+                artifact_root = self.settings.artifact_dir.resolve()
+                candidate = (artifact_root / rel).resolve()
+                try:
+                    candidate.relative_to(artifact_root)
+                except ValueError:
+                    return None
+                return str(candidate)
         return None
 
     def _artifact_url(self, artifact_path: str | None) -> str | None:
@@ -411,12 +988,21 @@ class RagStore:
             rel = Path(artifact_path).resolve().relative_to(self.settings.artifact_dir.resolve())
         except ValueError:
             return None
-        return f"{self.settings.artifact_url_base.rstrip('/')}/{rel.as_posix()}"
+        encoded_path = quote(rel.as_posix(), safe="/")
+        return f"{self.settings.artifact_url_base.rstrip('/')}/{encoded_path}"
 
-    def _page_context_url(self, source_pdf: str, page: int) -> str:
+    def _page_context_url(
+        self,
+        source_pdf: str,
+        page: int,
+    ) -> str:
         return f"/pages/{quote(source_pdf, safe='')}/{page}"
 
-    def _page_text_url(self, source_pdf: str, page: int) -> str:
+    def _page_text_url(
+        self,
+        source_pdf: str,
+        page: int,
+    ) -> str:
         return f"/pages/{quote(source_pdf, safe='')}/{page}/text"
 
 
@@ -424,27 +1010,109 @@ def _metadata_filter(
     team: str | None = None,
     year: int | None = None,
     source: str | None = None,
-) -> models.Filter | None:
+    team_numbers: list[str] | None = None,
+    years: list[int] | None = None,
+    source_ids: list[str] | None = None,
+    active_generations: dict[str, str] | None = None,
+) -> models.Filter:
     conditions = []
-    if team:
-        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=team)))
-    if year:
-        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=year)))
+    normalized_teams = list(dict.fromkeys([*([team] if team else []), *(team_numbers or [])]))
+    if normalized_teams:
+        conditions.append(_match_values("team", normalized_teams))
+    normalized_years = list(dict.fromkeys([*([year] if year else []), *(years or [])]))
+    if normalized_years:
+        conditions.append(_match_values("year", normalized_years))
     if source:
-        conditions.append(models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source)))
-    return models.Filter(must=conditions) if conditions else None
+        conditions.append(
+            models.FieldCondition(key="source_pdf", match=models.MatchValue(value=source))
+        )
+    if source_ids:
+        conditions.append(_match_values("source_id", list(dict.fromkeys(source_ids))))
+    return _active_filter(must=conditions, active_generations=active_generations)
 
-def _build_filter(request: SearchRequest) -> models.Filter | None:
-    conditions = []
-    if request.team:
-        conditions.append(models.FieldCondition(key="team", match=models.MatchValue(value=request.team)))
-    if request.year:
-        conditions.append(models.FieldCondition(key="year", match=models.MatchValue(value=request.year)))
-    if request.source:
-        conditions.append(models.FieldCondition(key="source_pdf", match=models.MatchValue(value=request.source)))
+
+def _build_filter(
+    request: SearchRequest,
+    active_generations: dict[str, str] | None = None,
+) -> models.Filter:
+    metadata_filter = _metadata_filter(
+        team=request.team,
+        year=request.year,
+        source=request.source,
+        team_numbers=request.team_numbers,
+        years=request.years,
+        source_ids=request.source_ids,
+        active_generations=active_generations,
+    )
+    conditions = list(metadata_filter.must or [])
     if request.modality:
-        conditions.append(models.FieldCondition(key="modality", match=models.MatchValue(value=request.modality)))
-    return models.Filter(must=conditions) if conditions else None
+        conditions.append(
+            models.FieldCondition(key="modality", match=models.MatchValue(value=request.modality))
+        )
+    return models.Filter(must=conditions, must_not=metadata_filter.must_not)
+
+
+def _active_filter(
+    *,
+    must: list[models.Condition] | None = None,
+    should: list[models.Condition] | None = None,
+    active_generations: dict[str, str] | None = None,
+) -> models.Filter:
+    conditions = list(must or [])
+    if active_generations:
+        conditions.append(_active_generation_condition(active_generations))
+    return models.Filter(
+        must=conditions,
+        should=should,
+        must_not=[
+            models.FieldCondition(
+                key="is_staged",
+                match=models.MatchValue(value=True),
+            )
+        ],
+    )
+
+
+def _active_generation_condition(active_generations: dict[str, str]) -> models.Filter:
+    source_ids = list(active_generations)
+    branches: list[models.Condition] = []
+    ingestion_ids = [
+        ingestion_id
+        for ingestion_id in active_generations.values()
+        if ingestion_id != LEGACY_GENERATION
+    ]
+    if ingestion_ids:
+        branches.append(_match_values("ingestion_id", ingestion_ids))
+
+    legacy_source_ids = [
+        source_id
+        for source_id, ingestion_id in active_generations.items()
+        if ingestion_id == LEGACY_GENERATION
+    ]
+    if legacy_source_ids:
+        branches.append(
+            models.Filter(
+                must=[
+                    _match_values("source_id", legacy_source_ids),
+                    models.IsEmptyCondition(is_empty=models.PayloadField(key="ingestion_id")),
+                ]
+            )
+        )
+
+    # Sources not yet represented in the registry retain their pre-registry behavior.
+    branches.append(
+        models.FieldCondition(
+            key="source_id",
+            match=models.MatchExcept.model_validate({"except": source_ids}),
+        )
+    )
+    return models.Filter(should=branches)
+
+
+def _match_values(key: str, values: list[str] | list[int]) -> models.FieldCondition:
+    if len(values) == 1:
+        return models.FieldCondition(key=key, match=models.MatchValue(value=values[0]))
+    return models.FieldCondition(key=key, match=models.MatchAny(any=values))
 
 
 def _lexical_bonus(query: str, text: str) -> float:
@@ -456,6 +1124,68 @@ def _lexical_bonus(query: str, text: str) -> float:
     return min(0.2, matches * 0.015)
 
 
+def _score_band(score: float, minimum: float) -> ScoreBand:
+    if score >= minimum + 0.25:
+        return "strong"
+    if score >= minimum + 0.1:
+        return "good"
+    return "relevant"
+
+
 def _chunk_sort_key(payload: dict) -> tuple[int, str]:
+    chunk_index = payload.get("chunk_index")
+    if isinstance(chunk_index, int):
+        return chunk_index, str(payload.get("id", ""))
     match = re.search(r"_text_(\d+)$", str(payload.get("id", "")))
     return (int(match.group(1)) if match else 0, str(payload.get("id", "")))
+
+
+def _page_key(payload: dict) -> tuple[str, int]:
+    return _generation_key(payload), int(payload.get("page", 0))
+
+
+def _generation_key(payload: dict) -> str:
+    return str(
+        payload.get("ingestion_id")
+        or payload.get("source_version_id")
+        or payload.get("source_pdf", "")
+    )
+
+
+def _is_current_generation(payload: dict, active_generations: dict[str, str]) -> bool:
+    source_id = str(payload.get("source_id") or Path(payload.get("source_pdf", "")).stem)
+    active_ingestion = active_generations.get(source_id)
+    if active_ingestion is None:
+        return True
+    if active_ingestion == LEGACY_GENERATION:
+        return payload.get("ingestion_id") is None
+    return payload.get("ingestion_id") == active_ingestion
+
+
+def _latest_generation(payloads: Iterable[dict]) -> str:
+    ingested_at_by_generation: dict[str, str] = {}
+    for payload in payloads:
+        generation = _generation_key(payload)
+        ingested_at_by_generation[generation] = max(
+            ingested_at_by_generation.get(generation, ""),
+            str(payload.get("ingested_at") or ""),
+        )
+    return max(
+        ingested_at_by_generation,
+        key=lambda generation: (ingested_at_by_generation[generation], generation),
+    )
+
+
+def _latest_source_summaries(summaries: Iterable[SourceSummary]) -> list[SourceSummary]:
+    latest: dict[str, SourceSummary] = {}
+    for summary in summaries:
+        current = latest.get(summary.source_id)
+        if current is None or (
+            summary.ingested_at or "",
+            summary.ingestion_id or summary.source_version_id,
+        ) > (
+            current.ingested_at or "",
+            current.ingestion_id or current.source_version_id,
+        ):
+            latest[summary.source_id] = summary
+    return list(latest.values())
