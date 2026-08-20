@@ -35,15 +35,49 @@ def search(
         sort=sort,
         modality=modality,  # type: ignore[arg-type]
     )
+    return _execute_search(request, settings, store=store)
+
+
+def search_source_catalog(
+    query: str,
+    top_k: int,
+    settings: Settings,
+    *,
+    team_numbers: list[str],
+    years: list[int],
+    source_ids: list[str],
+    store: RagStore | None = None,
+) -> SearchResponse:
+    """Search a trusted source catalog without applying the connector's 20-ID input bound."""
+    request = SearchRequest(
+        query=query,
+        top_k=top_k,
+        team_numbers=team_numbers,
+        years=years,
+    )
+    return _execute_search(request, settings, store=store, source_ids=source_ids)
+
+
+def _execute_search(
+    request: SearchRequest,
+    settings: Settings,
+    *,
+    store: RagStore | None,
+    source_ids: list[str] | None = None,
+) -> SearchResponse:
     expanded = expand_query(
-        " ".join([query, *request.mechanism_types]),
+        " ".join([request.query, *request.mechanism_types]),
         _expansion_years(request),
     )
     embedder = VoyageEmbedder(settings)
     text_vector = embedder.embed_texts([expanded], "query")[0]
     image_vector = embedder.embed_multimodal([expanded], [None], "query")[0]
     results, coverage = (store or RagStore(settings)).search(
-        request, text_vector, image_vector, expanded
+        request,
+        text_vector,
+        image_vector,
+        expanded,
+        source_ids=source_ids,
     )
     abstention_reason = None
     if not results:
@@ -53,7 +87,7 @@ def search(
             else "No indexed pages matched this query and filter set."
         )
     return SearchResponse(
-        query=query,
+        query=request.query,
         results=results,
         coverage=coverage,
         abstention_reason=abstention_reason,

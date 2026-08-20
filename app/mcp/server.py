@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from functools import partial
 from typing import Annotated, Protocol
 from urllib.parse import urlparse
 
@@ -17,6 +18,14 @@ from starlette.types import ASGIApp
 
 from app.mcp.auth import ClerkTokenVerifier
 from app.mcp.cache import TTLCache
+from app.mcp.contexts import (
+    GameContextOutput,
+    GameTopic,
+    TeamContextOutput,
+    game_context,
+    team_research_targets,
+    team_web_queries,
+)
 from app.mcp.images import (
     CandidateAssetSource,
     PreviewImage,
@@ -62,6 +71,7 @@ from app.rag.models import (
     SourceSummary,
 )
 from app.rag.search import search as rag_search
+from app.rag.search import search_source_catalog as rag_search_source_catalog
 from app.rag.store import RagStore
 
 READ_ONLY = ToolAnnotations(
@@ -85,6 +95,16 @@ MAX_INSPECTION_ENCODED_BYTES = 8 * 1024 * 1024
 
 class RetrievalBackend(Protocol):
     def search(self, request: SearchRequest) -> SearchResponse: ...
+
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse: ...
 
     def fetch(self, result_id: str) -> ImageContextResponse | None: ...
 
@@ -153,6 +173,25 @@ class RagRetrievalBackend:
             source_ids=request.source_ids,
             mechanism_types=request.mechanism_types,
             sort=request.sort,
+            store=self._store,
+        )
+
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse:
+        return rag_search_source_catalog(
+            query,
+            top_k,
+            self._settings,
+            team_numbers=team_numbers,
+            years=years,
+            source_ids=source_ids,
             store=self._store,
         )
 
@@ -258,18 +297,21 @@ def create_mcp_server(
         title="Mechbase FRC Mechanism Search",
         description="Search and retrieve mechanism details from FRC technical binders.",
         instructions=(
-            "For every non-empty search or find_similar result, complete the visual selection "
-            "flow before answering, even when the user does not explicitly ask for images. Call "
+            "For every non-empty search, find_similar, or get_team_context mechanism_search "
+            "result, complete the visual selection flow before answering, even when the user does "
+            "not explicitly ask for images. Call "
             "inspect_candidates with promising result ids and judge the actual page images plus "
             "page text against the request. Never present inspection images directly or use them "
             "as final answer images. If at least one image is relevant, call "
             "render_search_results with the inspected result and asset ids. If none "
             "are relevant, do not call the render tool and say that no useful image was found. "
             "Use fetch only when complete page text is needed. Use browse_source for multi-page "
-            "evidence from the same binder; find_similar can return pages from other binders. All "
-            "tools are read-only."
+            "evidence from the same binder; find_similar can return pages from other binders. Use "
+            "get_game_context to ground season terminology. Use get_team_context for exact team "
+            "coverage and browse its public targets before making performance claims. All tools "
+            "are read-only."
         ),
-        version="0.4.0",
+        version="0.5.0",
         auth=AuthSettings(
             issuer_url=settings.clerk_oauth_issuer_url,
             required_scopes=settings.mcp_required_scopes,
@@ -916,6 +958,131 @@ def create_mcp_server(
             scanned_pages=len(pages_to_load),
             next_cursor=next_cursor,
             truncated=next_cursor is not None,
+        )
+
+    @server.tool(
+        title="Get reviewed FRC game context",
+        description=(
+            "Get reviewed, structured season terminology and mechanism-relevant game context "
+            "with citations to the official FIRST manual. Use this before interpreting historical "
+            "binder language or comparing mechanisms across games. Official summaries and "
+            "engineering interpretations are labeled separately. Request only the topics needed. "
+            "This summary is not a substitute for the official manual and explicitly reports "
+            "unsupported seasons or missing topics."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def get_game_context(
+        year: SeasonYear,
+        topics: Annotated[list[GameTopic] | None, Field(max_length=7)] = None,
+    ) -> GameContextOutput:
+        return game_context(year, list(dict.fromkeys(topics or [])))
+
+    @server.tool(
+        title="Get exact FRC team context",
+        description=(
+            "Resolve exact indexed binder coverage for one FRC team and optional season. When a "
+            "mechanism query is supplied, search only that team's matching indexed sources. This "
+            "tool does not fetch live competition performance. If the user asks about records, "
+            "rankings, awards, matches, or performance, browse and cite the returned public FIRST "
+            "Events and The Blue Alliance targets before answering. Do not infer performance from "
+            "binder content or infer mechanism causality from event results. When mechanism_search "
+            "returns results, call inspect_candidates. Render only inspected assets that are "
+            "relevant to the request; if none are useful, do not call render_search_results."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def get_team_context(
+        team_number: TeamNumber,
+        year: SeasonYear | None = None,
+        mechanism_query: Annotated[str | None, Field(min_length=1, max_length=500)] = None,
+        top_k: Annotated[int, Field(ge=1, le=20)] = 8,
+    ) -> TeamContextOutput:
+        team = str(team_number)
+        years = [year] if year is not None else []
+        query = None
+        if mechanism_query is not None:
+            query = mechanism_query.strip()
+            if not query:
+                raise ValueError("mechanism_query must contain non-whitespace text.")
+
+        for _attempt in range(3):
+            corpus_revision = retrieval.corpus_revision()
+            source_cache_key = repr((corpus_revision, [team], years, []))
+            catalog = source_cache.get_or_compute(
+                source_cache_key,
+                lambda: retrieval.list_sources(
+                    team_numbers=[team],
+                    years=years,
+                    source_ids=[],
+                ),
+            )
+            matching_sources = catalog.sources
+            indexed_sources = source_output(
+                matching_sources,
+                public_base_url,
+                total_matching_sources=len(matching_sources),
+            )
+            mechanism_search = None
+            filters = AppliedSearchFilters(
+                team_numbers=[team],
+                years=years,
+                source_ids=list(dict.fromkeys(source.source_id for source in matching_sources)),
+            )
+            if query is not None and matching_sources:
+                search_parameters = (
+                    query,
+                    top_k,
+                    filters.team_numbers,
+                    filters.years,
+                    filters.source_ids,
+                )
+                cache_key = repr((corpus_revision, "source-catalog", search_parameters))
+                run_search = partial(
+                    retrieval.search_source_catalog,
+                    query,
+                    top_k,
+                    team_numbers=filters.team_numbers,
+                    years=filters.years,
+                    source_ids=filters.source_ids,
+                )
+                response = search_cache.get_or_compute(
+                    cache_key,
+                    run_search,
+                )
+                mechanism_search = search_output(
+                    response,
+                    public_base_url,
+                    applied_filters=filters,
+                )
+            elif query is not None:
+                mechanism_search = SearchOutput(
+                    results=[],
+                    applied_filters=filters,
+                    abstention_reason=(
+                        "No indexed binder matches the requested team and season, so mechanism "
+                        "search was not run."
+                    ),
+                )
+
+            output = TeamContextOutput(
+                team_number=team_number,
+                year=year,
+                indexed_sources=indexed_sources,
+                mechanism_search=mechanism_search,
+                visual_review_required=bool(
+                    mechanism_search is not None and mechanism_search.results
+                ),
+                live_research_targets=team_research_targets(team_number, year),
+                suggested_web_queries=team_web_queries(team_number, year),
+            )
+            if retrieval.corpus_revision() == corpus_revision:
+                return output
+
+        raise ValueError(
+            "The indexed corpus changed repeatedly during this team lookup; retry the request."
         )
 
     return server

@@ -58,6 +58,7 @@ class FakeTokenVerifier:
 class FakeRetrievalBackend:
     def __init__(self) -> None:
         self.search_calls: list[SearchRequest] = []
+        self.source_catalog_search_calls: list[dict[str, object]] = []
         self.fetch_calls: list[str] = []
         self.fetch_context_calls: list[dict[str, object]] = []
         self.similar_calls: list[dict[str, object]] = []
@@ -68,6 +69,8 @@ class FakeRetrievalBackend:
         self.browse_context_calls: list[dict[str, object]] = []
         self.asset_generation: str | None = None
         self.extra_figure_names: list[str] = []
+        self.revision_sequence: list[str] = []
+        self.extra_sources: list[SourceSummary] = []
 
     def search(self, request: SearchRequest) -> SearchResponse:
         self.search_calls.append(request)
@@ -81,7 +84,37 @@ class FakeRetrievalBackend:
             ),
         )
 
+    def search_source_catalog(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        team_numbers: list[str],
+        years: list[int],
+        source_ids: list[str],
+    ) -> SearchResponse:
+        self.source_catalog_search_calls.append(
+            {
+                "query": query,
+                "top_k": top_k,
+                "team_numbers": team_numbers,
+                "years": years,
+                "source_ids": source_ids,
+            }
+        )
+        return SearchResponse(
+            query=query,
+            results=[_search_result("result_1", 12)],
+            coverage=SearchCoverage(
+                candidate_pages=1,
+                candidate_sources=1,
+                returned_pages=1,
+            ),
+        )
+
     def corpus_revision(self) -> str:
+        if self.revision_sequence:
+            return self.revision_sequence.pop(0)
         return "test-corpus-v1"
 
     def fetch(self, result_id: str) -> ImageContextResponse | None:
@@ -239,7 +272,7 @@ class FakeRetrievalBackend:
                 "source_query": source_query,
             }
         )
-        sources = self._catalog_sources()
+        sources = [*self._catalog_sources(), *self.extra_sources]
         needle = source_query.casefold() if source_query else None
         return SourceListResponse(
             sources=[
@@ -653,6 +686,8 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "render_search_results",
                             "list_sources",
                             "browse_source",
+                            "get_game_context",
+                            "get_team_context",
                         }
                         assert set(tools["search"].input_schema["properties"]) == {
                             "query",
@@ -682,6 +717,25 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                             "source_query",
                             "limit",
                         }
+                        assert set(tools["get_game_context"].input_schema["properties"]) == {
+                            "year",
+                            "topics",
+                        }
+                        assert set(tools["get_team_context"].input_schema["properties"]) == {
+                            "team_number",
+                            "year",
+                            "mechanism_query",
+                            "top_k",
+                        }
+                        assert "does not fetch live competition performance" in (
+                            tools["get_team_context"].description or ""
+                        )
+                        assert "Render only inspected assets that are relevant" in (
+                            tools["get_team_context"].description or ""
+                        )
+                        assert "if none are useful, do not call render_search_results" in (
+                            tools["get_team_context"].description or ""
+                        )
                         assert tools["inspect_candidates"].output_schema is None
                         assert "Always follow visual review with render_search_results" in (
                             tools["inspect_candidates"].description or ""
@@ -1211,6 +1265,177 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert cached_sources.is_error is False
                         assert len(backend.list_source_calls) == 1
 
+                        searches_before_game_context = len(backend.search_calls)
+                        game = await session.call_tool(
+                            "get_game_context",
+                            {
+                                "year": 2018,
+                                "topics": ["game_pieces", "endgame", "terminology"],
+                            },
+                        )
+                        assert game.is_error is False
+                        assert game.structured_content["game_name"] == "FIRST POWER UP"
+                        assert [fact["topic"] for fact in game.structured_content["facts"]] == [
+                            "game_pieces",
+                            "endgame",
+                            "terminology",
+                        ]
+                        assert all(
+                            fact["citation"]["url"].startswith(
+                                "https://firstfrc.blob.core.windows.net/"
+                            )
+                            for fact in game.structured_content["facts"]
+                        )
+                        assert [
+                            fact["evidence_kind"] for fact in game.structured_content["facts"]
+                        ] == [
+                            "official_summary",
+                            "official_summary",
+                            "engineering_interpretation",
+                        ]
+                        assert game.structured_content["coverage"]["supported"] is True
+                        assert len(backend.search_calls) == searches_before_game_context
+
+                        at_home_season = await session.call_tool(
+                            "get_game_context",
+                            {"year": 2021, "topics": ["scoring"]},
+                        )
+                        assert at_home_season.is_error is False
+                        assert at_home_season.structured_content["facts"] == []
+                        assert at_home_season.structured_content["coverage"]["supported"] is False
+                        assert at_home_season.structured_content["coverage"]["missing_topics"] == [
+                            "scoring"
+                        ]
+                        assert (
+                            "at-home challenges"
+                            in at_home_season.structured_content["coverage"]["note"]
+                        )
+
+                        team_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 254,
+                                "year": 2020,
+                                "mechanism_query": "elevator rigging",
+                                "top_k": 4,
+                            },
+                        )
+                        assert team_context.is_error is False
+                        assert team_context.structured_content["team_number"] == 254
+                        assert team_context.structured_content["performance_checked"] is False
+                        assert team_context.structured_content["visual_review_required"] is True
+                        assert (
+                            team_context.structured_content["indexed_sources"]["sources"][0][
+                                "source_id"
+                            ]
+                            == "254-2020"
+                        )
+                        assert team_context.structured_content["mechanism_search"][
+                            "applied_filters"
+                        ]["team_numbers"] == ["254"]
+                        assert team_context.structured_content["mechanism_search"][
+                            "applied_filters"
+                        ]["years"] == [2020]
+                        assert backend.source_catalog_search_calls[-1] == {
+                            "query": "elevator rigging",
+                            "top_k": 4,
+                            "team_numbers": ["254"],
+                            "years": [2020],
+                            "source_ids": ["254-2020"],
+                        }
+                        assert {
+                            target["provider"]
+                            for target in team_context.structured_content["live_research_targets"]
+                        } == {"first_events", "the_blue_alliance"}
+                        assert all(
+                            target["requires_authentication"] is False
+                            for target in team_context.structured_content["live_research_targets"]
+                        )
+
+                        searches_before_missing_team = len(backend.source_catalog_search_calls)
+                        missing_team_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 111,
+                                "year": 2024,
+                                "mechanism_query": "intake",
+                            },
+                        )
+                        assert missing_team_context.is_error is False
+                        assert (
+                            missing_team_context.structured_content["indexed_sources"][
+                                "coverage_found"
+                            ]
+                            is False
+                        )
+                        assert (
+                            missing_team_context.structured_content["mechanism_search"]["results"]
+                            == []
+                        )
+                        assert (
+                            missing_team_context.structured_content["visual_review_required"]
+                            is False
+                        )
+                        assert (
+                            "search was not run"
+                            in missing_team_context.structured_content["mechanism_search"][
+                                "abstention_reason"
+                            ]
+                        )
+                        assert (
+                            len(backend.source_catalog_search_calls) == searches_before_missing_team
+                        )
+
+                        searches_before_refresh = len(backend.source_catalog_search_calls)
+                        backend.revision_sequence = [
+                            "test-corpus-a",
+                            "test-corpus-b",
+                            "test-corpus-b",
+                            "test-corpus-b",
+                        ]
+                        refreshed_team_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 254,
+                                "year": 2020,
+                                "mechanism_query": "refresh intake",
+                            },
+                        )
+                        assert refreshed_team_context.is_error is False
+                        assert (
+                            len(backend.source_catalog_search_calls) == searches_before_refresh + 2
+                        )
+                        assert backend.revision_sequence == []
+
+                        backend.extra_sources = [
+                            SourceSummary(
+                                source_id=f"254-archive-{index}",
+                                source_version_id=f"254-archive-{index}@version-a",
+                                source_pdf=f"254-archive-{index}.pdf",
+                                team="254",
+                                year=2019,
+                            )
+                            for index in range(21)
+                        ]
+                        backend.revision_sequence = ["many-sources", "many-sources"]
+                        searches_before_large_catalog = len(backend.source_catalog_search_calls)
+                        large_catalog_context = await session.call_tool(
+                            "get_team_context",
+                            {
+                                "team_number": 254,
+                                "mechanism_query": "archive intake",
+                            },
+                        )
+                        assert large_catalog_context.is_error is False
+                        large_catalog_calls = backend.source_catalog_search_calls[
+                            searches_before_large_catalog:
+                        ]
+                        assert len(large_catalog_calls) == 1
+                        assert set(large_catalog_calls[0]["source_ids"]) == {
+                            "254-2020",
+                            *(f"254-archive-{index}" for index in range(21)),
+                        }
+
                         browsed = await session.call_tool(
                             "browse_source",
                             {
@@ -1411,7 +1636,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         )
                         assert queried_sources.is_error is False
                         assert queried_sources.structured_content["coverage_found"] is True
-                        assert len(backend.list_source_calls) == 1
+                        assert len(backend.list_source_calls) == 6
 
                         filtered_sources = await session.call_tool(
                             "list_sources",
@@ -1425,7 +1650,7 @@ def test_mcp_protocol_lists_and_calls_read_only_tools(tmp_path: Path) -> None:
                         assert filtered_sources.is_error is False
                         assert filtered_sources.structured_content["sources"][0]["team"] == "4414"
                         assert filtered_sources.structured_content["sources"][0]["year"] == 2024
-                        assert len(backend.list_source_calls) == 2
+                        assert len(backend.list_source_calls) == 7
                         assert backend.list_source_calls[-1] == {
                             "team_numbers": ["4414"],
                             "years": [2024],

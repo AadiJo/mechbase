@@ -9,9 +9,15 @@ from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from app.rag.config import Settings
-from app.rag.models import PageContextResponse, RagDocument, SearchRequest, SimilarPagesResponse
+from app.rag.models import (
+    PageContextResponse,
+    RagDocument,
+    SearchCoverage,
+    SearchRequest,
+    SimilarPagesResponse,
+)
 from app.rag.pdf import _document_id
-from app.rag.search import _expansion_years
+from app.rag.search import _expansion_years, search_source_catalog
 from app.rag.store import IMAGE_VECTOR, TEXT_VECTOR, RagStore, _build_filter
 
 
@@ -72,6 +78,58 @@ def test_query_expansion_uses_the_same_legacy_and_plural_year_union() -> None:
     )
 
     assert _expansion_years(request) == [2020, 2024]
+
+
+def test_source_catalog_search_embeds_once_and_applies_every_exact_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingEmbedder:
+        def __init__(self) -> None:
+            self.text_calls = 0
+            self.multimodal_calls = 0
+
+        def embed_texts(self, texts, input_type):
+            self.text_calls += 1
+            return [[0.1]]
+
+        def embed_multimodal(self, texts, images, input_type):
+            self.multimodal_calls += 1
+            return [[0.2]]
+
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.source_ids: list[str] | None = None
+
+        def search(
+            self,
+            request,
+            text_vector,
+            image_vector,
+            expanded_query,
+            *,
+            source_ids=None,
+        ):
+            self.source_ids = source_ids
+            return [], SearchCoverage()
+
+    embedder = RecordingEmbedder()
+    store = RecordingStore()
+    monkeypatch.setattr("app.rag.search.VoyageEmbedder", lambda _settings: embedder)
+    source_ids = [f"254-archive-{index}" for index in range(22)]
+
+    search_source_catalog(
+        "archive intake",
+        8,
+        Settings(),
+        team_numbers=["254"],
+        years=[],
+        source_ids=source_ids,
+        store=store,  # type: ignore[arg-type]
+    )
+
+    assert embedder.text_calls == 1
+    assert embedder.multimodal_calls == 1
+    assert store.source_ids == source_ids
 
 
 def test_active_generation_filter_has_constant_condition_count() -> None:

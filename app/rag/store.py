@@ -337,6 +337,8 @@ class RagStore:
         text_vector: list[float],
         image_vector: list[float],
         expanded_query: str,
+        *,
+        source_ids: list[str] | None = None,
     ) -> tuple[list[SearchResult], SearchCoverage]:
         limit = max(request.top_k * 12, 60)
         (text_hits, image_hits), active_generations = self._read_with_active_snapshot(
@@ -345,7 +347,7 @@ class RagStore:
                     collection_name=self.settings.collection_name,
                     query=text_vector,
                     using=TEXT_VECTOR,
-                    query_filter=_build_filter(request, active),
+                    query_filter=_build_filter(request, active, source_ids=source_ids),
                     limit=limit,
                     with_payload=True,
                 ).points,
@@ -353,7 +355,7 @@ class RagStore:
                     collection_name=self.settings.collection_name,
                     query=image_vector,
                     using=IMAGE_VECTOR,
-                    query_filter=_build_filter(request, active),
+                    query_filter=_build_filter(request, active, source_ids=source_ids),
                     limit=limit,
                     with_payload=True,
                 ).points,
@@ -1527,6 +1529,8 @@ def _exact_page_filter(payload: dict) -> models.Filter:
 def _build_filter(
     request: SearchRequest,
     active_generations: dict[str, str] | None = None,
+    *,
+    source_ids: list[str] | None = None,
 ) -> models.Filter:
     metadata_filter = _metadata_filter(
         team=request.team,
@@ -1534,7 +1538,7 @@ def _build_filter(
         source=request.source,
         team_numbers=request.team_numbers,
         years=request.years,
-        source_ids=request.source_ids,
+        source_ids=request.source_ids if source_ids is None else source_ids,
         active_generations=active_generations,
     )
     conditions = list(metadata_filter.must or [])
