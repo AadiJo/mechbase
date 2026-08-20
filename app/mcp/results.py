@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from typing import Literal
 from urllib.parse import quote, urldefrag
 
 from pydantic import BaseModel, Field, JsonValue
 
-from app.mcp.images import preview_image_url
+from app.mcp.images import CandidateAssetSource, PreviewImage
 from app.rag.models import (
     ImageContextResponse,
     PageContextResponse,
@@ -167,15 +168,37 @@ class VisualCandidate(BaseModel):
     year: int | None = None
     page: int
     has_image: bool
+    assets: list[VisualAsset] = Field(default_factory=list)
+
+
+class VisualAsset(BaseModel):
+    asset_id: str
+    kind: Literal["page", "figure"]
+    image_url: str
+    mime_type: str
+    width: int
+    height: int
+    preview_mime_type: str
+    preview_width: int
+    preview_height: int
+    text: str
 
 
 class InspectOutput(BaseModel):
     candidates: list[VisualCandidate]
     missing_ids: list[str] = Field(default_factory=list)
+    truncated_ids: list[str] = Field(default_factory=list)
+
+
+class RenderSelection(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    asset_id: str = Field(min_length=1, max_length=100)
 
 
 class RenderItem(BaseModel):
     id: str
+    asset_id: str
+    asset_kind: Literal["page", "figure"]
     title: str
     url: str
     image_url: str
@@ -452,10 +475,9 @@ def visual_candidate(
     result_id: str,
     public_base_url: str,
     *,
-    has_image: bool,
+    assets: list[VisualAsset],
 ) -> VisualCandidate:
-    relative_image_url = preview_image_url(context)
-    image_url = _absolute_url(public_base_url, relative_image_url) if relative_image_url else None
+    image_url = assets[0].image_url if assets else None
     canonical_url = image_url or _absolute_url(public_base_url, context.page_context_url)
     return VisualCandidate(
         id=result_id,
@@ -467,24 +489,47 @@ def visual_candidate(
         team=context.team,
         year=context.year,
         page=context.page,
-        has_image=has_image,
+        has_image=bool(assets),
+        assets=assets,
+    )
+
+
+def visual_asset(
+    context: ImageContextResponse,
+    source: CandidateAssetSource,
+    preview: PreviewImage,
+    public_base_url: str,
+) -> VisualAsset:
+    return VisualAsset(
+        asset_id=source.asset_id,
+        kind=source.kind,
+        image_url=_absolute_url(public_base_url, source.image_url),
+        mime_type=preview.source_mime_type,
+        width=preview.width,
+        height=preview.height,
+        preview_mime_type=preview.mime_type,
+        preview_width=preview.preview_width,
+        preview_height=preview.preview_height,
+        text=_truncate(context.text, 2000),
     )
 
 
 def render_output(
-    contexts: list[tuple[str, ImageContextResponse]],
+    contexts: list[tuple[str, str, Literal["page", "figure"], ImageContextResponse, str]],
     public_base_url: str,
 ) -> RenderOutput:
     results = []
-    for result_id, context in contexts:
-        relative_image_url = preview_image_url(context)
-        if relative_image_url is None:
-            continue
+    for result_id, asset_id, asset_kind, context, relative_image_url in contexts:
         image_url = _absolute_url(public_base_url, relative_image_url)
+        title = _result_title(context.source_pdf, context.page, context.team)
+        if asset_kind == "figure":
+            title = f"{title}, figure {asset_id}"
         results.append(
             RenderItem(
                 id=result_id,
-                title=_result_title(context.source_pdf, context.page, context.team),
+                asset_id=asset_id,
+                asset_kind=asset_kind,
+                title=title,
                 url=image_url,
                 image_url=image_url,
                 source_pdf=context.source_pdf,

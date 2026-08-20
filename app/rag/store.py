@@ -926,6 +926,74 @@ class RagStore:
             self._source_summary_cache[source_id] = (active_generation, source)
         return source
 
+    def image_contexts(self, result_ids: list[str]) -> dict[str, ImageContextResponse]:
+        unique_ids = list(dict.fromkeys(result_ids))
+        if not unique_ids:
+            return {}
+
+        def read(active: dict[str, str]) -> tuple[dict[str, dict], list[dict]]:
+            seed_payloads = self._scroll_payloads(
+                _active_filter(
+                    must=[_match_values("id", unique_ids)],
+                    active_generations=active,
+                ),
+                limit=None,
+            )
+            seed_payloads = [
+                payload for payload in seed_payloads if _is_current_generation(payload, active)
+            ]
+            grouped_seeds: dict[str, list[dict]] = {}
+            for payload in seed_payloads:
+                payload_id = str(payload.get("id") or "")
+                if payload_id:
+                    grouped_seeds.setdefault(payload_id, []).append(payload)
+
+            selected_seeds = {}
+            for result_id, payloads in grouped_seeds.items():
+                latest_generation = _latest_generation(payloads)
+                selected_seeds[result_id] = next(
+                    payload for payload in payloads if _generation_key(payload) == latest_generation
+                )
+            if not selected_seeds:
+                return {}, []
+
+            page_branches = [_exact_page_filter(payload) for payload in selected_seeds.values()]
+            page_payloads = self._scroll_payloads(
+                _active_filter(
+                    should=page_branches,
+                    active_generations=active,
+                ),
+                limit=None,
+            )
+            return selected_seeds, page_payloads
+
+        (selected_seeds, page_payloads), active_generations = self._read_with_active_snapshot(read)
+        page_payloads = [
+            payload
+            for payload in page_payloads
+            if _is_current_generation(payload, active_generations)
+        ]
+        grouped_pages: dict[tuple[str, int], list[dict]] = {}
+        for payload in page_payloads:
+            grouped_pages.setdefault(_page_key(payload), []).append(payload)
+
+        contexts = {}
+        for result_id in unique_ids:
+            payload = selected_seeds.get(result_id)
+            if payload is None:
+                continue
+            page_payload_group = grouped_pages.get(_page_key(payload))
+            if not page_payload_group:
+                continue
+            page = int(payload.get("page", 0))
+            page_context = self._page_context_from_payloads(
+                str(payload.get("source_pdf") or ""),
+                page,
+                page_payload_group,
+            )
+            contexts[result_id] = self._image_context_from_payload(payload, page_context)
+        return contexts
+
     def image_context(
         self,
         result_id: str | None = None,
@@ -1424,6 +1492,36 @@ def _metadata_filter(
     if source_ids:
         conditions.append(_match_values("source_id", list(dict.fromkeys(source_ids))))
     return _active_filter(must=conditions, active_generations=active_generations)
+
+
+def _exact_page_filter(payload: dict) -> models.Filter:
+    conditions: list[models.Condition] = [
+        models.FieldCondition(
+            key="source_pdf",
+            match=models.MatchValue(value=str(payload.get("source_pdf") or "")),
+        ),
+        models.FieldCondition(
+            key="page",
+            match=models.MatchValue(value=int(payload.get("page", 0))),
+        ),
+    ]
+    source_version_id = payload.get("source_version_id")
+    if source_version_id:
+        conditions.append(
+            models.FieldCondition(
+                key="source_version_id",
+                match=models.MatchValue(value=source_version_id),
+            )
+        )
+    ingestion_id = payload.get("ingestion_id")
+    if ingestion_id:
+        conditions.append(
+            models.FieldCondition(
+                key="ingestion_id",
+                match=models.MatchValue(value=ingestion_id),
+            )
+        )
+    return models.Filter(must=conditions)
 
 
 def _build_filter(
